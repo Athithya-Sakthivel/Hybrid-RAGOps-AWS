@@ -1,0 +1,7 @@
+ray==2.50.1
+qdrant-client==1.15.1
+neo4j==5.19.0
+neo4j-graphrag==1.10.0
+httpx==0.28.1
+python-dotenv==1.1.1
+typing==3.7.4.3

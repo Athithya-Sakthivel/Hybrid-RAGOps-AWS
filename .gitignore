@@ -1,0 +1,8 @@
+repos
+tmp
+export.sh
+tmp.md
+.venv
+*.venv
+venv
+venv1
