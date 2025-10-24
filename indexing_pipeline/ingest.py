@@ -1,8 +1,11 @@
 from __future__ import annotations
-import os,sys,json,time,uuid,logging,ray
-from typing import List,Dict,TypedDict,Optional
+import os,sys,json,time,uuid,logging
+from typing import List,Dict,TypedDict,Optional,Any
 from functools import wraps
 from pathlib import Path
+import ray
+from ray import serve
+from ray.serve.handle import DeploymentResponse
 from neo4j import GraphDatabase
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct,VectorParams,Distance
@@ -10,7 +13,8 @@ class Doc(TypedDict):
     external_id: str
     title: str
     text: str
-RAY_ADDRESS=os.getenv("RAY_ADDRESS",None)
+RAY_ADDRESS=os.getenv("RAY_ADDRESS","auto")
+APP_NAME=os.getenv("SERVE_APP_NAME","default")
 EMBED_DEPLOYMENT=os.getenv("EMBED_DEPLOYMENT","embed_onxx")
 QDRANT_URL=os.getenv("QDRANT_URL","http://localhost:6333")
 QDRANT_API_KEY=os.getenv("QDRANT_API_KEY") or None
@@ -24,13 +28,13 @@ INGEST_SOURCE=os.getenv("INGEST_SOURCE","")
 NEO4J_URI=os.getenv("NEO4J_URI","bolt://localhost:7687")
 NEO4J_USER=os.getenv("NEO4J_USER","neo4j")
 NEO4J_PASSWORD=os.getenv("NEO4J_PASSWORD","neo4j")
+SERVE_WAIT=float(os.getenv("SERVE_WAIT","60"))
 RETRY_ATTEMPTS=int(os.getenv("RETRY_ATTEMPTS","3"))
 RETRY_BASE=float(os.getenv("RETRY_BASE_SECONDS","0.5"))
 logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"))
 log=logging.getLogger("ingest")
 def retry(attempts: int = RETRY_ATTEMPTS, base: float = RETRY_BASE):
     def deco(fn):
-        @wraps(fn)
         def wrapper(*a,**k):
             last_exc=None
             for i in range(attempts):
@@ -72,9 +76,11 @@ def merge_document_node(driver: GraphDatabase.driver, external_id: str, title: s
     with driver.session() as session:
         session.run("MERGE (d:Document {neo4j_id:$id}) SET d.title=$title, d.text=$text, d.updated_at = datetime()",id=external_id,title=title,text=text)
 def validate_embed_response(resp: dict, expected_batch: int) -> List[List[float]]:
-    assert isinstance(resp,dict),f"embed response must be dict; got {type(resp)}"
+    if not isinstance(resp,dict):
+        raise RuntimeError(f"embed response must be dict; got {type(resp)}")
     vectors=resp.get("vectors")
-    assert isinstance(vectors,list),f"embed vectors must be list; got {type(vectors)}"
+    if not isinstance(vectors,list):
+        raise RuntimeError(f"embed vectors must be list; got {type(vectors)}")
     if len(vectors)!=expected_batch:
         raise RuntimeError(f"embed returned {len(vectors)} vectors for {expected_batch} inputs")
     for i,v in enumerate(vectors):
@@ -89,11 +95,29 @@ def build_point(eid: str, idx: int, vec: List[float], chunk_text_str: str, title
     if title:
         payload["title"]=title
     return PointStruct(id=pid,vector=vec,payload=payload)
+def _get_embed_handle(name: str, timeout: float = SERVE_WAIT, poll: float = 1.0):
+    address=RAY_ADDRESS or "auto"
+    if not ray.is_initialized():
+        ray.init(address=address,ignore_reinit_error=True)
+    start=time.time()
+    last_exc=None
+    while time.time()-start<timeout:
+        try:
+            handle=serve.get_deployment_handle(name,app_name=APP_NAME)
+            test_resp=handle.remote({"texts":["health-check"]})
+            if isinstance(test_resp,DeploymentResponse):
+                out=test_resp.result(timeout=EMBED_TIMEOUT)
+            else:
+                out=test_resp
+            validate_embed_response(out,expected_batch=1)
+            return handle
+        except Exception as e:
+            last_exc=e
+            time.sleep(poll)
+    raise RuntimeError(f"Timed out waiting for Serve deployment '{name}': last error: {last_exc}")
 @retry()
 def ingest(docs: List[Doc]) -> int:
-    ray.init(address=RAY_ADDRESS)
-    from ray import serve
-    handle=serve.get_deployment(EMBED_DEPLOYMENT).get_handle(sync=False)
+    handle=_get_embed_handle(EMBED_DEPLOYMENT)
     qdrant=QdrantClient(url=QDRANT_URL,api_key=QDRANT_API_KEY,prefer_grpc=PREFER_GRPC)
     ensure_qdrant_collection(qdrant,COLLECTION,VECTOR_DIM)
     driver=GraphDatabase.driver(NEO4J_URI,auth=(NEO4J_USER,NEO4J_PASSWORD))
@@ -107,9 +131,12 @@ def ingest(docs: List[Doc]) -> int:
         if not chunks:
             log.info("No chunks for %s; skipping",eid)
             continue
-        ref=handle.remote({"texts":chunks})
-        resp=ray.get(ref,timeout=EMBED_TIMEOUT)
-        vectors=validate_embed_response(resp,expected_batch=len(chunks))
+        resp=handle.remote({"texts":chunks})
+        if isinstance(resp,DeploymentResponse):
+            resp_out=resp.result(timeout=EMBED_TIMEOUT)
+        else:
+            resp_out=resp
+        vectors=validate_embed_response(resp_out,expected_batch=len(chunks))
         for i,(chunk,vec) in enumerate(zip(chunks,vectors)):
             pt=build_point(eid,i,vec,chunk,title)
             required={"neo4j_id","chunk_id","text"}
