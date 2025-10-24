@@ -9,9 +9,46 @@ ray stop && ray start --head && python3 infra/rayserve_onnx.py
 docker run -d --name ollama -v ollama_models:/root/.ollama -p 11434:11434 -e OLLAMA_HOST=0.0.0.0 ollama/ollama:latest
 docker exec -it ollama ollama pull smollm:135m  # smollm:360m llama3.2
 
-docker rm -f qdrant neo4j || true
 docker run -d --name qdrant -p 6333:6333 -p 6334:6334 qdrant/qdrant:latest
-docker run -d --name neo4j -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH=neo4j/neo4j neo4j:5
+
+# compact final block — copy/paste (replace password)
+docker rm -f neo4j 2>/dev/null || true
+mkdir -p ./neo4j/data ./neo4j/logs
+sudo chown -R "$(id -u):$(id -g)" ./neo4j
+
+
+# (in a new terminal after Neo4j is up) export envs your ingest expects and run ingest
+export NEO4J_URI="bolt://127.0.0.1:7687"
+export NEO4J_USER="neo4j"
+export NEO4J_PASSWORD="${NEO4J_PW}"
+export QDRANT_URL="http://127.0.0.1:6333"
+
+# optional performance knobs
+export BATCH_SIZE=64
+export EMBED_SUB_BATCH=16
+
+export NEO4J_PW="ReplaceWithStrongPass!"   # <<-- REPLACE with a strong password
+docker run -d --name neo4j \
+  -p 7474:7474 -p 7687:7687 \
+  -e NEO4J_AUTH="neo4j/${NEO4J_PW}" \
+  -e NEO4J_server_memory_heap_initial__size=512M \
+  -e NEO4J_server_memory_heap_max__size=1G \
+  -e NEO4J_server_memory_pagecache_size=512M \
+  -v "$PWD/neo4j/data:/data" \
+  -v "$PWD/neo4j/logs:/logs" \
+  neo4j:5.19.0
+
+# run ingestion (same venv where Ray/Serve are running)
+python3 indexing_pipeline/ingest.py
+
+
+
+# list collections (REST)
+curl -s 'http://localhost:6333/collections' | jq .
+
+# check collection info
+curl -s 'http://localhost:6333/collections/my_collection' | jq .
+
 
 export RAY_ADDRESS="auto"
 export ONNX_USE_CUDA="false"

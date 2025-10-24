@@ -1,41 +1,59 @@
+#!/usr/bin/env python3
 from __future__ import annotations
-import os, time, logging, ray, httpx
-from typing import List, Dict, Any, TypedDict, Optional
-from functools import wraps
-from dotenv import load_dotenv
-load_dotenv()
-
-class Provenance(TypedDict):
-    neo4j_id: Optional[str]
-    chunk_id: Optional[str]
-    score: Optional[float]
-
-class QueryOutput(TypedDict):
-    prompt: str
-    provenance: List[Provenance]
-    records: List[Dict[str, Any]]
-    llm: Optional[Any]
-
-RAY_ADDRESS = os.getenv("RAY_ADDRESS", None)
-EMBED_HANDLE_NAME = os.getenv("EMBED_HANDLE_NAME", "embed_onxx")
-RERANK_HANDLE_NAME = os.getenv("RERANK_HANDLE_NAME", "rerank_onxx")
-QDRANT_COLLECTION = os.getenv("COLLECTION", "my_collection")
-VECTOR_DIM = int(os.getenv("VECTOR_DIM", "768"))
-TOP_K = int(os.getenv("TOP_K", "5"))
-RERANK_TOP = int(os.getenv("RERANK_TOP", "20"))
-HYBRID_ALPHA = float(os.getenv("HYBRID_ALPHA", "1.0"))
-LLM_URL = os.getenv("LLM_URL", "").rstrip("/")
-LLM_TYPE = os.getenv("LLM_TYPE", "mock")
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "30"))
-RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "3"))
-RETRY_BASE = float(os.getenv("RETRY_BASE_SECONDS", "0.5"))
+import os, time, logging, math, uuid, httpx
+from typing import List, Dict, Any, Optional, Tuple
+import ray
+from ray import serve
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("query")
 
+RAY_ADDRESS = os.getenv("RAY_ADDRESS", "auto")
+RAY_NAMESPACE = os.getenv("RAY_NAMESPACE", None)
+EMBED_HANDLE_NAME = os.getenv("EMBED_DEPLOYMENT", "embed_onxx")
+RERANK_HANDLE_NAME = os.getenv("RERANK_HANDLE_NAME", "rerank_onxx")
+
+QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") or None
+PREFER_GRPC = os.getenv("PREFER_GRPC", "true").lower() in ("1", "true", "yes")
+QDRANT_COLLECTION = os.getenv("COLLECTION", "my_collection")
+
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "neo4j")
+NEO4J_FULLTEXT_INDEX = os.getenv("NEO4J_FULLTEXT_INDEX", "chunkTextIndex")
+
+VECTOR_DIM = int(os.getenv("VECTOR_DIM", "768"))
+TOP_K = int(os.getenv("TOP_K", "5"))
+
+TOP_VECTOR_CHUNKS = int(os.getenv("TOP_VECTOR_CHUNKS", "100"))
+TOP_BM25_CHUNKS = int(os.getenv("TOP_BM25_CHUNKS", "100"))
+
+FIRST_STAGE_RRF_K = int(os.getenv("FIRST_STAGE_RRF_K", "60"))
+MAX_CHUNKS_FOR_GRAPH_EXPANSION = int(os.getenv("MAX_CHUNKS_FOR_GRAPH_EXPANSION", "20"))
+GRAPH_EXPANSION_HOPS = int(os.getenv("GRAPH_EXPANSION_HOPS", "1"))
+SECOND_STAGE_RRF_K = int(os.getenv("SECOND_STAGE_RRF_K", "60"))
+
+MAX_CHUNKS_TO_CROSSENCODER = int(os.getenv("MAX_CHUNKS_TO_CROSSENCODER", "64"))
+MAX_CHUNKS_TO_LLM = int(os.getenv("MAX_CHUNKS_TO_LLM", "8"))
+
+RERANK_TOP = int(os.getenv("RERANK_TOP", "50"))
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "30"))
+RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "3"))
+RETRY_BASE = float(os.getenv("RETRY_BASE_SECONDS", "0.5"))
+
+try:
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchText
+except Exception as e:
+    raise RuntimeError("qdrant-client import failed: " + str(e))
+try:
+    from neo4j import GraphDatabase, exceptions as neo4j_exceptions
+except Exception as e:
+    raise RuntimeError("neo4j driver import failed: " + str(e))
+
 def retry(attempts: int = RETRY_ATTEMPTS, base: float = RETRY_BASE):
     def deco(fn):
-        @wraps(fn)
         def wrapper(*a, **k):
             last = None
             for i in range(attempts):
@@ -44,33 +62,103 @@ def retry(attempts: int = RETRY_ATTEMPTS, base: float = RETRY_BASE):
                 except Exception as e:
                     last = e
                     wait = base * (2 ** i)
-                    log.warning("retry %d/%d for %s: %s - sleeping %.2fs", i + 1, attempts, fn.__name__, e, wait)
+                    log.warning("retry %d/%d %s: %s (sleep %.2fs)", i + 1, attempts, fn.__name__, e, wait)
                     time.sleep(wait)
             log.error("all retries failed for %s", fn.__name__)
             raise last
         return wrapper
     return deco
 
+def _resolve_handle_response(resp_obj, timeout: int = HTTP_TIMEOUT):
+    if isinstance(resp_obj, (dict, list)):
+        return resp_obj
+    try:
+        import ray as _ray
+        ObjectRefType = getattr(_ray, "ObjectRef", None) or getattr(_ray, "_raylet.ObjectRef", None)
+    except Exception:
+        ObjectRefType = None
+    try:
+        if ObjectRefType is not None and isinstance(resp_obj, ObjectRefType):
+            return ray.get(resp_obj, timeout=timeout)
+    except Exception:
+        pass
+    try:
+        if hasattr(resp_obj, "result") and callable(getattr(resp_obj, "result")):
+            return resp_obj.result()
+    except Exception:
+        pass
+    try:
+        return ray.get(resp_obj, timeout=timeout)
+    except Exception as e:
+        raise RuntimeError("Unable to resolve Serve handle response type: " + str(type(resp_obj)) + " -> " + str(e))
+
 @retry()
-def make_clients_and_retriever():
-    from qdrant_client import QdrantClient
-    from neo4j import GraphDatabase
-    from neo4j_graphrag.retrievers import QdrantNeo4jRetriever
-    q = QdrantClient(url=os.getenv("QDRANT_URL", "http://localhost:6333"),
-                     api_key=os.getenv("QDRANT_API_KEY") or None,
-                     prefer_grpc=os.getenv("PREFER_GRPC", "true").lower() in ("1", "true", "yes"))
-    drv = GraphDatabase.driver(os.getenv("NEO4J_URI", "bolt://localhost:7687"),
-                               auth=(os.getenv("NEO4J_USER", "neo4j"), os.getenv("NEO4J_PASSWORD", "neo4j")))
-    retr = QdrantNeo4jRetriever(driver=drv, client=q, collection_name=QDRANT_COLLECTION,
-                                id_property_neo4j="neo4j_id", id_property_external="neo4j_id")
-    return q, drv, retr
+def make_clients():
+    q = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=PREFER_GRPC)
+    drv = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    return q, drv
 
-qdrant_client, neo4j_driver, retriever = make_clients_and_retriever()
+qdrant, neo4j_driver = make_clients()
 
-ray.init(address=RAY_ADDRESS)
-from ray import serve
-_embed_handle = serve.get_deployment(EMBED_HANDLE_NAME).get_handle(sync=False)
-_rerank_handle = serve.get_deployment(RERANK_HANDLE_NAME).get_handle(sync=False)
+ray.init(address=RAY_ADDRESS, namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+
+def _get_handle(name: str, timeout: float = 60.0, poll: float = 1.0, app_name: Optional[str] = "default"):
+    start = time.time()
+    last_exc = None
+    while time.time() - start < timeout:
+        try:
+            if hasattr(serve, "get_deployment_handle"):
+                try:
+                    handle = serve.get_deployment_handle(name, app_name=app_name, _check_exists=False)
+                    resp = handle.remote({"texts": ["health-check"]})
+                    _resolve_handle_response(resp, timeout=HTTP_TIMEOUT)
+                    return handle
+                except Exception as e:
+                    last_exc = e
+            if hasattr(serve, "get_deployment"):
+                try:
+                    dep = serve.get_deployment(name)
+                    handle = dep.get_handle(sync=False)
+                    resp = handle.remote({"texts": ["health-check"]})
+                    _resolve_handle_response(resp, timeout=HTTP_TIMEOUT)
+                    return handle
+                except Exception as e:
+                    last_exc = e
+            if hasattr(serve, "get_handle"):
+                try:
+                    handle = serve.get_handle(name, sync=False)
+                    resp = handle.remote({"texts": ["health-check"]})
+                    _resolve_handle_response(resp, timeout=HTTP_TIMEOUT)
+                    return handle
+                except Exception as e:
+                    last_exc = e
+            time.sleep(poll)
+        except Exception as e:
+            last_exc = e
+            time.sleep(poll)
+    try:
+        import httpx as _httpx
+        r = _httpx.post(f"http://127.0.0.1:8000/{name}", json={"texts": ["health-check"]}, timeout=10.0)
+        if r.status_code == 200:
+            log.warning("Using HTTP fallback for Serve deployment %s", name)
+            class _HTTPHandle:
+                def __init__(self, url):
+                    self.url = url
+                def remote(self, payload):
+                    rr = _httpx.post(self.url, json=payload, timeout=30.0)
+                    rr.raise_for_status()
+                    return rr.json()
+            return _HTTPHandle(f"http://127.0.0.1:8000/{name}")
+    except Exception:
+        pass
+    raise RuntimeError(f"Timed out waiting for Serve deployment {name}: {last_exc}")
+
+embed_handle = _get_handle(EMBED_HANDLE_NAME)
+rerank_handle = None
+try:
+    rerank_handle = _get_handle(RERANK_HANDLE_NAME)
+except Exception:
+    log.warning("No rerank handle available, cross-encoder will be skipped")
 
 _http = httpx.Client(timeout=HTTP_TIMEOUT)
 
@@ -83,136 +171,252 @@ def _minmax_norm(xs: List[float]) -> List[float]:
         return [0.0 for _ in vals]
     return [(v - mn) / (mx - mn) for v in vals]
 
-def _extract_score_from_record(rec: Any) -> float:
-    try:
-        d = rec.data()
-    except Exception:
-        return 0.0
-    if isinstance(d, dict):
-        if "score" in d and isinstance(d["score"], (int, float)):
-            return float(d["score"])
-        for v in d.values():
-            if isinstance(v, dict) and isinstance(v.get("score"), (int, float)):
-                return float(v.get("score"))
-    return 0.0
-
 @retry()
 def embed_text(text: str) -> List[float]:
-    ref = _embed_handle.remote({"texts": [text]})
-    resp = ray.get(ref, timeout=HTTP_TIMEOUT)
-    assert isinstance(resp, dict), f"embed serve returned non-dict: {type(resp)}"
-    vecs = resp.get("vectors")
-    assert isinstance(vecs, list) and len(vecs) == 1, f"embed serve must return 1 vector, got: {vecs}"
-    vec = vecs[0]
-    assert isinstance(vec, (list, tuple)), "embed vector must be list-like"
-    if len(vec) != VECTOR_DIM:
-        raise RuntimeError(f"embed vector dim mismatch: got {len(vec)} expected {VECTOR_DIM}")
-    return [float(x) for x in vec]
+    resp_obj = embed_handle.remote({"texts": [text]})
+    resp = _resolve_handle_response(resp_obj, timeout=HTTP_TIMEOUT)
+    if not isinstance(resp, dict) or "vectors" not in resp:
+        raise RuntimeError("embed returned bad payload")
+    vecs = resp["vectors"]
+    if not isinstance(vecs, list) or len(vecs) != 1:
+        raise RuntimeError("embed must return single vector")
+    v = vecs[0]
+    if len(v) != VECTOR_DIM:
+        raise RuntimeError("embed dim mismatch")
+    return [float(x) for x in v]
 
 @retry()
-def rerank_batch(query: str, texts: List[str]) -> List[float]:
+def cross_rerank(query: str, texts: List[str]) -> List[float]:
+    if not rerank_handle:
+        raise RuntimeError("rerank handle not available")
     if not texts:
         return []
-    ref = _rerank_handle.remote({"query": query, "cands": texts})
-    resp = ray.get(ref, timeout=HTTP_TIMEOUT)
-    assert isinstance(resp, dict), f"rerank serve returned non-dict: {type(resp)}"
-    scores = resp.get("scores", [])
-    assert isinstance(scores, list), f"rerank scores must be list, got {type(scores)}"
+    resp_obj = rerank_handle.remote({"query": query, "cands": texts})
+    resp = _resolve_handle_response(resp_obj, timeout=HTTP_TIMEOUT)
+    if not isinstance(resp, dict) or "scores" not in resp:
+        raise RuntimeError("rerank returned bad payload")
+    scores = resp["scores"]
     if len(scores) != len(texts):
-        raise RuntimeError(f"reranker returned {len(scores)} scores for {len(texts)} candidates")
+        raise RuntimeError("rerank returned wrong number of scores")
     return [float(s) for s in scores]
 
 @retry()
-def hybrid_query(query_text: str, top_k: int = TOP_K) -> QueryOutput:
-    q_vec = embed_text(query_text)
-    raw = retriever.get_search_results(query_vector=q_vec, top_k=max(top_k, RERANK_TOP))
-    assert hasattr(raw, "records"), "retriever.get_search_results returned object missing 'records'"
-    records = raw.records
-    if not isinstance(records, list):
-        raise RuntimeError("retriever returned unexpected records type")
-    candidates: List[Dict[str, Any]] = []
-    for rec in records:
-        try:
-            rd = rec.data()
-        except Exception:
-            rd = {"raw": str(rec)}
-        node_props = {}
-        if isinstance(rd, dict) and "n_props" in rd and isinstance(rd["n_props"], dict):
-            node_props = rd["n_props"]
-        else:
-            for v in rd.values() if isinstance(rd, dict) else []:
-                if isinstance(v, dict):
-                    node_props = v
-                    break
-        neo4j_id = node_props.get("neo4j_id") or node_props.get("id")
-        text = node_props.get("text") or node_props.get("title") or str(node_props)
-        score = _extract_score_from_record(rec)
-        candidates.append({"neo4j_id": neo4j_id, "text": text, "props": node_props, "vec_score": score})
-    if not candidates:
-        return {"prompt": "", "provenance": [], "records": [], "llm": None}
-    vec_scores = [c["vec_score"] for c in candidates]
-    vec_norm = _minmax_norm(vec_scores)
-    for i, c in enumerate(candidates):
-        c["_vec_norm"] = vec_norm[i]
-    alpha = float(HYBRID_ALPHA) if HYBRID_ALPHA is not None else 1.0
-    other_norm = [0.0] * len(candidates)
-    hybrid_scores = [alpha * v + (1.0 - alpha) * o for v, o in zip(vec_norm, other_norm)]
-    for i, c in enumerate(candidates):
-        c["_hybrid"] = hybrid_scores[i]
-    candidates.sort(key=lambda x: (-x["_hybrid"], str(x.get("neo4j_id", ""))))
-    topN = min(len(candidates), RERANK_TOP)
-    top_texts = [c["text"] for c in candidates[:topN]]
-    try:
-        cross_scores = rerank_batch(query_text, top_texts)
-    except Exception as e:
-        log.warning("rerank failed; continuing with hybrid scores: %s", e)
-        cross_scores = []
-    if cross_scores:
-        cross_norm = _minmax_norm(cross_scores)
-        for i in range(topN):
-            candidates[i]["_cross"] = cross_scores[i]
-            candidates[i]["_cross_norm"] = cross_norm[i]
-            candidates[i]["_hybrid"] = 0.9 * cross_norm[i] + 0.1 * candidates[i].get("_vec_norm", 0.0)
-        candidates.sort(key=lambda x: (-x["_hybrid"], str(x.get("neo4j_id", ""))))
-    pieces: List[str] = []
-    prov: List[Provenance] = []
-    for c in candidates[:top_k]:
-        nid = c.get("neo4j_id"); txt = c.get("text") or ""
-        pieces.append(f"NODE (id={nid}):\n{txt}")
-        prov.append({"neo4j_id": nid, "chunk_id": None, "score": float(c.get("_hybrid", c.get("_vec_norm", 0.0)))})
-    context = "\n\n---\n\n".join(pieces)
-    prompt = f"USE ONLY THE CONTEXT BELOW. Cite provenance as neo4j_id.\n\nCONTEXT:\n{context}\n\nUSER QUERY:\n{query_text}\n"
-    llm_out = None
-    if LLM_URL:
-        try:
-            if LLM_TYPE == "tgi":
-                payload = {"inputs": prompt, "parameters": {"max_new_tokens": 512}}
-                r = _http.post(LLM_URL, json=payload); r.raise_for_status(); d = r.json()
-                if isinstance(d, dict) and "results" in d and d["results"]:
-                    llm_out = d["results"][0].get("generated_text") or d["results"][0].get("text")
-                elif isinstance(d, dict) and "generated_text" in d:
-                    llm_out = d.get("generated_text")
-                else:
-                    llm_out = d
-            else:
-                r = _http.post(LLM_URL, json={"prompt": prompt, "max_tokens": 512}); r.raise_for_status(); llm_out = r.json()
-        except Exception as e:
-            log.exception("LLM call failed: %s", e); llm_out = {"error": str(e)}
-    return {"prompt": prompt, "provenance": prov, "records": [{k: v for k, v in c.items() if k != "props"} for c in candidates[:top_k]], "llm": llm_out}
+def qdrant_vector_search(q_vec: List[float], top_k: int) -> List[Dict[str,Any]]:
+    results = qdrant.search(collection_name=QDRANT_COLLECTION, query_vector=q_vec, limit=top_k, with_payload=True, with_vector=False)
+    out = []
+    for r in results:
+        payload = getattr(r, "payload", {}) or {}
+        out.append({"id": str(getattr(r, "id", None)), "score": float(getattr(r, "score", 0.0) or 0.0), "payload": payload})
+    return out
 
-def close():
-    try: _http.close()
-    except: pass
-    try: qdrant_client.close()
-    except: pass
-    try: neo4j_driver.close()
-    except: pass
+@retry()
+def qdrant_payload_keyword_search(q: str, top_k: int) -> List[Dict[str,Any]]:
+    try:
+        flt = Filter(must=[FieldCondition(key="text", match=MatchText(text=q))])
+        results = qdrant.search(collection_name=QDRANT_COLLECTION, query_vector=None, limit=top_k, with_payload=True, with_vector=False, query_filter=flt)
+        out = []
+        for r in results:
+            payload = getattr(r, "payload", {}) or {}
+            out.append({"id": str(getattr(r, "id", None)), "score": float(getattr(r, "score", 0.0) or 0.0), "payload": payload})
+        return out
+    except Exception:
+        return []
+
+@retry()
+def ensure_neo4j_fulltext_index(driver, index_name: str = NEO4J_FULLTEXT_INDEX):
+    with driver.session() as session:
+        try:
+            res = session.run("CALL db.index.fulltext.list() YIELD name RETURN collect(name) AS idxs")
+            rec = res.single()
+            names = rec["idxs"] if rec else []
+            if index_name in names:
+                return
+        except Exception:
+            pass
+        try:
+            session.run(f"CALL db.index.fulltext.createNodeIndex('{index_name}', ['Chunk'], ['text'])")
+            log.info("Created Neo4j fulltext index %s", index_name)
+        except Exception as e:
+            log.warning("Could not create fulltext index (may already exist or incompatible server): %s", e)
+
+@retry()
+def neo4j_fulltext_search(driver, q: str, top_k: int) -> List[Dict[str,Any]]:
+    ensure_neo4j_fulltext_index(driver, NEO4J_FULLTEXT_INDEX)
+    out = []
+    with driver.session() as session:
+        try:
+            cy = f"CALL db.index.fulltext.queryNodes('{NEO4J_FULLTEXT_INDEX}', $q) YIELD node, score RETURN node.chunk_id AS chunk_id, node.text AS text, score ORDER BY score DESC LIMIT $limit"
+            res = session.run(cy, q=q, limit=top_k)
+            for r in res:
+                out.append({"chunk_id": r["chunk_id"], "text": r["text"], "score": float(r["score"] or 0.0)})
+        except neo4j_exceptions.ClientError as e:
+            log.warning("Neo4j fulltext query failed: %s", e)
+        except Exception as e:
+            log.warning("Neo4j fulltext query unexpected error: %s", e)
+    return out
+
+@retry()
+def neo4j_expand_neighbors(driver, chunk_ids: List[str], hops: int, max_additional_per_start: int) -> List[Dict[str,Any]]:
+    if not chunk_ids:
+        return []
+    collected = []
+    unique_start = list(dict.fromkeys(chunk_ids))
+    with driver.session() as session:
+        for cid in unique_start:
+            try:
+                cy = "MATCH (start:Chunk {chunk_id:$cid})<-[:HAS_CHUNK]-(d:Document)-[:HAS_CHUNK]->(n:Chunk) RETURN DISTINCT n.chunk_id AS chunk_id, n.text AS text LIMIT $lim"
+                res = session.run(cy, cid=cid, lim=max_additional_per_start)
+            except Exception:
+                res = []
+            for r in res:
+                try:
+                    cid2 = r["chunk_id"]
+                    txt = r["text"]
+                    if cid2 and cid2 != cid:
+                        collected.append({"chunk_id": cid2, "text": txt})
+                except Exception:
+                    pass
+    return collected
+
+def _rrf_fuse(ranked_lists: List[List[Any]], k: int) -> Dict[Any, float]:
+    scores = {}
+    for lst in ranked_lists:
+        for i, it in enumerate(lst):
+            rank = i + 1
+            key = it if isinstance(it, (str, int)) else it.get("chunk_id") or it.get("id")
+            if key is None:
+                continue
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
+    return scores
+
+@retry()
+def _fetch_qdrant_by_chunk_id(chunk_id: str) -> Optional[Dict[str,Any]]:
+    try:
+        flt = Filter(must=[FieldCondition(key="chunk_id", match=MatchValue(value=chunk_id))])
+        res = qdrant.search(collection_name=QDRANT_COLLECTION, query_vector=None, limit=1, with_payload=True, with_vector=True, query_filter=flt)
+        if res:
+            r = res[0]
+            payload = getattr(r, "payload", {}) or {}
+            vector = getattr(r, "vector", None)
+            return {"id": str(getattr(r, "id", None)), "payload": payload, "vector": vector, "score": float(getattr(r, "score", 0.0) or 0.0)}
+    except Exception:
+        pass
+    return None
+
+def _cos_sim(a: List[float], b: List[float]) -> float:
+    if not a or not b:
+        return 0.0
+    sa = sum(x*x for x in a)
+    sb = sum(x*x for x in b)
+    if sa == 0 or sb == 0:
+        return 0.0
+    dp = sum(x*y for x,y in zip(a,b))
+    return float(dp / (math.sqrt(sa) * math.sqrt(sb)))
+
+def _assemble_records_from_ids(chunk_ids: List[str]) -> List[Dict[str,Any]]:
+    out = []
+    seen = set()
+    for cid in chunk_ids:
+        if cid in seen:
+            continue
+        rec = _fetch_qdrant_by_chunk_id(cid)
+        if rec:
+            payload = rec.get("payload", {}) or {}
+            out.append({"chunk_id": cid, "text": payload.get("text",""), "document_id": payload.get("document_id"), "qdrant_id": rec.get("id"), "vector": rec.get("vector")})
+            seen.add(cid)
+    return out
+
+def two_stage_query(query_text: str, top_k: int = TOP_K) -> Dict[str,Any]:
+    q_vec = embed_text(query_text)
+    vec_list = qdrant_vector_search(q_vec, TOP_VECTOR_CHUNKS)
+    vec_chunk_ids = [v["payload"].get("chunk_id") for v in vec_list if v.get("payload")]
+    bm25_list = neo4j_fulltext_search(neo4j_driver, query_text, TOP_BM25_CHUNKS)
+    bm25_chunk_ids = [b["chunk_id"] for b in bm25_list]
+    kw_list = qdrant_payload_keyword_search(query_text, TOP_BM25_CHUNKS)
+    kw_chunk_ids = [k["payload"].get("chunk_id") for k in kw_list if k.get("payload")]
+    rrf_scores_first = _rrf_fuse([vec_chunk_ids, bm25_chunk_ids, kw_chunk_ids], k=FIRST_STAGE_RRF_K)
+    fused_sorted = sorted(rrf_scores_first.items(), key=lambda x: -x[1])
+    fused_ids = [i for i,s in fused_sorted]
+    if not fused_ids:
+        return {"prompt":"", "provenance": [], "records": [], "llm": None}
+    deduped_fused = list(dict.fromkeys(fused_ids))
+    to_expand = deduped_fused[:MAX_CHUNKS_FOR_GRAPH_EXPANSION]
+    expanded = neo4j_expand_neighbors(neo4j_driver, to_expand, GRAPH_EXPANSION_HOPS, max_additional_per_start=RERANK_TOP)
+    expanded_ids = [e["chunk_id"] for e in expanded if e.get("chunk_id")]
+    combined_unique = list(dict.fromkeys(deduped_fused + expanded_ids))
+    detailed = _assemble_records_from_ids(combined_unique)
+    query_vec = q_vec
+    vec_scores_map = {}
+    for d in detailed:
+        if d.get("vector"):
+            vec_scores_map[d["chunk_id"]] = _cos_sim(query_vec, [float(x) for x in d["vector"]])
+        else:
+            vec_scores_map[d["chunk_id"]] = 0.0
+    bm25_map = {item["chunk_id"]: item["score"] for item in bm25_list}
+    kw_map = {}
+    for k in kw_list:
+        pid = k.get("payload",{}).get("chunk_id")
+        if pid:
+            kw_map[pid] = kw_map.get(pid, 0.0) + float(k.get("score",0.0))
+    ranked_lists_for_second = []
+    vec_ranked = sorted(vec_scores_map.items(), key=lambda x: -x[1])
+    ranked_lists_for_second.append([cid for cid,sc in vec_ranked])
+    ranked_lists_for_second.append(sorted(bm25_map.keys(), key=lambda c: -bm25_map.get(c,0.0)))
+    ranked_lists_for_second.append(sorted(kw_map.keys(), key=lambda c: -kw_map.get(c,0.0)))
+    rrf_scores_second = _rrf_fuse(ranked_lists_for_second, k=SECOND_STAGE_RRF_K)
+    final_sorted = sorted(rrf_scores_second.items(), key=lambda x: -x[1])
+    final_ids = [cid for cid,sc in final_sorted]
+    deduped = []
+    seen = set()
+    for cid in final_ids:
+        if cid in seen:
+            continue
+        seen.add(cid)
+        deduped.append(cid)
+    cross_candidates = deduped[:MAX_CHUNKS_TO_CROSSENCODER]
+    cross_texts = []
+    for cid in cross_candidates:
+        recs = _fetch_qdrant_by_chunk_id(cid)
+        if recs:
+            payload = recs.get("payload",{}) or {}
+            cross_texts.append(payload.get("text",""))
+    cross_scores = []
+    if cross_texts and rerank_handle:
+        try:
+            cross_scores = cross_rerank(query_text, cross_texts)
+        except Exception as e:
+            log.warning("cross rerank failed: %s", e)
+            cross_scores = []
+    merged = []
+    for i, cid in enumerate(cross_candidates):
+        base_score = float(rrf_scores_second.get(cid, 0.0))
+        cross_score = float(cross_scores[i]) if i < len(cross_scores) else 0.0
+        merged_score = 0.8 * cross_score + 0.2 * base_score if cross_scores else base_score
+        merged.append({"chunk_id": cid, "score": merged_score})
+    if merged:
+        merged_sorted = sorted(merged, key=lambda x: -x["score"])
+        final_list = [m["chunk_id"] for m in merged_sorted][:top_k]
+    else:
+        final_list = deduped[:top_k]
+    final_records = []
+    for cid in final_list[:MAX_CHUNKS_TO_LLM]:
+        rec = _fetch_qdrant_by_chunk_id(cid)
+        if rec:
+            payload = rec.get("payload",{}) or {}
+            final_records.append({"document_id": payload.get("document_id"), "chunk_id": cid, "text": payload.get("text",""), "score": float(rrf_scores_second.get(cid,0.0))})
+    pieces = []
+    provenance = []
+    for r in final_records:
+        pieces.append(f"CHUNK (doc={r['document_id']} chunk={r['chunk_id']}):\n{r['text']}")
+        provenance.append({"document_id": r["document_id"], "chunk_id": r["chunk_id"], "score": r["score"]})
+    context = "\n\n---\n\n".join(pieces)
+    prompt = f"USE ONLY THE CONTEXT BELOW. Cite provenance by document_id.\n\nCONTEXT:\n{context}\n\nUSER QUERY:\n{query_text}\n"
+    return {"prompt": prompt, "provenance": provenance, "records": final_records, "llm": None}
 
 if __name__ == "__main__":
-    out = hybrid_query("How do I install User manual B?", top_k=5)
-    print("---- PROMPT ----\n", out["prompt"])
-    print("\n---- PROVENANCE ----")
+    q = "How to install User manual B?"
+    out = two_stage_query(q, top_k=TOP_K)
+    print("PROMPT:\n", out["prompt"][:2000])
+    print("\nPROVENANCE:")
     for p in out["provenance"]:
         print(p)
-    print("\n---- LLM ----\n", out["llm"])
-    close()

@@ -1,4 +1,4 @@
-ray==2.50.1
+ray==2.50.0
 qdrant-client==1.15.1
 neo4j==5.19.0
 neo4j-graphrag==1.10.0
