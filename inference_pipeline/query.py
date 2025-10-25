@@ -1,47 +1,45 @@
-#!/usr/bin/env python3
 from __future__ import annotations
-import os, time, logging, math, uuid, httpx
-from typing import List, Dict, Any, Optional, Tuple
+import os
+import time
+import logging
+import math
+from typing import List, Dict, Any, Optional
 import ray
 from ray import serve
-
+import httpx
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("query")
-
 RAY_ADDRESS = os.getenv("RAY_ADDRESS", "auto")
 RAY_NAMESPACE = os.getenv("RAY_NAMESPACE", None)
 EMBED_HANDLE_NAME = os.getenv("EMBED_DEPLOYMENT", "embed_onxx")
 RERANK_HANDLE_NAME = os.getenv("RERANK_HANDLE_NAME", "rerank_onxx")
-
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") or None
 PREFER_GRPC = os.getenv("PREFER_GRPC", "true").lower() in ("1", "true", "yes")
 QDRANT_COLLECTION = os.getenv("COLLECTION", "my_collection")
-
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "neo4j")
 NEO4J_FULLTEXT_INDEX = os.getenv("NEO4J_FULLTEXT_INDEX", "chunkTextIndex")
-
 VECTOR_DIM = int(os.getenv("VECTOR_DIM", "768"))
 TOP_K = int(os.getenv("TOP_K", "5"))
-
 TOP_VECTOR_CHUNKS = int(os.getenv("TOP_VECTOR_CHUNKS", "100"))
 TOP_BM25_CHUNKS = int(os.getenv("TOP_BM25_CHUNKS", "100"))
-
 FIRST_STAGE_RRF_K = int(os.getenv("FIRST_STAGE_RRF_K", "60"))
 MAX_CHUNKS_FOR_GRAPH_EXPANSION = int(os.getenv("MAX_CHUNKS_FOR_GRAPH_EXPANSION", "20"))
 GRAPH_EXPANSION_HOPS = int(os.getenv("GRAPH_EXPANSION_HOPS", "1"))
 SECOND_STAGE_RRF_K = int(os.getenv("SECOND_STAGE_RRF_K", "60"))
-
 MAX_CHUNKS_TO_CROSSENCODER = int(os.getenv("MAX_CHUNKS_TO_CROSSENCODER", "64"))
 MAX_CHUNKS_TO_LLM = int(os.getenv("MAX_CHUNKS_TO_LLM", "8"))
-
+INFERENCE_EMBEDDER_MAX_TOKENS = int(os.getenv("INFERENCE_EMBEDDER_MAX_TOKENS", "64"))
+CROSS_ENCODER_MAX_TOKENS = int(os.getenv("CROSS_ENCODER_MAX_TOKENS", "600"))
+ENABLE_METADATA_CHUNKS = os.getenv("ENABLE_METADATA_CHUNKS", "false").lower() in ("1", "true", "yes")
+MAX_METADATA_CHUNKS = int(os.getenv("MAX_METADATA_CHUNKS", "50"))
+ENABLE_CROSS_ENCODER = os.getenv("ENABLE_CROSS_ENCODER", "true").lower() in ("1", "true", "yes")
 RERANK_TOP = int(os.getenv("RERANK_TOP", "50"))
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "30"))
 RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "3"))
 RETRY_BASE = float(os.getenv("RETRY_BASE_SECONDS", "0.5"))
-
 try:
     from qdrant_client import QdrantClient
     from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchText
@@ -51,7 +49,6 @@ try:
     from neo4j import GraphDatabase, exceptions as neo4j_exceptions
 except Exception as e:
     raise RuntimeError("neo4j driver import failed: " + str(e))
-
 def retry(attempts: int = RETRY_ATTEMPTS, base: float = RETRY_BASE):
     def deco(fn):
         def wrapper(*a, **k):
@@ -68,7 +65,6 @@ def retry(attempts: int = RETRY_ATTEMPTS, base: float = RETRY_BASE):
             raise last
         return wrapper
     return deco
-
 def _resolve_handle_response(resp_obj, timeout: int = HTTP_TIMEOUT):
     if isinstance(resp_obj, (dict, list)):
         return resp_obj
@@ -91,17 +87,13 @@ def _resolve_handle_response(resp_obj, timeout: int = HTTP_TIMEOUT):
         return ray.get(resp_obj, timeout=timeout)
     except Exception as e:
         raise RuntimeError("Unable to resolve Serve handle response type: " + str(type(resp_obj)) + " -> " + str(e))
-
 @retry()
 def make_clients():
     q = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=PREFER_GRPC)
     drv = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
     return q, drv
-
 qdrant, neo4j_driver = make_clients()
-
 ray.init(address=RAY_ADDRESS, namespace=RAY_NAMESPACE, ignore_reinit_error=True)
-
 def _get_handle(name: str, timeout: float = 60.0, poll: float = 1.0, app_name: Optional[str] = "default"):
     start = time.time()
     last_exc = None
@@ -152,16 +144,13 @@ def _get_handle(name: str, timeout: float = 60.0, poll: float = 1.0, app_name: O
     except Exception:
         pass
     raise RuntimeError(f"Timed out waiting for Serve deployment {name}: {last_exc}")
-
 embed_handle = _get_handle(EMBED_HANDLE_NAME)
 rerank_handle = None
 try:
     rerank_handle = _get_handle(RERANK_HANDLE_NAME)
 except Exception:
     log.warning("No rerank handle available, cross-encoder will be skipped")
-
 _http = httpx.Client(timeout=HTTP_TIMEOUT)
-
 def _minmax_norm(xs: List[float]) -> List[float]:
     if not xs:
         return []
@@ -170,10 +159,9 @@ def _minmax_norm(xs: List[float]) -> List[float]:
     if mx <= mn:
         return [0.0 for _ in vals]
     return [(v - mn) / (mx - mn) for v in vals]
-
 @retry()
-def embed_text(text: str) -> List[float]:
-    resp_obj = embed_handle.remote({"texts": [text]})
+def embed_text(text: str, max_length: int = INFERENCE_EMBEDDER_MAX_TOKENS) -> List[float]:
+    resp_obj = embed_handle.remote({"texts": [text], "max_length": int(max_length)})
     resp = _resolve_handle_response(resp_obj, timeout=HTTP_TIMEOUT)
     if not isinstance(resp, dict) or "vectors" not in resp:
         raise RuntimeError("embed returned bad payload")
@@ -184,14 +172,14 @@ def embed_text(text: str) -> List[float]:
     if len(v) != VECTOR_DIM:
         raise RuntimeError("embed dim mismatch")
     return [float(x) for x in v]
-
 @retry()
-def cross_rerank(query: str, texts: List[str]) -> List[float]:
+def cross_rerank(query: str, texts: List[str], max_length: int = CROSS_ENCODER_MAX_TOKENS) -> List[float]:
     if not rerank_handle:
         raise RuntimeError("rerank handle not available")
     if not texts:
         return []
-    resp_obj = rerank_handle.remote({"query": query, "cands": texts})
+    payload = {"query": query, "cands": texts, "max_length": int(max_length)}
+    resp_obj = rerank_handle.remote(payload)
     resp = _resolve_handle_response(resp_obj, timeout=HTTP_TIMEOUT)
     if not isinstance(resp, dict) or "scores" not in resp:
         raise RuntimeError("rerank returned bad payload")
@@ -199,29 +187,32 @@ def cross_rerank(query: str, texts: List[str]) -> List[float]:
     if len(scores) != len(texts):
         raise RuntimeError("rerank returned wrong number of scores")
     return [float(s) for s in scores]
-
 @retry()
-def qdrant_vector_search(q_vec: List[float], top_k: int) -> List[Dict[str,Any]]:
-    results = qdrant.search(collection_name=QDRANT_COLLECTION, query_vector=q_vec, limit=top_k, with_payload=True, with_vector=False)
+def qdrant_vector_search(q_vec: List[float], top_k: int) -> List[Dict[str, Any]]:
+    try:
+        results = qdrant.search(collection_name=QDRANT_COLLECTION, query_vector=q_vec, limit=top_k, with_payload=True, with_vector=True)
+    except Exception as e:
+        log.warning("qdrant vector search failed: %s", e)
+        return []
+    out = []
+    for r in results:
+        payload = getattr(r, "payload", {}) or {}
+        vector = getattr(r, "vector", None)
+        out.append({"id": str(getattr(r, "id", None)), "score": float(getattr(r, "score", 0.0) or 0.0), "payload": payload, "vector": vector})
+    return out
+@retry()
+def qdrant_payload_keyword_search(q: str, top_k: int) -> List[Dict[str, Any]]:
+    try:
+        flt = Filter(must=[FieldCondition(key="snippet", match=MatchText(text=q))])
+        results = qdrant.search(collection_name=QDRANT_COLLECTION, query_vector=None, limit=top_k, with_payload=True, with_vector=False, query_filter=flt)
+    except Exception as e:
+        log.debug("qdrant payload keyword search failed: %s", e)
+        return []
     out = []
     for r in results:
         payload = getattr(r, "payload", {}) or {}
         out.append({"id": str(getattr(r, "id", None)), "score": float(getattr(r, "score", 0.0) or 0.0), "payload": payload})
     return out
-
-@retry()
-def qdrant_payload_keyword_search(q: str, top_k: int) -> List[Dict[str,Any]]:
-    try:
-        flt = Filter(must=[FieldCondition(key="text", match=MatchText(text=q))])
-        results = qdrant.search(collection_name=QDRANT_COLLECTION, query_vector=None, limit=top_k, with_payload=True, with_vector=False, query_filter=flt)
-        out = []
-        for r in results:
-            payload = getattr(r, "payload", {}) or {}
-            out.append({"id": str(getattr(r, "id", None)), "score": float(getattr(r, "score", 0.0) or 0.0), "payload": payload})
-        return out
-    except Exception:
-        return []
-
 @retry()
 def ensure_neo4j_fulltext_index(driver, index_name: str = NEO4J_FULLTEXT_INDEX):
     with driver.session() as session:
@@ -238,14 +229,13 @@ def ensure_neo4j_fulltext_index(driver, index_name: str = NEO4J_FULLTEXT_INDEX):
             log.info("Created Neo4j fulltext index %s", index_name)
         except Exception as e:
             log.warning("Could not create fulltext index (may already exist or incompatible server): %s", e)
-
 @retry()
-def neo4j_fulltext_search(driver, q: str, top_k: int) -> List[Dict[str,Any]]:
+def neo4j_fulltext_search(driver, q: str, top_k: int) -> List[Dict[str, Any]]:
     ensure_neo4j_fulltext_index(driver, NEO4J_FULLTEXT_INDEX)
     out = []
     with driver.session() as session:
         try:
-            cy = f"CALL db.index.fulltext.queryNodes('{NEO4J_FULLTEXT_INDEX}', $q) YIELD node, score RETURN node.chunk_id AS chunk_id, node.text AS text, score ORDER BY score DESC LIMIT $limit"
+            cy = (f"CALL db.index.fulltext.queryNodes('{NEO4J_FULLTEXT_INDEX}', $q) " "YIELD node, score RETURN node.chunk_id AS chunk_id, node.text AS text, score " "ORDER BY score DESC LIMIT $limit")
             res = session.run(cy, q=q, limit=top_k)
             for r in res:
                 out.append({"chunk_id": r["chunk_id"], "text": r["text"], "score": float(r["score"] or 0.0)})
@@ -254,9 +244,26 @@ def neo4j_fulltext_search(driver, q: str, top_k: int) -> List[Dict[str,Any]]:
         except Exception as e:
             log.warning("Neo4j fulltext query unexpected error: %s", e)
     return out
-
 @retry()
-def neo4j_expand_neighbors(driver, chunk_ids: List[str], hops: int, max_additional_per_start: int) -> List[Dict[str,Any]]:
+def neo4j_fetch_texts(driver, chunk_ids: List[str]) -> Dict[str, str]:
+    if not chunk_ids:
+        return {}
+    mapping: Dict[str, str] = {}
+    with driver.session() as session:
+        try:
+            res = session.run("MATCH (c:Chunk) WHERE c.chunk_id IN $ids RETURN c.chunk_id AS cid, c.text AS text", ids=list(chunk_ids))
+            for r in res:
+                try:
+                    cid = r["cid"]
+                    txt = r["text"] or ""
+                    mapping[cid] = txt
+                except Exception:
+                    pass
+        except Exception as e:
+            log.debug("neo4j_fetch_texts failed: %s", e)
+    return mapping
+@retry()
+def neo4j_expand_neighbors(driver, chunk_ids: List[str], hops: int, max_additional_per_start: int) -> List[Dict[str, Any]]:
     if not chunk_ids:
         return []
     collected = []
@@ -264,7 +271,7 @@ def neo4j_expand_neighbors(driver, chunk_ids: List[str], hops: int, max_addition
     with driver.session() as session:
         for cid in unique_start:
             try:
-                cy = "MATCH (start:Chunk {chunk_id:$cid})<-[:HAS_CHUNK]-(d:Document)-[:HAS_CHUNK]->(n:Chunk) RETURN DISTINCT n.chunk_id AS chunk_id, n.text AS text LIMIT $lim"
+                cy = ("MATCH (start:Chunk {chunk_id:$cid})<-[:HAS_CHUNK]-(d:Document)-[:HAS_CHUNK]->(n:Chunk) " "RETURN DISTINCT n.chunk_id AS chunk_id, n.text AS text LIMIT $lim")
                 res = session.run(cy, cid=cid, lim=max_additional_per_start)
             except Exception:
                 res = []
@@ -277,20 +284,18 @@ def neo4j_expand_neighbors(driver, chunk_ids: List[str], hops: int, max_addition
                 except Exception:
                     pass
     return collected
-
 def _rrf_fuse(ranked_lists: List[List[Any]], k: int) -> Dict[Any, float]:
-    scores = {}
+    scores: Dict[Any, float] = {}
     for lst in ranked_lists:
         for i, it in enumerate(lst):
             rank = i + 1
-            key = it if isinstance(it, (str, int)) else it.get("chunk_id") or it.get("id")
+            key = it if isinstance(it, (str, int)) else (it.get("chunk_id") or it.get("id"))
             if key is None:
                 continue
             scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
     return scores
-
 @retry()
-def _fetch_qdrant_by_chunk_id(chunk_id: str) -> Optional[Dict[str,Any]]:
+def _fetch_qdrant_by_chunk_id(chunk_id: str) -> Optional[Dict[str, Any]]:
     try:
         flt = Filter(must=[FieldCondition(key="chunk_id", match=MatchValue(value=chunk_id))])
         res = qdrant.search(collection_name=QDRANT_COLLECTION, query_vector=None, limit=1, with_payload=True, with_vector=True, query_filter=flt)
@@ -302,19 +307,17 @@ def _fetch_qdrant_by_chunk_id(chunk_id: str) -> Optional[Dict[str,Any]]:
     except Exception:
         pass
     return None
-
 def _cos_sim(a: List[float], b: List[float]) -> float:
     if not a or not b:
         return 0.0
-    sa = sum(x*x for x in a)
-    sb = sum(x*x for x in b)
+    sa = sum(x * x for x in a)
+    sb = sum(x * x for x in b)
     if sa == 0 or sb == 0:
         return 0.0
-    dp = sum(x*y for x,y in zip(a,b))
+    dp = sum(x * y for x, y in zip(a, b))
     return float(dp / (math.sqrt(sa) * math.sqrt(sb)))
-
-def _assemble_records_from_ids(chunk_ids: List[str]) -> List[Dict[str,Any]]:
-    out = []
+def _assemble_records_from_ids(chunk_ids: List[str]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
     seen = set()
     for cid in chunk_ids:
         if cid in seen:
@@ -322,23 +325,52 @@ def _assemble_records_from_ids(chunk_ids: List[str]) -> List[Dict[str,Any]]:
         rec = _fetch_qdrant_by_chunk_id(cid)
         if rec:
             payload = rec.get("payload", {}) or {}
-            out.append({"chunk_id": cid, "text": payload.get("text",""), "document_id": payload.get("document_id"), "qdrant_id": rec.get("id"), "vector": rec.get("vector")})
+            out.append({"chunk_id": cid, "qdrant_id": rec.get("id"), "snippet": payload.get("snippet", ""), "document_id": payload.get("document_id"), "vector": rec.get("vector")})
             seen.add(cid)
+    ids = [r["chunk_id"] for r in out]
+    texts_map = neo4j_fetch_texts(neo4j_driver, ids)
+    for r in out:
+        r["text"] = texts_map.get(r["chunk_id"], r.get("snippet", ""))
     return out
-
-def two_stage_query(query_text: str, top_k: int = TOP_K) -> Dict[str,Any]:
-    q_vec = embed_text(query_text)
+def two_stage_query(query_text: str, top_k: int = TOP_K) -> Dict[str, Any]:
+    q_vec = embed_text(query_text, max_length=INFERENCE_EMBEDDER_MAX_TOKENS)
     vec_list = qdrant_vector_search(q_vec, TOP_VECTOR_CHUNKS)
-    vec_chunk_ids = [v["payload"].get("chunk_id") for v in vec_list if v.get("payload")]
+    vec_scores = {}
+    vec_chunk_ids = []
+    for r in vec_list:
+        payload = r.get("payload", {}) or {}
+        cid = payload.get("chunk_id")
+        vec = r.get("vector")
+        if cid:
+            vec_chunk_ids.append(cid)
+            if vec:
+                try:
+                    vec_scores[cid] = _cos_sim(q_vec, [float(x) for x in vec])
+                except Exception:
+                    vec_scores[cid] = 0.0
+            else:
+                vec_scores[cid] = 0.0
     bm25_list = neo4j_fulltext_search(neo4j_driver, query_text, TOP_BM25_CHUNKS)
     bm25_chunk_ids = [b["chunk_id"] for b in bm25_list]
-    kw_list = qdrant_payload_keyword_search(query_text, TOP_BM25_CHUNKS)
+    if ENABLE_METADATA_CHUNKS:
+        kw_list = qdrant_payload_keyword_search(query_text, MAX_METADATA_CHUNKS)
+    else:
+        kw_list = []
     kw_chunk_ids = [k["payload"].get("chunk_id") for k in kw_list if k.get("payload")]
-    rrf_scores_first = _rrf_fuse([vec_chunk_ids, bm25_chunk_ids, kw_chunk_ids], k=FIRST_STAGE_RRF_K)
+    first_stage_lists = []
+    if vec_chunk_ids:
+        first_stage_lists.append(vec_chunk_ids)
+    if bm25_chunk_ids:
+        first_stage_lists.append(bm25_chunk_ids)
+    if ENABLE_METADATA_CHUNKS and kw_chunk_ids:
+        first_stage_lists.append(kw_chunk_ids)
+    if not first_stage_lists:
+        return {"prompt": "", "provenance": [], "records": [], "llm": None}
+    rrf_scores_first = _rrf_fuse(first_stage_lists, k=FIRST_STAGE_RRF_K)
     fused_sorted = sorted(rrf_scores_first.items(), key=lambda x: -x[1])
-    fused_ids = [i for i,s in fused_sorted]
+    fused_ids = [i for i, s in fused_sorted]
     if not fused_ids:
-        return {"prompt":"", "provenance": [], "records": [], "llm": None}
+        return {"prompt": "", "provenance": [], "records": [], "llm": None}
     deduped_fused = list(dict.fromkeys(fused_ids))
     to_expand = deduped_fused[:MAX_CHUNKS_FOR_GRAPH_EXPANSION]
     expanded = neo4j_expand_neighbors(neo4j_driver, to_expand, GRAPH_EXPANSION_HOPS, max_additional_per_start=RERANK_TOP)
@@ -346,26 +378,38 @@ def two_stage_query(query_text: str, top_k: int = TOP_K) -> Dict[str,Any]:
     combined_unique = list(dict.fromkeys(deduped_fused + expanded_ids))
     detailed = _assemble_records_from_ids(combined_unique)
     query_vec = q_vec
-    vec_scores_map = {}
+    vec_scores_map: Dict[str, float] = {}
     for d in detailed:
-        if d.get("vector"):
-            vec_scores_map[d["chunk_id"]] = _cos_sim(query_vec, [float(x) for x in d["vector"]])
-        else:
-            vec_scores_map[d["chunk_id"]] = 0.0
+        v = d.get("vector")
+        cid = d.get("chunk_id")
+        if cid:
+            if v:
+                try:
+                    vec_scores_map[cid] = _cos_sim(query_vec, [float(x) for x in v])
+                except Exception:
+                    vec_scores_map[cid] = 0.0
+            else:
+                vec_scores_map[cid] = 0.0
     bm25_map = {item["chunk_id"]: item["score"] for item in bm25_list}
-    kw_map = {}
+    kw_map: Dict[str, float] = {}
     for k in kw_list:
-        pid = k.get("payload",{}).get("chunk_id")
+        pid = k.get("payload", {}).get("chunk_id")
         if pid:
-            kw_map[pid] = kw_map.get(pid, 0.0) + float(k.get("score",0.0))
-    ranked_lists_for_second = []
-    vec_ranked = sorted(vec_scores_map.items(), key=lambda x: -x[1])
-    ranked_lists_for_second.append([cid for cid,sc in vec_ranked])
-    ranked_lists_for_second.append(sorted(bm25_map.keys(), key=lambda c: -bm25_map.get(c,0.0)))
-    ranked_lists_for_second.append(sorted(kw_map.keys(), key=lambda c: -kw_map.get(c,0.0)))
-    rrf_scores_second = _rrf_fuse(ranked_lists_for_second, k=SECOND_STAGE_RRF_K)
-    final_sorted = sorted(rrf_scores_second.items(), key=lambda x: -x[1])
-    final_ids = [cid for cid,sc in final_sorted]
+            kw_map[pid] = kw_map.get(pid, 0.0) + float(k.get("score", 0.0))
+    ranked_lists_for_second: List[List[str]] = []
+    if vec_scores_map:
+        vec_ranked = sorted(vec_scores_map.items(), key=lambda x: -x[1])
+        ranked_lists_for_second.append([cid for cid, sc in vec_ranked])
+    if bm25_map:
+        ranked_lists_for_second.append(sorted(bm25_map.keys(), key=lambda c: -bm25_map.get(c, 0.0)))
+    if ENABLE_METADATA_CHUNKS and kw_map:
+        ranked_lists_for_second.append(sorted(kw_map.keys(), key=lambda c: -kw_map.get(c, 0.0)))
+    if not ranked_lists_for_second:
+        final_ids = [d["chunk_id"] for d in detailed][:top_k]
+    else:
+        rrf_scores_second = _rrf_fuse(ranked_lists_for_second, k=SECOND_STAGE_RRF_K)
+        final_sorted = sorted(rrf_scores_second.items(), key=lambda x: -x[1])
+        final_ids = [cid for cid, sc in final_sorted]
     deduped = []
     seen = set()
     for cid in final_ids:
@@ -373,37 +417,51 @@ def two_stage_query(query_text: str, top_k: int = TOP_K) -> Dict[str,Any]:
             continue
         seen.add(cid)
         deduped.append(cid)
-    cross_candidates = deduped[:MAX_CHUNKS_TO_CROSSENCODER]
-    cross_texts = []
-    for cid in cross_candidates:
-        recs = _fetch_qdrant_by_chunk_id(cid)
-        if recs:
-            payload = recs.get("payload",{}) or {}
-            cross_texts.append(payload.get("text",""))
-    cross_scores = []
-    if cross_texts and rerank_handle:
+    final_after_cross = deduped
+    if ENABLE_CROSS_ENCODER and rerank_handle:
+        cross_candidates = deduped[:MAX_CHUNKS_TO_CROSSENCODER]
+        cross_texts_map = neo4j_fetch_texts(neo4j_driver, cross_candidates)
+        cross_texts = []
+        for cid in cross_candidates:
+            txt = cross_texts_map.get(cid)
+            if not txt:
+                rec = _fetch_qdrant_by_chunk_id(cid)
+                txt = (rec.get("payload", {}) or {}).get("snippet", "") if rec else ""
+            cross_texts.append(txt or "")
+        cross_scores = []
         try:
-            cross_scores = cross_rerank(query_text, cross_texts)
+            if cross_texts:
+                cross_scores = cross_rerank(query_text, cross_texts, max_length=CROSS_ENCODER_MAX_TOKENS)
         except Exception as e:
             log.warning("cross rerank failed: %s", e)
             cross_scores = []
-    merged = []
-    for i, cid in enumerate(cross_candidates):
-        base_score = float(rrf_scores_second.get(cid, 0.0))
-        cross_score = float(cross_scores[i]) if i < len(cross_scores) else 0.0
-        merged_score = 0.8 * cross_score + 0.2 * base_score if cross_scores else base_score
-        merged.append({"chunk_id": cid, "score": merged_score})
-    if merged:
-        merged_sorted = sorted(merged, key=lambda x: -x["score"])
-        final_list = [m["chunk_id"] for m in merged_sorted][:top_k]
+        if cross_scores:
+            merged = []
+            for i, cid in enumerate(cross_candidates):
+                base_score = float(rrf_scores_second.get(cid, 0.0)) if 'rrf_scores_second' in locals() else 0.0
+                cross_score = float(cross_scores[i]) if i < len(cross_scores) else 0.0
+                merged_score = 0.8 * cross_score + 0.2 * base_score
+                merged.append({"chunk_id": cid, "score": merged_score})
+            merged_sorted = sorted(merged, key=lambda x: -x["score"])
+            final_after_cross = [m["chunk_id"] for m in merged_sorted] + [c for c in deduped if c not in {m["chunk_id"] for m in merged}]
+        else:
+            final_after_cross = deduped
     else:
-        final_list = deduped[:top_k]
+        final_after_cross = deduped
+    final_list = final_after_cross[:top_k]
+    limited_for_llm = final_list[:MAX_CHUNKS_TO_LLM]
+    final_texts_map = neo4j_fetch_texts(neo4j_driver, limited_for_llm)
     final_records = []
-    for cid in final_list[:MAX_CHUNKS_TO_LLM]:
-        rec = _fetch_qdrant_by_chunk_id(cid)
-        if rec:
-            payload = rec.get("payload",{}) or {}
-            final_records.append({"document_id": payload.get("document_id"), "chunk_id": cid, "text": payload.get("text",""), "score": float(rrf_scores_second.get(cid,0.0))})
+    for cid in limited_for_llm:
+        qrec = _fetch_qdrant_by_chunk_id(cid)
+        payload = (qrec.get("payload", {}) if qrec else {}) or {}
+        snippet = payload.get("snippet", "")
+        docid = payload.get("document_id")
+        text = final_texts_map.get(cid, snippet)
+        base_score = 0.0
+        if 'rrf_scores_second' in locals():
+            base_score = float(rrf_scores_second.get(cid, 0.0))
+        final_records.append({"document_id": docid, "chunk_id": cid, "text": text, "score": base_score})
     pieces = []
     provenance = []
     for r in final_records:
@@ -412,7 +470,6 @@ def two_stage_query(query_text: str, top_k: int = TOP_K) -> Dict[str,Any]:
     context = "\n\n---\n\n".join(pieces)
     prompt = f"USE ONLY THE CONTEXT BELOW. Cite provenance by document_id.\n\nCONTEXT:\n{context}\n\nUSER QUERY:\n{query_text}\n"
     return {"prompt": prompt, "provenance": provenance, "records": final_records, "llm": None}
-
 if __name__ == "__main__":
     q = "How to install User manual B?"
     out = two_stage_query(q, top_k=TOP_K)

@@ -1,4 +1,4 @@
-FROM python:3.10.12-slim-bullseye AS builder
+FROM python:3.12-slim-bullseye AS builder
 ENV DEBIAN_FRONTEND=noninteractive
 ENV VENV_PATH=/opt/venv
 ENV MODEL_HOME=/opt/models
@@ -18,7 +18,7 @@ RUN mkdir -p /wheels
 RUN ${VENV_PATH}/bin/pip wheel -r /workspace/requirements.txt -w /wheels
 RUN ${VENV_PATH}/bin/pip install --no-index --find-links=/wheels -r /workspace/requirements.txt
 
-FROM python:3.10.12-slim-bullseye AS runtime
+FROM python:3.12-slim-bullseye AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV VENV_PATH=/opt/venv
@@ -79,13 +79,7 @@ ENV CONCURRENCY=2
 ENV INDEXING_EMBEDDER_MAX_LENGTH=2048
 ENV METRICS_PORT=8000
 ENV HEALTH_PORT=8082
-ENV WEAVIATE_URL="http://localhost:8080"
-ENV WEAVIATE_API_KEY=""
-ENV WEAVIATE_GRPC_HOST=""
-ENV WEAVIATE_GRPC_PORT=50051
-ENV WEAVIATE_GRPC_SECURE=false
-ENV WEAVIATE_FORCE_REST=0
-ENV WEAVIATE_COLLECTION="Chunk"
+
 ENV SELECTIVE_UPSERT=1
 ENV FORCE_REHASH=0
 ENV MAX_HASH_FETCH=5000

@@ -1,11 +1,5 @@
-#!/usr/bin/env python3
 from __future__ import annotations
-import os
-import sys
-import json
-import time
-import uuid
-import logging
+import os, sys, json, time, uuid, logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import ray
@@ -15,6 +9,8 @@ RAY_NAMESPACE = os.getenv("RAY_NAMESPACE", None)
 DATA_IN_LOCAL = os.getenv("DATA_IN_LOCAL", "true").lower() in ("1", "true", "yes")
 LOCAL_DIR_PATH = os.getenv("LOCAL_DIR_PATH", "data/chunked/")
 EMBED_DEPLOYMENT = os.getenv("EMBED_DEPLOYMENT", "embed_onxx")
+INDEXING_EMBEDDER_MAX_TOKENS = int(os.getenv("INDEXING_EMBEDDER_MAX_TOKENS", "512"))
+SNIPPET_MAX_CHARS = int(os.getenv("SNIPPET_MAX_CHARS", "512"))
 VECTOR_DIM = int(os.getenv("VECTOR_DIM", "768"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "64"))
 EMBED_SUB_BATCH = int(os.getenv("EMBED_SUB_BATCH", "32"))
@@ -83,7 +79,7 @@ def ensure_document_and_chunks(driver, document_id: str, file_name: str, chunks_
         tx = session.begin_transaction()
         tx.run("MERGE (d:Document {document_id:$doc_id}) SET d.file_name=$file_name, d.updated_at = datetime()", doc_id=document_id, file_name=file_name)
         for cm in chunks_meta:
-            tx.run("MERGE (c:Chunk {chunk_id:$chunk_id}) SET c.token_count=$token_count, c.file_type=$file_type, c.source_url=$source_url, c.timestamp=$timestamp WITH c MATCH (d:Document {document_id:$doc_id}) MERGE (d)-[:HAS_CHUNK]->(c)", chunk_id=cm.get("chunk_id"), token_count=cm.get("token_count"), file_type=cm.get("file_type"), source_url=cm.get("source_url"), timestamp=cm.get("timestamp"), doc_id=document_id)
+            tx.run("MERGE (c:Chunk {chunk_id:$chunk_id}) SET c.text=$text, c.token_count=$token_count, c.file_type=$file_type, c.source_url=$source_url, c.timestamp=$timestamp, c.file_name=$file_name WITH c MATCH (d:Document {document_id:$doc_id}) MERGE (d)-[:HAS_CHUNK]->(c)", chunk_id=cm.get("chunk_id"), text=cm.get("text") or "", token_count=cm.get("token_count"), file_type=cm.get("file_type"), source_url=cm.get("source_url"), timestamp=cm.get("timestamp"), file_name=cm.get("file_name"), doc_id=document_id)
         tx.commit()
     log.debug("Neo4j metadata stored for %s (%d chunks)", document_id, len(chunks_meta))
 def _resolve_handle_response(resp_obj, embed_timeout: int = EMBED_TIMEOUT):
@@ -120,7 +116,7 @@ def _get_embed_handle(name: str, timeout: float = 60.0, poll: float = 1.0, app_n
             if hasattr(serve, "get_deployment_handle"):
                 try:
                     handle = serve.get_deployment_handle(name, app_name=app_name, _check_exists=False)
-                    resp_obj = handle.remote({"texts": ["health-check"]})
+                    resp_obj = handle.remote({"texts": ["health-check"], "max_length": INDEXING_EMBEDDER_MAX_TOKENS})
                     _resolve_handle_response(resp_obj, embed_timeout=EMBED_TIMEOUT)
                     return handle
                 except Exception as e:
@@ -129,7 +125,7 @@ def _get_embed_handle(name: str, timeout: float = 60.0, poll: float = 1.0, app_n
                 try:
                     dep = serve.get_deployment(name)
                     handle = dep.get_handle(sync=False)
-                    resp_obj = handle.remote({"texts": ["health-check"]})
+                    resp_obj = handle.remote({"texts": ["health-check"], "max_length": INDEXING_EMBEDDER_MAX_TOKENS})
                     _resolve_handle_response(resp_obj, embed_timeout=EMBED_TIMEOUT)
                     return handle
                 except Exception as e:
@@ -137,7 +133,7 @@ def _get_embed_handle(name: str, timeout: float = 60.0, poll: float = 1.0, app_n
             if hasattr(serve, "get_handle"):
                 try:
                     handle = serve.get_handle(name, sync=False)
-                    resp_obj = handle.remote({"texts": ["health-check"]})
+                    resp_obj = handle.remote({"texts": ["health-check"], "max_length": INDEXING_EMBEDDER_MAX_TOKENS})
                     _resolve_handle_response(resp_obj, embed_timeout=EMBED_TIMEOUT)
                     return handle
                 except Exception as e:
@@ -149,7 +145,7 @@ def _get_embed_handle(name: str, timeout: float = 60.0, poll: float = 1.0, app_n
             time.sleep(poll)
     try:
         import httpx
-        r = httpx.post(f"http://127.0.0.1:8000/{name}", json={"texts": ["health-check"]}, timeout=10.0)
+        r = httpx.post(f"http://127.0.0.1:8000/{name}", json={"texts": ["health-check"], "max_length": INDEXING_EMBEDDER_MAX_TOKENS}, timeout=10.0)
         if r.status_code == 200:
             log.warning("Using HTTP fallback for Serve deployment %s", name)
             class _HTTPHandle:
@@ -164,17 +160,7 @@ def _get_embed_handle(name: str, timeout: float = 60.0, poll: float = 1.0, app_n
         pass
     raise RuntimeError(f"Timed out waiting for Serve deployment {name}: {last_exc}")
 def _normalize_chunk_obj(raw: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "document_id": raw.get("document_id"),
-        "chunk_id": raw.get("chunk_id") or str(uuid.uuid4()),
-        "text": raw.get("text", "") or "",
-        "token_count": int(raw.get("token_count") or 0),
-        "file_type": raw.get("file_type") or "",
-        "file_name": raw.get("file_name") or "",
-        "source_url": raw.get("source_url") or "",
-        "timestamp": raw.get("timestamp") or "",
-        "parser_version": raw.get("parser_version") or "",
-    }
+    return {"document_id": raw.get("document_id"), "chunk_id": raw.get("chunk_id") or str(uuid.uuid4()), "text": raw.get("text", "") or "", "token_count": int(raw.get("token_count") or 0), "file_type": raw.get("file_type") or "", "file_name": raw.get("file_name") or "", "source_url": raw.get("source_url") or "", "timestamp": raw.get("timestamp") or "", "parser_version": raw.get("parser_version") or ""}
 @retry()
 def ingest_files(local_dir: str = LOCAL_DIR_PATH):
     _ensure_ray_connected()
@@ -231,12 +217,15 @@ def _embed_and_store_batch(handle, qdrant_client, neo4j_driver, texts, metas, to
         sub_texts = texts[i:i+EMBED_SUB_BATCH]
         sub_metas = metas[i:i+EMBED_SUB_BATCH]
         t0 = time.time()
-        resp_obj = handle.remote({"texts": sub_texts})
+        payload = {"texts": sub_texts, "max_length": INDEXING_EMBEDDER_MAX_TOKENS}
+        resp_obj = handle.remote(payload)
         resp = _resolve_handle_response(resp_obj, embed_timeout=EMBED_TIMEOUT)
         t1 = time.time()
         log.info("Embed sub-batch size=%d elapsed=%.3fs", len(sub_texts), t1 - t0)
         if not isinstance(resp, dict) or "vectors" not in resp:
             raise RuntimeError("embed returned unexpected response")
+        if "max_length_used" in resp:
+            log.debug("embed used max_length=%s", resp.get("max_length_used"))
         vectors = resp["vectors"]
         if len(vectors) != len(sub_texts):
             raise RuntimeError("embed returned mismatched vectors")
@@ -248,27 +237,11 @@ def _embed_and_store_batch(handle, qdrant_client, neo4j_driver, texts, metas, to
                 point_uuid = str(uuid.uuid5(uuid.NAMESPACE_OID, orig_cid if orig_cid else str(uuid.uuid4())))
             except Exception:
                 point_uuid = str(uuid.uuid4())
-            payload = {
-                "document_id": meta.get("document_id"),
-                "chunk_id": meta.get("chunk_id"),
-                "text": meta.get("text"),
-                "token_count": meta.get("token_count"),
-                "file_name": meta.get("file_name"),
-                "file_type": meta.get("file_type"),
-                "source_url": meta.get("source_url"),
-                "timestamp": meta.get("timestamp"),
-                "parser_version": meta.get("parser_version"),
-            }
-            point = PointStruct(id=point_uuid, vector=[float(x) for x in vec], payload=payload)
+            snippet = (meta.get("text") or "")[:SNIPPET_MAX_CHARS]
+            q_payload = {"document_id": meta.get("document_id"), "chunk_id": meta.get("chunk_id"), "snippet": snippet, "token_count": meta.get("token_count"), "file_name": meta.get("file_name"), "file_type": meta.get("file_type"), "source_url": meta.get("source_url"), "timestamp": meta.get("timestamp"), "parser_version": meta.get("parser_version")}
+            point = PointStruct(id=point_uuid, vector=[float(x) for x in vec], payload=q_payload)
             to_upsert.append(point)
-            cm_for_neo4j = {
-                "chunk_id": meta.get("chunk_id"),
-                "token_count": meta.get("token_count"),
-                "file_type": meta.get("file_type"),
-                "source_url": meta.get("source_url"),
-                "timestamp": meta.get("timestamp"),
-                "file_name": meta.get("file_name"),
-            }
+            cm_for_neo4j = {"chunk_id": meta.get("chunk_id"), "text": meta.get("text") or "", "token_count": meta.get("token_count"), "file_type": meta.get("file_type"), "source_url": meta.get("source_url"), "timestamp": meta.get("timestamp"), "file_name": meta.get("file_name")}
             docid = meta.get("document_id")
             if docid:
                 neo4j_batch_map.setdefault(docid, []).append(cm_for_neo4j)
