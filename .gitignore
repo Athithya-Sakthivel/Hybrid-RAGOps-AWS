@@ -8,3 +8,5 @@ venv
 venv1
 neo4j
 qdrant
+*.db
+*.tar.gz
