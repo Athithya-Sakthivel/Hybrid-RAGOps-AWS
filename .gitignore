@@ -10,3 +10,4 @@ neo4j
 qdrant
 *.db
 *.tar.gz
+run
