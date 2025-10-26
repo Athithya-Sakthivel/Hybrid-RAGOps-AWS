@@ -1,115 +1,123 @@
+# Retrieval plan (ideal, concrete & deterministic)
+
+## Environment toggles (add these to your runtime)
+
+* `ENABLE_METADATA_CHUNKS` (`true` / `false`) — default: `false`
+  When `true` run a payload keyword search (Qdrant MatchText) and include that ranked list in first-stage RRF. Controlled size: `MAX_METADATA_CHUNKS`.
+* `MAX_METADATA_CHUNKS` (integer) — default: `50`
+  Max results to return from payload/metadata keyword search.
+* `ENABLE_CROSS_ENCODER` (`true` / `false`) — default: `true`
+  If `true` run cross-encoder (Serve) on top candidates and use its scores to re-rank before selecting LLM context. If `false` skip cross-encoder and pass deduped ordered chunks to LLM.
+
+(You may also keep the other envs we discussed: `TOP_VECTOR_CHUNKS`, `TOP_BM25_CHUNKS`, `FIRST_STAGE_RRF_K`, `MAX_CHUNKS_FOR_GRAPH_EXPANSION`, `GRAPH_EXPANSION_HOPS`, `SECOND_STAGE_RRF_K`, `MAX_CHUNKS_TO_CROSSENCODER`, `MAX_CHUNKS_TO_LLM`, `INFERENCE_EMBEDDER_MAX_TOKENS`, `CROSS_ENCODER_MAX_TOKENS` etc.)
+
+---
+
+## High-level summary (1 sentence)
+
+Embed query → fetch candidate lists (vectors, BM25, optional metadata) → **first-stage RRF** fuse → dedupe → seed graph expansion → assemble candidate details → **second-stage RRF** fuse → optional cross-encoder re-rank → choose final top chunks for LLM.
+
+---
+
+## Step-by-step concrete workflow
+
+### 0) Pre-reqs / constants (recommended defaults)
+
+* `TOP_VECTOR_CHUNKS = 200` (ANN fetch window)
+* `TOP_BM25_CHUNKS = 100`
+* `ENABLE_METADATA_CHUNKS = true|false`
+* `MAX_METADATA_CHUNKS = 50` (only used if `ENABLE_METADATA_CHUNKS=true`)
+* `FIRST_STAGE_RRF_K = 60`
+* `MAX_CHUNKS_FOR_GRAPH_EXPANSION = 20`
+* `GRAPH_EXPANSION_HOPS = 1`
+* `SECOND_STAGE_RRF_K = 60`
+* `ENABLE_CROSS_ENCODER = true|false` 
+* `MAX_CHUNKS_TO_CROSSENCODER = 64 (only used if `ENABLE_CROSS_ENCODER = true`)`
+* `MAX_CHUNKS_TO_LLM = 8`
 
 
+### 1) Embed query (single call)
 
+* Call embedder with `INFERENCE_EMBEDDER_MAX_TOKENS` (e.g. 60).
+* Produce `q_vec` (normalized).
 
+### 2) Retrieve raw ranked lists (parallel)
 
+Run these **in parallel** to minimize latency:
 
+A. **Vector ANN fetch** (Qdrant) — get top `TOP_VECTOR_CHUNKS` candidate IDs & (preferably) their stored vectors.
 
-# Ray Serve / ONNX deployment settings
-export RAY_ADDRESS="auto"
-export RAY_NAMESPACE="default"
+* Immediately **fetch vectors** for those candidates and compute exact cosine similarity locally with `q_vec` (this yields the *bi-encoder rescored vector ranking* — important step).
 
-# Deployment names (must match query/ingest)
-export EMBED_DEPLOYMENT="embed_onxx"
-export RERANK_HANDLE_NAME="rerank_onxx"
+B. **Neo4j fulltext (BM25-style)** — `CALL db.index.fulltext.queryNodes(...)` to return top `TOP_BM25_CHUNKS` candidate chunk IDs with Lucene scores.
 
-# ONNX / model locations
-export ONNX_USE_CUDA="false"                      # "true" to use CUDAExecutionProvider
-export MODEL_DIR_EMBED="/models/gte-modernbert-base"
-export MODEL_DIR_RERANK="/models/gte-reranker-modernbert-base"
-export ONNX_EMBED_PATH="${MODEL_DIR_EMBED}/onnx/model_int8.onnx"
-export ONNX_EMBED_TOKENIZER_PATH="${MODEL_DIR_EMBED}/tokenizer.json"
-export ONNX_RERANK_PATH="${MODEL_DIR_RERANK}/onnx/model_int8.onnx"
-export ONNX_RERANK_TOKENIZER_PATH="${MODEL_DIR_RERANK}/tokenizer.json"
+C. **Optional: payload keyword search (metadata)** — *only if* `ENABLE_METADATA_CHUNKS=true`: run Qdrant payload MatchText/MATCH on `text` (or other metadata) and return up to `MAX_METADATA_CHUNKS`. This is treated as a third ranked list (fall-back/metadata).
 
-# Replicas / GPU / runtime knobs
-export EMBED_REPLICAS="1"
-export RERANK_REPLICAS="1"
-export EMBED_GPU_PER_REPLICA="0"   # number of GPUs per embed replica (string)
-export RERANK_GPU_PER_REPLICA="0"  # number of GPUs per rerank replica (string)
+Outputs: three ordered lists of chunk IDs with scores:
 
-# ONNX/ORT tuning
-export MAX_RERANK="256"
-export ORT_INTRA_THREADS="1"
-export ORT_INTER_THREADS="1"
+* `vec_rank` (by exact cosine on fetched vectors)
+* `bm25_rank` (Neo4j Lucene scores)
+* `kw_rank` (optional metadata/payload search)
 
-# Logging / debug
-export LOG_LEVEL="INFO"
+> Note: **Do not** use raw ANN distance ordering for RRF — always do local rescoring (cosine) on the ANN window.
 
+### 3) First-stage fusion (RRF)
 
-# Ray / local data
-export RAY_ADDRESS="auto"
-export RAY_NAMESPACE="default"
-export DATA_IN_LOCAL="true"
-export LOCAL_DIR_PATH="data/chunked/"
+* Input: `vec_rank`, `bm25_rank`, optional `kw_rank`.
+* Use Reciprocal Rank Fusion: for each ranked list, for an item at rank `r` add score `1/(k + r)` to that item, with `k = FIRST_STAGE_RRF_K`. Sum across lists.
+* Sort by fused score descending → `fused_list`.
 
-# Deployments / embedding
-export EMBED_DEPLOYMENT="embed_onxx"
-export INDEXING_EMBEDDER_MAX_TOKENS="512"   # truncate/truncation for embedder during indexing
+### 4) Deduplicate fused list (important)
 
-# Embedding / batching / vector dim
-export VECTOR_DIM="768"
-export BATCH_SIZE="64"
-export EMBED_SUB_BATCH="32"
-export EMBED_TIMEOUT="60"
+* Remove duplicate chunk IDs while keeping **first occurrence order** (stable). Call this `deduped_fused`.
+* Rationale: avoid expanding same chunk multiple times and keep highest-first-stage precedence.
 
-# Qdrant settings
-export QDRANT_URL="http://127.0.0.1:6333"
-export QDRANT_API_KEY=""                    # set if you use Qdrant API key
-export PREFER_GRPC="true"
-export COLLECTION="my_collection"          # Qdrant collection name
+### 5) Choose seeds and Graph expansion
 
-# Neo4j settings (replace password!)
-export NEO4J_URI="bolt://127.0.0.1:7687"
-export NEO4J_USER="neo4j"
-export NEO4J_PASSWORD="ReplaceWithStrongPass!"
+* Seeds = `deduped_fused[:MAX_CHUNKS_FOR_GRAPH_EXPANSION]`.
+* Run graph expansion in Neo4j for `GRAPH_EXPANSION_HOPS` hops. **Expansion logic:** for each seed chunk, collect neighbor chunks according to relationships you care about (Document→Chunk neighbors, citations, same-author, etc.). Limit per-seed neighbors (e.g. `max_additional_per_start = RERANK_TOP`).
+* Add expanded neighbor chunk IDs to pool, preserving uniqueness. Call result `combined_unique_candidates`.
 
-# Retry / misc
-export RETRY_ATTEMPTS="3"
-export RETRY_BASE_SECONDS="0.5"
-export LOG_LEVEL="INFO"
+### 6) Assemble detailed candidate records
 
-# Ray / handles
-export RAY_ADDRESS="auto"
-export RAY_NAMESPACE="default"
-export EMBED_DEPLOYMENT="embed_onxx"        # used as EMBED_HANDLE_NAME in query
-export RERANK_HANDLE_NAME="rerank_onxx"
+For each chunk in `combined_unique_candidates`:
 
-# Qdrant
-export QDRANT_URL="http://127.0.0.1:6333"
-export QDRANT_API_KEY=""                    # set if required
-export PREFER_GRPC="true"
-export COLLECTION="my_collection"
+* Fetch payload (text, document_id, token_count) and vector from Qdrant (`with_vector=True`) — this provides text + vector + any metadata.
+* If BM25 produced a score for that chunk, include it in a `bm25_map`. If not present, treat bm25=0.
+* If metadata kw list produced score, include in `kw_map`.
 
-# Neo4j
-export NEO4J_URI="bolt://127.0.0.1:7687"
-export NEO4J_USER="neo4j"
-export NEO4J_PASSWORD="ReplaceWithStrongPass!"
-export NEO4J_FULLTEXT_INDEX="chunkTextIndex"
+You now have for each candidate: `{chunk_id, text, vector, bm25_score, kw_score, doc_id, token_count}`.
 
-# Vector / retrieval tuning
-export VECTOR_DIM="768"
-export TOP_K="5"
-export TOP_VECTOR_CHUNKS="100"
-export TOP_BM25_CHUNKS="100"
+### 7) Compute fresh vector similarity ranking
 
-# Two-stage & graph expansion RRF knobs
-export FIRST_STAGE_RRF_K="60"
-export MAX_CHUNKS_FOR_GRAPH_EXPANSION="20"
-export GRAPH_EXPANSION_HOPS="1"
-export SECOND_STAGE_RRF_K="60"
+* Compute exact cosine similarity between `q_vec` and each candidate vector. Produce `vec_map` and `vec_rank2` (descending).
 
-# Cross-encoder / LLM limits
-export MAX_CHUNKS_TO_CROSSENCODER="64"
-export MAX_CHUNKS_TO_LLM="8"
+### 8) Second-stage fusion (RRF) over assembled candidates
 
-# Token limits for inference
-export INFERENCE_EMBEDDER_MAX_TOKENS="64"
-export CROSS_ENCODER_MAX_TOKENS="600"
+* Build ranked lists over the candidate pool:
 
-# Misc
-export RERANK_TOP="50"
-export HTTP_TIMEOUT="30"
-export RETRY_ATTEMPTS="3"
-export RETRY_BASE_SECONDS="0.5"
-export LOG_LEVEL="INFO"
+  * `vec_rank2` (by computed cosine)
+  * `bm25_rank2` (by `bm25_map`)
+  * `kw_rank2` (if enabled, by `kw_map`)
+  * Optionally, `graph_rank` (score by number-of-seed-connections or inverse distance)
+* Fuse with RRF with `SECOND_STAGE_RRF_K`. Sort -> `final_fused_order`.
+* Deduplicate again (stable).
+
+### 9) Cross-encoder re-ranking (conditional)
+
+* If `ENABLE_CROSS_ENCODER=true`:
+
+  * Take top `MAX_CHUNKS_TO_CROSSENCODER` from `final_fused_order` (or fewer if list shorter).
+  * Call cross-encoder with `max_length = CROSS_ENCODER_MAX_TOKENS` (truncate/pad as needed). Provide pairs `(query, chunk_text)`.
+  * Receive dense relevance scores; combine with second-stage fused scores: e.g. `combined_score = w_cross * cross_score + (1 - w_cross) * base_score` (suggest `w_cross=0.8` by default). Sort by `combined_score`.
+* If `ENABLE_CROSS_ENCODER=false`:
+
+  * Skip cross-encoder and use `final_fused_order` directly.
+
+### 10) Final selection → LLM prompt assembly
+
+* Choose top `MAX_CHUNKS_TO_LLM` chunks after cross-encoder (or after final fused if cross off).
+* **Optional token budget enforcement**: iterate chunks in order, accumulate tokens (use `token_count` from payload or estimate via tokenizer) and stop when `SUM(tokens) + estimated_prompt_tokens >= MAX_PROMPT_TOKENS`. This prevents wasted compute & exceeds LLM limits.
+* Assemble prompt using selected chunks, include provenance (document_id, chunk_id, score).
+
+---

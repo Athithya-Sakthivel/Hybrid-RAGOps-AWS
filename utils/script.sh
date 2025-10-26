@@ -1,5 +1,9 @@
 
 
+grep -qxF 'source .venv/bin/activate' ~/.bashrc || echo 'source .venv/bin/activate' >> ~/.bashrc
+
+
+
 if [ "${ENABLE_CROSS_ENCODER:-true}" = "true" ]; then
   echo "[info] ollama container (optional)"
   docker rm -f ollama 2>/dev/null || true

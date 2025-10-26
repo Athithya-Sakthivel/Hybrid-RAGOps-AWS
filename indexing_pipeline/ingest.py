@@ -1,10 +1,32 @@
 #!/usr/bin/env python3
 # ingest.py
-# Production-ready, non-breaking ingestion for hybrid vector+graph RAG.
+# Production-ready ingestion for hybrid vector+graph RAG.
 # Targets: ray==2.50.0, qdrant-client==1.15.1, neo4j==5.19.0
+#
+# Required env variables (examples):
+#   QDRANT_URL="https://<qdrant-endpoint>"
+#   QDRANT_API_KEY="...."
+#   COLLECTION="my_collection"
+#   NEO4J_URI="neo4j+s://<host>:7687"
+#   NEO4J_USER="neo4j"
+#   NEO4J_PASSWORD="..."
+#   VECTOR_DIM=768
+#   EMBED_DEPLOYMENT="embed_onxx"
+#   DATA_IN_LOCAL=true
+#   LOCAL_DIR_PATH="data/chunked/"
+#   DO_BACKUP_AFTER_INDEXING=false   # optional, provider-managed backups preferred
+#
 
 from __future__ import annotations
-import os, sys, json, time, uuid, logging, random, signal, sqlite3
+import os
+import sys
+import json
+import time
+import uuid
+import logging
+import random
+import signal
+import sqlite3
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -12,7 +34,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import ray
 from ray import serve
 
-# Config (env driven)
+# ---------- Config (env-driven) ----------
 RAY_ADDRESS = os.getenv("RAY_ADDRESS", "auto")
 RAY_NAMESPACE = os.getenv("RAY_NAMESPACE", None)
 DATA_IN_LOCAL = os.getenv("DATA_IN_LOCAL", "true").lower() in ("1", "true", "yes")
@@ -23,9 +45,9 @@ EMBED_TIMEOUT = int(os.getenv("EMBED_TIMEOUT", "60"))
 SNIPPET_MAX_CHARS = int(os.getenv("SNIPPET_MAX_CHARS", "512"))
 VECTOR_DIM = int(os.getenv("VECTOR_DIM", "768"))
 
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "64"))            # Qdrant upsert batch
-EMBED_SUB_BATCH = int(os.getenv("EMBED_SUB_BATCH", "32"))  # embed calls
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))           # parallel upsert workers
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "64"))
+EMBED_SUB_BATCH = int(os.getenv("EMBED_SUB_BATCH", "32"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
 
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") or None
@@ -46,7 +68,7 @@ SQLITE_STATE_DB = os.getenv("SQLITE_STATE_DB", "ingest_state.db")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("ingest")
 
-# external libs
+# ---------- external libs ----------
 try:
     from qdrant_client import QdrantClient
     from qdrant_client.models import PointStruct, VectorParams, Distance
@@ -54,7 +76,7 @@ except Exception as e:
     raise RuntimeError("qdrant-client import failed: " + str(e))
 
 try:
-    from neo4j import GraphDatabase, basic_auth
+    from neo4j import GraphDatabase
 except Exception as e:
     raise RuntimeError("neo4j driver import failed: " + str(e))
 
@@ -133,12 +155,18 @@ def ensure_qdrant_collection(client: QdrantClient, collection: str, dim: int):
     else:
         log.debug("Qdrant collection %s already exists", collection)
 
+    # best-effort: create payload indexes for common fields
     for field in ("document_id", "chunk_id", "file_name", "source_url"):
         try:
+            # qdrant-client API surface varies by version; attempt typical call and ignore failures
             client.create_payload_index(collection_name=collection, field_name=field, field_schema="keyword")
             log.debug("Ensured payload index for %s", field)
-        except Exception as e:
-            log.debug("create_payload_index skipped/failed for %s: %s", field, e)
+        except Exception:
+            try:
+                client.create_payload_index(collection_name=collection, field_name=field)
+                log.debug("Ensured payload index (alt) for %s", field)
+            except Exception as e:
+                log.debug("create_payload_index skipped/failed for %s: %s", field, e)
 
 @retryable()
 def qdrant_upsert_batch(client: QdrantClient, collection: str, points: List[PointStruct]):
@@ -173,13 +201,14 @@ def neo4j_bulk_write(driver, chunks: List[Dict[str, Any]]):
       ON MATCH SET ch.updated_at = datetime(), ch.qdrant_id = c.qdrant_point_id
     MERGE (d)-[:HAS_CHUNK]->(ch)
     """
+    # batch large writes to avoid giant transactions
     for i in range(0, len(chunks), 1000):
         batch = chunks[i:i+1000]
         with driver.session() as s:
             s.execute_write(lambda tx: tx.run(cypher, chunks=batch))
         log.info("Neo4j wrote %d chunks", len(batch))
 
-# ---------- Ray Serve helpers (original logic) ----------
+# ---------- Ray Serve helpers ----------
 def _resolve_handle_response(resp_obj, embed_timeout: int = EMBED_TIMEOUT):
     if isinstance(resp_obj, (dict, list)):
         return resp_obj
@@ -243,7 +272,6 @@ def _get_embed_handle(name: str, timeout: float = 60.0, poll: float = 1.0, app_n
             last_exc = e
             log.debug("waiting for embed handle %s: %s", name, e)
             time.sleep(poll)
-    # no HTTP fallback added (keeps behavior consistent), raise
     raise RuntimeError(f"Timed out waiting for Serve deployment {name}: {last_exc}")
 
 # ---------- Ingestor ----------
