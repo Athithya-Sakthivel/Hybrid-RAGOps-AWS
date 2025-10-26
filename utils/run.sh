@@ -1,1 +1,1 @@
-ray stop && ray start --head && python3 infra/rayserve_onnx.py
+sudo rm -rf /tmp/ray/ && ray stop --force && ray start --head && python3 infra/rayserve_onnx.py

@@ -6,52 +6,57 @@ import json
 import math
 import logging
 from typing import List, Dict, Any, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import ray
+from ray import serve
 
-# Basic logging
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "DEBUG"))
+# env / logging
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("query")
 
-# Config (tune for interactive runs)
 RAY_ADDRESS = os.getenv("RAY_ADDRESS", "auto")
 RAY_NAMESPACE = os.getenv("RAY_NAMESPACE", None)
+
 EMBED_HANDLE_NAME = os.getenv("EMBED_DEPLOYMENT", "embed_onxx")
 RERANK_HANDLE_NAME = os.getenv("RERANK_HANDLE_NAME", "rerank_onxx")
+
+SERVE_HTTP_HOST = os.getenv("SERVE_HTTP_HOST", "127.0.0.1")
+SERVE_HTTP_PORT = int(os.getenv("SERVE_HTTP_PORT", "8000"))
+
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") or None
 PREFER_GRPC = os.getenv("PREFER_GRPC", "true").lower() in ("1", "true", "yes")
 QDRANT_COLLECTION = os.getenv("COLLECTION", "my_collection")
+
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "neo4j")
 NEO4J_FULLTEXT_INDEX = os.getenv("NEO4J_FULLTEXT_INDEX", "chunkTextIndex")
 
 VECTOR_DIM = int(os.getenv("VECTOR_DIM", "768"))
+
 TOP_K = int(os.getenv("TOP_K", "5"))
 TOP_VECTOR_CHUNKS = int(os.getenv("TOP_VECTOR_CHUNKS", "100"))
 TOP_BM25_CHUNKS = int(os.getenv("TOP_BM25_CHUNKS", "100"))
 FIRST_STAGE_RRF_K = int(os.getenv("FIRST_STAGE_RRF_K", "60"))
+SECOND_STAGE_RRF_K = int(os.getenv("SECOND_STAGE_RRF_K", "60"))
 MAX_CHUNKS_FOR_GRAPH_EXPANSION = int(os.getenv("MAX_CHUNKS_FOR_GRAPH_EXPANSION", "20"))
 GRAPH_EXPANSION_HOPS = int(os.getenv("GRAPH_EXPANSION_HOPS", "1"))
-SECOND_STAGE_RRF_K = int(os.getenv("SECOND_STAGE_RRF_K", "60"))
 MAX_CHUNKS_TO_CROSSENCODER = int(os.getenv("MAX_CHUNKS_TO_CROSSENCODER", "64"))
 MAX_CHUNKS_TO_LLM = int(os.getenv("MAX_CHUNKS_TO_LLM", "8"))
+
 INFERENCE_EMBEDDER_MAX_TOKENS = int(os.getenv("INFERENCE_EMBEDDER_MAX_TOKENS", "64"))
 CROSS_ENCODER_MAX_TOKENS = int(os.getenv("CROSS_ENCODER_MAX_TOKENS", "600"))
+ENABLE_CROSS_ENCODER = os.getenv("ENABLE_CROSS_ENCODER", "true").lower() in ("1", "true", "yes")
 ENABLE_METADATA_CHUNKS = os.getenv("ENABLE_METADATA_CHUNKS", "false").lower() in ("1", "true", "yes")
 MAX_METADATA_CHUNKS = int(os.getenv("MAX_METADATA_CHUNKS", "50"))
-ENABLE_CROSS_ENCODER = os.getenv("ENABLE_CROSS_ENCODER", "true").lower() in ("1", "true", "yes")
 RERANK_TOP = int(os.getenv("RERANK_TOP", "50"))
 
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "8"))
-RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "2"))
-RETRY_BASE = float(os.getenv("RETRY_BASE_SECONDS", "0.25"))
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "30"))
+RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "3"))
+RETRY_BASE = float(os.getenv("RETRY_BASE_SECONDS", "0.5"))
 
-# Concurrency for qdrant fetches
-QDRANT_FETCH_WORKERS = int(os.getenv("QDRANT_FETCH_WORKERS", "12"))
-QDRANT_FETCH_TIMEOUT = float(os.getenv("QDRANT_FETCH_TIMEOUT", "5.0"))
-
-# Defensive imports
+# external libs
 try:
     from qdrant_client import QdrantClient
     from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchText
@@ -63,15 +68,9 @@ try:
 except Exception as e:
     raise RuntimeError("neo4j driver import failed: " + str(e))
 
-# Ray Serve handles lazy resolved
-try:
-    import ray
-    from ray import serve
-except Exception:
-    ray = None
-    serve = None
+import httpx
 
-# Simple retry decorator
+# utils
 def retry(attempts: int = RETRY_ATTEMPTS, base: float = RETRY_BASE):
     def deco(fn):
         def wrapper(*a, **k):
@@ -84,30 +83,18 @@ def retry(attempts: int = RETRY_ATTEMPTS, base: float = RETRY_BASE):
                     wait = base * (2 ** i)
                     log.warning("retry %d/%d %s: %s (sleep %.2fs)", i + 1, attempts, fn.__name__, e, wait)
                     time.sleep(wait)
-            log.error("all retries failed for %s: %s", fn.__name__, last)
+            log.error("all retries failed for %s", fn.__name__)
             raise last
         return wrapper
     return deco
 
-# Create clients
-@retry()
-def make_clients():
-    q = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=PREFER_GRPC)
-    drv = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    return q, drv
-
-qdrant, neo4j_driver = make_clients()
-
-# Resolve various serve handle response shapes robustly
-def _resolve_handle_response(resp_obj, timeout: int = int(HTTP_TIMEOUT)):
+def _resolve_handle_response(resp_obj, timeout: int = HTTP_TIMEOUT):
     if isinstance(resp_obj, (dict, list)):
         return resp_obj
-    if ray is not None:
-        try:
-            ObjectRefType = getattr(ray, "ObjectRef", None) or getattr(ray, "_raylet.ObjectRef", None)
-        except Exception:
-            ObjectRefType = None
-    else:
+    try:
+        import ray as _ray
+        ObjectRefType = getattr(_ray, "ObjectRef", None) or getattr(_ray, "_raylet.ObjectRef", None)
+    except Exception:
         ObjectRefType = None
     try:
         if ObjectRefType is not None and isinstance(resp_obj, ObjectRefType):
@@ -120,70 +107,89 @@ def _resolve_handle_response(resp_obj, timeout: int = int(HTTP_TIMEOUT)):
     except Exception:
         pass
     try:
-        if ray is not None:
-            return ray.get(resp_obj, timeout=timeout)
+        return ray.get(resp_obj, timeout=timeout)
     except Exception as e:
         raise RuntimeError("Unable to resolve Serve handle response type: " + str(type(resp_obj)) + " -> " + str(e))
-    raise RuntimeError("Unknown response object type: " + str(type(resp_obj)))
 
-# Get serve handle with fallback to HTTP post if necessary
+# clients
+@retry()
+def make_clients():
+    q = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=PREFER_GRPC)
+    drv = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    return q, drv
+
+qdrant, neo4j_driver = make_clients()
+
+# Ray init
+ray.init(address=RAY_ADDRESS, namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+
+# handle discovery (tries Serve API then HTTP fallback)
 def _get_handle(name: str, timeout: float = 60.0, poll: float = 1.0, app_name: Optional[str] = "default"):
-    if serve is not None:
-        start = time.time()
-        last_exc = None
-        while time.time() - start < timeout:
-            try:
-                if hasattr(serve, "get_deployment_handle"):
+    start = time.time()
+    last_exc = None
+    while time.time() - start < timeout:
+        try:
+            if hasattr(serve, "get_deployment_handle"):
+                try:
                     handle = serve.get_deployment_handle(name, app_name=app_name, _check_exists=False)
-                elif hasattr(serve, "get_deployment"):
+                    resp = handle.remote({"texts": ["health-check"], "max_length": INFERENCE_EMBEDDER_MAX_TOKENS})
+                    _resolve_handle_response(resp, timeout=HTTP_TIMEOUT)
+                    return handle
+                except Exception as e:
+                    last_exc = e
+            if hasattr(serve, "get_deployment"):
+                try:
                     dep = serve.get_deployment(name)
                     handle = dep.get_handle(sync=False)
-                elif hasattr(serve, "get_handle"):
+                    resp = handle.remote({"texts": ["health-check"], "max_length": INFERENCE_EMBEDDER_MAX_TOKENS})
+                    _resolve_handle_response(resp, timeout=HTTP_TIMEOUT)
+                    return handle
+                except Exception as e:
+                    last_exc = e
+            if hasattr(serve, "get_handle"):
+                try:
                     handle = serve.get_handle(name, sync=False)
-                else:
-                    raise RuntimeError("No serve API available")
-                # health-check call
-                resp = handle.remote({"texts": ["health-check"]})
-                _resolve_handle_response(resp, timeout=int(HTTP_TIMEOUT))
-                return handle
-            except Exception as e:
-                last_exc = e
-                time.sleep(poll)
-        log.warning("serve handle get timed out: %s", last_exc)
+                    resp = handle.remote({"texts": ["health-check"], "max_length": INFERENCE_EMBEDDER_MAX_TOKENS})
+                    _resolve_handle_response(resp, timeout=HTTP_TIMEOUT)
+                    return handle
+                except Exception as e:
+                    last_exc = e
+            time.sleep(poll)
+        except Exception as e:
+            last_exc = e
+            time.sleep(poll)
 
-    # HTTP fallback local
+    # HTTP fallback to local Serve proxy
     try:
         import httpx as _httpx
-        r = _httpx.post(f"http://127.0.0.1:8000/{name}", json={"texts": ["health-check"]}, timeout=10.0)
+        url = f"http://{SERVE_HTTP_HOST}:{SERVE_HTTP_PORT}/{name}"
+        r = _httpx.post(url, json={"texts": ["health-check"]}, timeout=10.0)
         if r.status_code == 200:
-            log.warning("Using HTTP fallback for Serve deployment %s", name)
+            log.warning("Using HTTP fallback for Serve deployment %s -> %s", name, url)
             class _HTTPHandle:
                 def __init__(self, url):
                     self.url = url
                 def remote(self, payload):
-                    rr = _httpx.post(self.url, json=payload, timeout=int(HTTP_TIMEOUT))
+                    rr = _httpx.post(self.url, json=payload, timeout=HTTP_TIMEOUT)
                     rr.raise_for_status()
                     return rr.json()
-            return _HTTPHandle(f"http://127.0.0.1:8000/{name}")
-    except Exception:
-        pass
-    raise RuntimeError(f"Timed out waiting for Serve deployment {name}")
+            return _HTTPHandle(url)
+    except Exception as e:
+        last_exc = e
+    raise RuntimeError(f"Timed out waiting for Serve deployment {name}: {last_exc}")
 
-# Acquire embed and rerank handles (best-effort)
-embed_handle = None
+embed_handle = _get_handle(EMBED_HANDLE_NAME)
 rerank_handle = None
-try:
-    if ray is not None:
-        ray.init(address=RAY_ADDRESS, namespace=RAY_NAMESPACE, ignore_reinit_error=True)
-    embed_handle = _get_handle(EMBED_HANDLE_NAME)
+if ENABLE_CROSS_ENCODER:
     try:
         rerank_handle = _get_handle(RERANK_HANDLE_NAME)
     except Exception:
         log.warning("No rerank handle available, cross-encoder will be skipped")
-except Exception as e:
-    log.warning("Ray/Serve init or handles failed: %s", e)
+        rerank_handle = None
 
-# Helpers
+_http = httpx.Client(timeout=HTTP_TIMEOUT)
+
+# helpers: normalization, scoring, fetching
 def _minmax_norm(xs: List[float]) -> List[float]:
     if not xs:
         return []
@@ -195,10 +201,8 @@ def _minmax_norm(xs: List[float]) -> List[float]:
 
 @retry()
 def embed_text(text: str, max_length: int = INFERENCE_EMBEDDER_MAX_TOKENS) -> List[float]:
-    if embed_handle is None:
-        raise RuntimeError("embed handle not available")
     resp_obj = embed_handle.remote({"texts": [text], "max_length": int(max_length)})
-    resp = _resolve_handle_response(resp_obj, timeout=int(HTTP_TIMEOUT))
+    resp = _resolve_handle_response(resp_obj, timeout=HTTP_TIMEOUT)
     if not isinstance(resp, dict) or "vectors" not in resp:
         raise RuntimeError("embed returned bad payload")
     vecs = resp["vectors"]
@@ -206,7 +210,7 @@ def embed_text(text: str, max_length: int = INFERENCE_EMBEDDER_MAX_TOKENS) -> Li
         raise RuntimeError("embed must return single vector")
     v = vecs[0]
     if len(v) != VECTOR_DIM:
-        raise RuntimeError("embed dim mismatch")
+        raise RuntimeError(f"embed dim mismatch {len(v)} != {VECTOR_DIM}")
     return [float(x) for x in v]
 
 @retry()
@@ -217,7 +221,7 @@ def cross_rerank(query: str, texts: List[str], max_length: int = CROSS_ENCODER_M
         return []
     payload = {"query": query, "cands": texts, "max_length": int(max_length)}
     resp_obj = rerank_handle.remote(payload)
-    resp = _resolve_handle_response(resp_obj, timeout=int(HTTP_TIMEOUT))
+    resp = _resolve_handle_response(resp_obj, timeout=HTTP_TIMEOUT)
     if not isinstance(resp, dict) or "scores" not in resp:
         raise RuntimeError("rerank returned bad payload")
     scores = resp["scores"]
@@ -268,7 +272,7 @@ def ensure_neo4j_fulltext_index(driver, index_name: str = NEO4J_FULLTEXT_INDEX):
             session.run(f"CALL db.index.fulltext.createNodeIndex('{index_name}', ['Chunk'], ['text'])")
             log.info("Created Neo4j fulltext index %s", index_name)
         except Exception as e:
-            log.debug("Could not create fulltext index (maybe exists): %s", e)
+            log.warning("Could not create fulltext index (may already exist or incompatible server): %s", e)
 
 @retry()
 def neo4j_fulltext_search(driver, q: str, top_k: int) -> List[Dict[str, Any]]:
@@ -299,12 +303,9 @@ def neo4j_fetch_texts(driver, chunk_ids: List[str]) -> Dict[str, str]:
         try:
             res = session.run("MATCH (c:Chunk) WHERE c.chunk_id IN $ids RETURN c.chunk_id AS cid, c.text AS text", ids=list(chunk_ids))
             for r in res:
-                try:
-                    cid = r["cid"]
-                    txt = r["text"] or ""
-                    mapping[cid] = txt
-                except Exception:
-                    pass
+                cid = r["cid"]
+                txt = r["text"] or ""
+                mapping[cid] = txt
         except Exception as e:
             log.debug("neo4j_fetch_texts failed: %s", e)
     return mapping
@@ -326,13 +327,10 @@ def neo4j_expand_neighbors(driver, chunk_ids: List[str], hops: int, max_addition
             except Exception:
                 res = []
             for r in res:
-                try:
-                    cid2 = r["chunk_id"]
-                    txt = r["text"]
-                    if cid2 and cid2 != cid:
-                        collected.append({"chunk_id": cid2, "text": txt})
-                except Exception:
-                    pass
+                cid2 = r["chunk_id"]
+                txt = r["text"]
+                if cid2 and cid2 != cid:
+                    collected.append({"chunk_id": cid2, "text": txt})
     return collected
 
 def _rrf_fuse(ranked_lists: List[List[Any]], k: int) -> Dict[Any, float]:
@@ -346,8 +344,8 @@ def _rrf_fuse(ranked_lists: List[List[Any]], k: int) -> Dict[Any, float]:
             scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
     return scores
 
-# Parallelized qdrant fetch helper (major latency reduction)
-def _fetch_qdrant_by_chunk_id_one(chunk_id: str) -> Optional[Dict[str, Any]]:
+@retry()
+def _fetch_qdrant_by_chunk_id(chunk_id: str) -> Optional[Dict[str, Any]]:
     try:
         flt = Filter(must=[FieldCondition(key="chunk_id", match=MatchValue(value=chunk_id))])
         res = qdrant.search(collection_name=QDRANT_COLLECTION, query_vector=None, limit=1, with_payload=True, with_vector=True, query_filter=flt)
@@ -356,51 +354,9 @@ def _fetch_qdrant_by_chunk_id_one(chunk_id: str) -> Optional[Dict[str, Any]]:
             payload = getattr(r, "payload", {}) or {}
             vector = getattr(r, "vector", None)
             return {"id": str(getattr(r, "id", None)), "payload": payload, "vector": vector, "score": float(getattr(r, "score", 0.0) or 0.0)}
-    except Exception as e:
-        log.debug("qdrant fetch chunk_id=%s failed: %s", chunk_id, e)
+    except Exception:
+        pass
     return None
-
-def _assemble_records_from_ids(chunk_ids: List[str], max_workers: int = QDRANT_FETCH_WORKERS, per_fetch_timeout: float = QDRANT_FETCH_TIMEOUT) -> List[Dict[str, Any]]:
-    if not chunk_ids:
-        return []
-    unique = []
-    seen = set()
-    for cid in chunk_ids:
-        if cid and cid not in seen:
-            seen.add(cid)
-            unique.append(cid)
-
-    results: Dict[str, Dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = {ex.submit(_fetch_qdrant_by_chunk_id_one, cid): cid for cid in unique}
-        for fut in as_completed(futs):
-            cid = futs[fut]
-            try:
-                rec = fut.result(timeout=per_fetch_timeout)
-            except Exception as e:
-                log.debug("qdrant fetch future failed for %s: %s", cid, e)
-                rec = None
-            if rec:
-                payload = rec.get("payload", {}) or {}
-                results[cid] = {"chunk_id": cid,
-                                "qdrant_id": rec.get("id"),
-                                "snippet": payload.get("snippet", ""),
-                                "document_id": payload.get("document_id"),
-                                "vector": rec.get("vector")}
-
-    out: List[Dict[str, Any]] = []
-    for cid in unique:
-        rec = results.get(cid)
-        if rec:
-            out.append(rec)
-        else:
-            out.append({"chunk_id": cid, "qdrant_id": None, "snippet": "", "document_id": None, "vector": None})
-
-    ids = [r["chunk_id"] for r in out if r.get("chunk_id")]
-    texts_map = neo4j_fetch_texts(neo4j_driver, ids)
-    for r in out:
-        r["text"] = texts_map.get(r["chunk_id"], r.get("snippet", ""))
-    return out
 
 def _cos_sim(a: List[float], b: List[float]) -> float:
     if not a or not b:
@@ -412,17 +368,30 @@ def _cos_sim(a: List[float], b: List[float]) -> float:
     dp = sum(x * y for x, y in zip(a, b))
     return float(dp / (math.sqrt(sa) * math.sqrt(sb)))
 
-def two_stage_query(query_text: str, top_k: int = TOP_K) -> Dict[str, Any]:
-    start_total = time.perf_counter()
-    # 1) embed
-    t0 = time.perf_counter()
-    q_vec = embed_text(query_text, max_length=INFERENCE_EMBEDDER_MAX_TOKENS)
-    t1 = time.perf_counter()
+def _assemble_records_from_ids(chunk_ids: List[str]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for cid in chunk_ids:
+        if cid in seen:
+            continue
+        rec = _fetch_qdrant_by_chunk_id(cid)
+        if rec:
+            payload = rec.get("payload", {}) or {}
+            out.append({"chunk_id": cid, "qdrant_id": rec.get("id"), "snippet": payload.get("snippet", ""), "document_id": payload.get("document_id"), "vector": rec.get("vector")})
+            seen.add(cid)
+    ids = [r["chunk_id"] for r in out]
+    texts_map = neo4j_fetch_texts(neo4j_driver, ids)
+    for r in out:
+        r["text"] = texts_map.get(r["chunk_id"], r.get("snippet", ""))
+    return out
 
-    # 2) vector search
+# main two-stage query
+def two_stage_query(query_text: str, top_k: int = TOP_K) -> Dict[str, Any]:
+    q_vec = embed_text(query_text, max_length=INFERENCE_EMBEDDER_MAX_TOKENS)
     vec_list = qdrant_vector_search(q_vec, TOP_VECTOR_CHUNKS)
-    vec_chunk_ids = []
+
     vec_scores = {}
+    vec_chunk_ids = []
     for r in vec_list:
         payload = r.get("payload", {}) or {}
         cid = payload.get("chunk_id")
@@ -437,18 +406,15 @@ def two_stage_query(query_text: str, top_k: int = TOP_K) -> Dict[str, Any]:
             else:
                 vec_scores[cid] = 0.0
 
-    # 3) bm25 search
     bm25_list = neo4j_fulltext_search(neo4j_driver, query_text, TOP_BM25_CHUNKS)
     bm25_chunk_ids = [b["chunk_id"] for b in bm25_list]
 
-    # 4) optional metadata keyword search
     if ENABLE_METADATA_CHUNKS:
         kw_list = qdrant_payload_keyword_search(query_text, MAX_METADATA_CHUNKS)
     else:
         kw_list = []
     kw_chunk_ids = [k["payload"].get("chunk_id") for k in kw_list if k.get("payload")]
 
-    # 5) first-stage fusion
     first_stage_lists = []
     if vec_chunk_ids:
         first_stage_lists.append(vec_chunk_ids)
@@ -456,25 +422,25 @@ def two_stage_query(query_text: str, top_k: int = TOP_K) -> Dict[str, Any]:
         first_stage_lists.append(bm25_chunk_ids)
     if ENABLE_METADATA_CHUNKS and kw_chunk_ids:
         first_stage_lists.append(kw_chunk_ids)
+
     if not first_stage_lists:
         return {"prompt": "", "provenance": [], "records": [], "llm": None}
+
     rrf_scores_first = _rrf_fuse(first_stage_lists, k=FIRST_STAGE_RRF_K)
     fused_sorted = sorted(rrf_scores_first.items(), key=lambda x: -x[1])
     fused_ids = [i for i, s in fused_sorted]
     if not fused_ids:
         return {"prompt": "", "provenance": [], "records": [], "llm": None}
-    deduped_fused = list(dict.fromkeys(fused_ids))
 
-    # 6) graph expansion (may add candidates)
+    deduped_fused = list(dict.fromkeys(fused_ids))
     to_expand = deduped_fused[:MAX_CHUNKS_FOR_GRAPH_EXPANSION]
     expanded = neo4j_expand_neighbors(neo4j_driver, to_expand, GRAPH_EXPANSION_HOPS, max_additional_per_start=RERANK_TOP)
     expanded_ids = [e["chunk_id"] for e in expanded if e.get("chunk_id")]
-    combined_unique = list(dict.fromkeys(deduped_fused + expanded_ids))
 
-    # 7) assemble records (parallelized qdrant fetch + single neo4j fetch for texts)
+    combined_unique = list(dict.fromkeys(deduped_fused + expanded_ids))
     detailed = _assemble_records_from_ids(combined_unique)
 
-    # 8) compute final fusion scores second stage
+    # recompute vector similarity on assembled vectors
     query_vec = q_vec
     vec_scores_map: Dict[str, float] = {}
     for d in detailed:
@@ -512,7 +478,7 @@ def two_stage_query(query_text: str, top_k: int = TOP_K) -> Dict[str, Any]:
         final_sorted = sorted(rrf_scores_second.items(), key=lambda x: -x[1])
         final_ids = [cid for cid, sc in final_sorted]
 
-    # dedupe preserve order
+    # dedupe and optionally cross-encode rerank top
     deduped = []
     seen = set()
     for cid in final_ids:
@@ -520,9 +486,8 @@ def two_stage_query(query_text: str, top_k: int = TOP_K) -> Dict[str, Any]:
             continue
         seen.add(cid)
         deduped.append(cid)
-    final_after_cross = deduped
 
-    # optional cross encoder rerank
+    final_after_cross = deduped
     if ENABLE_CROSS_ENCODER and rerank_handle:
         cross_candidates = deduped[:MAX_CHUNKS_TO_CROSSENCODER]
         cross_texts_map = neo4j_fetch_texts(neo4j_driver, cross_candidates)
@@ -530,27 +495,29 @@ def two_stage_query(query_text: str, top_k: int = TOP_K) -> Dict[str, Any]:
         for cid in cross_candidates:
             txt = cross_texts_map.get(cid)
             if not txt:
-                rec = _fetch_qdrant_by_chunk_id_one(cid)
+                rec = _fetch_qdrant_by_chunk_id(cid)
                 txt = (rec.get("payload", {}) or {}).get("snippet", "") if rec else ""
             cross_texts.append(txt or "")
+        cross_scores = []
         try:
             if cross_texts:
                 cross_scores = cross_rerank(query_text, cross_texts, max_length=CROSS_ENCODER_MAX_TOKENS)
-            else:
-                cross_scores = []
         except Exception as e:
             log.warning("cross rerank failed: %s", e)
             cross_scores = []
 
         if cross_scores:
             merged = []
+            base_map = locals().get("rrf_scores_second", {}) if 'rrf_scores_second' in locals() else {}
             for i, cid in enumerate(cross_candidates):
-                base_score = float(rrf_scores_second.get(cid, 0.0)) if 'rrf_scores_second' in locals() else 0.0
+                base_score = float(base_map.get(cid, 0.0))
                 cross_score = float(cross_scores[i]) if i < len(cross_scores) else 0.0
                 merged_score = 0.8 * cross_score + 0.2 * base_score
                 merged.append({"chunk_id": cid, "score": merged_score})
             merged_sorted = sorted(merged, key=lambda x: -x["score"])
-            final_after_cross = [m["chunk_id"] for m in merged_sorted] + [c for c in deduped if c not in {m["chunk_id"] for m in merged}]
+            merged_ids = [m["chunk_id"] for m in merged_sorted]
+            remaining = [c for c in deduped if c not in set(merged_ids)]
+            final_after_cross = merged_ids + remaining
         else:
             final_after_cross = deduped
 
@@ -560,18 +527,12 @@ def two_stage_query(query_text: str, top_k: int = TOP_K) -> Dict[str, Any]:
 
     final_records = []
     for cid in limited_for_llm:
-        qrec = None
-        try:
-            qrec = next((r for r in detailed if r.get("chunk_id") == cid), None)
-        except Exception:
-            qrec = None
+        qrec = _fetch_qdrant_by_chunk_id(cid)
         payload = (qrec.get("payload", {}) if qrec else {}) or {}
-        snippet = qrec.get("snippet", "") if qrec else ""
-        docid = qrec.get("document_id") if qrec else None
+        snippet = payload.get("snippet", "")
+        docid = payload.get("document_id")
         text = final_texts_map.get(cid, snippet)
-        base_score = 0.0
-        if 'rrf_scores_second' in locals():
-            base_score = float(rrf_scores_second.get(cid, 0.0))
+        base_score = float(locals().get("rrf_scores_second", {}).get(cid, 0.0)) if 'rrf_scores_second' in locals() else 0.0
         final_records.append({"document_id": docid, "chunk_id": cid, "text": text, "score": base_score})
 
     pieces = []
@@ -582,35 +543,13 @@ def two_stage_query(query_text: str, top_k: int = TOP_K) -> Dict[str, Any]:
 
     context = "\n\n---\n\n".join(pieces)
     prompt = f"USE ONLY THE CONTEXT BELOW. Cite provenance by document_id.\n\nCONTEXT:\n{context}\n\nUSER QUERY:\n{query_text}\n"
-    end_total = time.perf_counter()
 
-    # timing summary
-    timing = {
-        "embed_s": round(t1 - t0, 3),
-        "total_s": round(end_total - start_total, 3),
-        "qdrant_candidates": len(vec_chunk_ids),
-        "final_candidate_count": len(final_records),
-    }
-
-    return {"prompt": prompt, "provenance": provenance, "records": final_records, "llm": None, "timing": timing}
+    return {"prompt": prompt, "provenance": provenance, "records": final_records, "llm": None}
 
 if __name__ == "__main__":
-    q = os.environ.get("HYBRID_QUERY", "What is RAGOps?")
-    topk = int(os.environ.get("TOPK", str(TOP_K)))
-    start = time.perf_counter()
-    try:
-        out = two_stage_query(q, top_k=topk)
-        end = time.perf_counter()
-        summary = {
-            "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "query": q,
-            "topk": topk,
-            "timing": out.get("timing", {}),
-            "provenance": out.get("provenance", []),
-            "records": out.get("records", []),
-            "duration_s": round(end - start, 3)
-        }
-        print(json.dumps(summary, indent=2, ensure_ascii=False))
-    except Exception as e:
-        log.exception("query failed: %s", e)
-        print(json.dumps({"error": str(e)}, indent=2))
+    q = "How to install User manual B?"
+    out = two_stage_query(q, top_k=TOP_K)
+    print("PROMPT:\n", out["prompt"][:2000])
+    print("\nPROVENANCE:")
+    for p in out["provenance"]:
+        print(p)
