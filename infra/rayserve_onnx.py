@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 from __future__ import annotations
 import os
 import json
@@ -27,6 +28,7 @@ EMBED_DEPLOYMENT = os.getenv("EMBED_DEPLOYMENT", "embed_onxx")
 RERANK_HANDLE_NAME = os.getenv("RERANK_HANDLE_NAME", "rerank_onxx")
 
 ONNX_USE_CUDA = (os.getenv("ONNX_USE_CUDA", "false").lower() in ("1", "true", "yes"))
+# Correct defaults matching your /models layout
 MODEL_DIR_EMBED = os.getenv("MODEL_DIR_EMBED", "/models/gte-modernbert-base")
 MODEL_DIR_RERANK = os.getenv("MODEL_DIR_RERANK", "/models/gte-reranker-modernbert-base")
 ONNX_EMBED_PATH = os.getenv("ONNX_EMBED_PATH", os.path.join(MODEL_DIR_EMBED, "onnx", "model_int8.onnx"))
@@ -96,11 +98,10 @@ def _effective_max_length(tokenizer: PreTrainedTokenizerFast, requested: Optiona
         caps.append(int(hard_cap))
     if model_max and model_max > 0:
         caps.append(model_max)
-    if any(c > 0 for c in caps):
-        eff = min([c for c in caps if c and c > 0])
-    else:
-        eff = int(env_default)
-    return max(1, int(eff))
+    # choose the smallest positive cap as effective length
+    candidates = [c for c in caps if c and c > 0]
+    eff = int(min(candidates)) if candidates else int(env_default)
+    return max(1, eff)
 
 @serve.deployment(name=EMBED_DEPLOYMENT, num_replicas=EMBED_REPLICAS, ray_actor_options={"num_gpus": EMBED_GPU})
 class ONNXEmbed:
