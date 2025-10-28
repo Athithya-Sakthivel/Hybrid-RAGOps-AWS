@@ -31,3 +31,4 @@ typing==3.7.4.3
 httpx==0.28.1
 spacy==3.8.7
 pydantic==2.11.10
+astro-provider-ray==0.3.1
