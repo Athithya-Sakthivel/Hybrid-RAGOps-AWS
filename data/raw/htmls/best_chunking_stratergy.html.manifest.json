@@ -5,9 +5,10 @@
   "pipeline_run_id": "300d2b3b-46cf-4a96-86f0-12e734ee265f",
   "s3_key": "data/raw/htmls/best_chunking_stratergy.html",
   "timestamp": "2025-10-15T00:55:53.344518Z",
-  "status": "completed",
+  "status": "failed",
   "indexed_chunks": 10,
   "failed_chunks": 0,
   "weaviate_count": 10,
-  "indexed_at": "2025-10-15T00:57:10Z"
+  "indexed_at": "2025-10-15T00:57:10Z",
+  "error": "embed:'DeploymentHandle' object is not callable"
 }

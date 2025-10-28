@@ -1,46 +1,53 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import os, sys, json, time, uuid, hashlib, logging
+import os
+import sys
+import json
+import time
+import uuid
+import hashlib
+import logging
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 
-LOG_LEVEL = os.getenv("LOG_LEVEL","INFO")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("ingest")
 
 import ray
 from ray import serve
 
-RAY_ADDRESS = os.getenv("RAY_ADDRESS","auto")
-RAY_NAMESPACE = os.getenv("RAY_NAMESPACE","ragops")
-SERVE_APP_NAME = os.getenv("SERVE_APP_NAME","default")
+RAY_ADDRESS = os.getenv("RAY_ADDRESS", "auto")
+RAY_NAMESPACE = os.getenv("RAY_NAMESPACE", "ragops")
+SERVE_APP_NAME = os.getenv("SERVE_APP_NAME", "default")
 
-DATA_IN_LOCAL = os.getenv("DATA_IN_LOCAL","false").lower() in ("1","true","yes")
-LOCAL_DIR_PATH = os.getenv("LOCAL_DIR_PATH","./data")
-S3_BUCKET = os.getenv("S3_BUCKET","e2e-rag-system-42").strip()
-S3_RAW_PREFIX = os.getenv("S3_RAW_PREFIX","data/raw/").rstrip("/") + "/"
-S3_CHUNKED_PREFIX = os.getenv("S3_CHUNKED_PREFIX","data/chunked/").rstrip("/") + "/"
+DATA_IN_LOCAL = os.getenv("DATA_IN_LOCAL", "false").lower() in ("1", "true", "yes")
+LOCAL_DIR_PATH = os.getenv("LOCAL_DIR_PATH", "./data")
+S3_BUCKET = os.getenv("S3_BUCKET", "e2e-rag-system-42").strip()
+S3_RAW_PREFIX = os.getenv("S3_RAW_PREFIX", "data/raw/").rstrip("/") + "/"
+S3_CHUNKED_PREFIX = os.getenv("S3_CHUNKED_PREFIX", "data/chunked/").rstrip("/") + "/"
 
-EMBED_DEPLOYMENT = os.getenv("EMBED_DEPLOYMENT","embed_onxx")
-RERANK_DEPLOYMENT = os.getenv("RERANK_HANDLE_NAME","rerank_onxx")
-INDEXING_EMBEDDER_MAX_TOKENS = int(os.getenv("INDEXING_EMBEDDER_MAX_TOKENS","512"))
-VECTOR_DIM = int(os.getenv("VECTOR_DIM","768"))
+EMBED_DEPLOYMENT = os.getenv("EMBED_DEPLOYMENT", "embed_onxx")
+RERANK_DEPLOYMENT = os.getenv("RERANK_HANDLE_NAME", "rerank_onxx")
+INDEXING_EMBEDDER_MAX_TOKENS = int(os.getenv("INDEXING_EMBEDDER_MAX_TOKENS", "512"))
+VECTOR_DIM = int(os.getenv("VECTOR_DIM", "768"))
 
-QDRANT_URL = os.getenv("QDRANT_URL","http://127.0.0.1:6333")
+QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", None)
-QDRANT_COLLECTION = os.getenv("COLLECTION","my_collection")
-QDRANT_ON_DISK_PAYLOAD = os.getenv("QDRANT_ON_DISK_PAYLOAD","true").lower() in ("1","true","yes")
+QDRANT_COLLECTION = os.getenv("COLLECTION", "my_collection")
+QDRANT_ON_DISK_PAYLOAD = os.getenv("QDRANT_ON_DISK_PAYLOAD", "true").lower() in ("1", "true", "yes")
 
-NEO4J_URI = os.getenv("NEO4J_URI","bolt://localhost:7687")
-NEO4J_USER = os.getenv("NEO4J_USER","neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD","")
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
 
-BATCH_SIZE = int(os.getenv("BATCH_SIZE","64"))
-EMBED_BATCH = int(os.getenv("EMBED_BATCH","32"))
-EMBED_TIMEOUT = int(os.getenv("EMBED_TIMEOUT","60"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "64"))
+EMBED_BATCH = int(os.getenv("EMBED_BATCH", "32"))
+EMBED_TIMEOUT = int(os.getenv("EMBED_TIMEOUT", "60"))
 
-SELECTIVE_UPSERT = os.getenv("SELECTIVE_UPSERT","1") in ("1","true","True")
-FORCE_REHASH = os.getenv("FORCE_REHASH","0") in ("1","true","True")
+SELECTIVE_UPSERT = os.getenv("SELECTIVE_UPSERT", "1") in ("1", "true", "True")
+FORCE_REHASH = os.getenv("FORCE_REHASH", "0") in ("1", "true", "True")
+
 
 def deterministic_point_id(chunk_id: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_OID, str(chunk_id)))
@@ -59,55 +66,76 @@ def compute_local_file_hash(path: str) -> str:
     with open(path, "rb") as fh:
         return sha256_bytes_iter(fh)
 
-def read_manifest_s3(bucket: str, key: str, client=None) -> Optional[Dict[str,Any]]:
+def _s3_client_for_bucket(bucket: str):
     import boto3
-    client = client or boto3.client("s3")
+    session = boto3.session.Session()
+    env_region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
+    if env_region:
+        return session.client("s3", region_name=env_region)
+    client = session.client("s3")
+    try:
+        resp = client.get_bucket_location(Bucket=bucket)
+        loc = resp.get("LocationConstraint")
+        if not loc:
+            loc = "us-east-1"
+        if loc == "EU":
+            loc = "eu-west-1"
+        return session.client("s3", region_name=loc)
+    except Exception:
+        fallback = session.region_name or "us-east-1"
+        return session.client("s3", region_name=fallback)
+
+def read_manifest_s3(bucket: str, key: str, client=None) -> Optional[Dict[str, Any]]:
+    client = client or _s3_client_for_bucket(bucket)
     try:
         obj = client.get_object(Bucket=bucket, Key=key + ".manifest.json")
         return json.loads(obj["Body"].read().decode("utf-8"))
     except Exception:
         return None
 
-def write_manifest_s3_atomic(bucket: str, key: str, manifest: Dict[str,Any], client=None):
-    import boto3
-    client = client or boto3.client("s3")
+def write_manifest_s3_atomic(bucket: str, key: str, manifest: Dict[str, Any], client=None):
+    client = client or _s3_client_for_bucket(bucket)
     final_key = key + ".manifest.json"
     tmp_key = final_key + f".tmp.{int(time.time())}-{uuid.uuid4().hex[:8]}"
-    client.put_object(Bucket=bucket, Key=tmp_key, Body=json.dumps(manifest,indent=2).encode("utf-8"), ContentType="application/json")
-    client.copy_object(CopySource={"Bucket":bucket,"Key":tmp_key}, Bucket=bucket, Key=final_key)
+    client.put_object(Bucket=bucket, Key=tmp_key, Body=json.dumps(manifest, indent=2).encode("utf-8"), ContentType="application/json")
+    client.copy_object(CopySource={"Bucket": bucket, "Key": tmp_key}, Bucket=bucket, Key=final_key)
     try:
         client.delete_object(Bucket=bucket, Key=tmp_key)
     except Exception:
         pass
 
-def read_manifest_local(path: str) -> Optional[Dict[str,Any]]:
+def read_manifest_local(path: str) -> Optional[Dict[str, Any]]:
     try:
-        with open(path + ".manifest.json","r",encoding="utf-8") as fh:
+        with open(path + ".manifest.json", "r", encoding="utf-8") as fh:
             return json.load(fh)
     except Exception:
         return None
 
-def write_manifest_local_atomic(path: str, manifest: Dict[str,Any]):
+def write_manifest_local_atomic(path: str, manifest: Dict[str, Any]):
     final = path + ".manifest.json"
     tmp = final + f".tmp.{int(time.time())}-{uuid.uuid4().hex[:8]}"
-    with open(tmp,"w",encoding="utf-8") as fh:
+    with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2)
     os.replace(tmp, final)
 
 def list_chunked_files_s3_for_file_hash(bucket: str, file_hash: str, client=None) -> List[str]:
-    import boto3
-    client = client or boto3.client("s3")
-    prefix = S3_CHUNKED_PREFIX + file_hash.rstrip("/") + "/"
+    client = client or _s3_client_for_bucket(bucket)
+    prefix = S3_CHUNKED_PREFIX
     keys = []
     paginator = client.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents",[]) or []:
+        for obj in page.get("Contents", []) or []:
             k = obj["Key"]
-            if k.lower().endswith(".json") or k.lower().endswith(".jsonl"):
+            if k.startswith(prefix + file_hash):
+                if k.lower().endswith(".json") or k.lower().endswith(".jsonl"):
+                    keys.append(k)
+                continue
+            base = k.split("/")[-1]
+            if base.startswith(file_hash) and (base.lower().endswith(".json") or base.lower().endswith(".jsonl")):
                 keys.append(k)
     return keys
 
-def read_json_objects_from_text(text: str) -> List[Dict[str,Any]]:
+def read_json_objects_from_text(text: str) -> List[Dict[str, Any]]:
     text = (text or "").strip()
     if not text:
         return []
@@ -143,17 +171,27 @@ class QdrantWriter:
     def __init__(self, url: str, api_key: Optional[str], collection: str, vector_dim: int, on_disk_payload: bool = True):
         from qdrant_client import QdrantClient
         from qdrant_client.http.models import VectorParams, Distance
-        self.client = QdrantClient(url=url, api_key=api_key, prefer_grpc=True)
         self.collection = collection
+        self.vector_dim = vector_dim
+        self.on_disk_payload = on_disk_payload
+        prefer_grpc = True
+        if url.startswith("http://") or url.startswith("https://"):
+            prefer_grpc = False
         try:
+            self.client = QdrantClient(url=url, api_key=api_key, prefer_grpc=prefer_grpc)
             cols = [c.name for c in self.client.get_collections().collections]
             if collection not in cols:
                 self.client.create_collection(collection_name=collection, vectors_config=VectorParams(size=vector_dim, distance=Distance.COSINE), on_disk_payload=on_disk_payload)
         except Exception as e:
-            log.warning("qdrant collection ensure failed: %s", e)
+            log.warning("qdrant init warning: %s", e)
+            self.client = None
 
-    def check_points_exist(self, ids: List[str]) -> Dict[str,bool]:
+    def check_points_exist(self, ids: List[str]) -> Dict[str, bool]:
         out = {}
+        if not self.client:
+            for pid in ids:
+                out[pid] = False
+            return out
         for pid in ids:
             try:
                 p = self.client.get_point(collection_name=self.collection, id=pid)
@@ -162,14 +200,17 @@ class QdrantWriter:
                 out[pid] = False
         return out
 
-    def upsert_points(self, points: List[Dict[str,Any]]):
+    def upsert_points(self, points: List[Dict[str, Any]]):
         from qdrant_client.http.models import PointStruct
+        if not self.client:
+            raise RuntimeError("qdrant client unavailable")
         structs = []
         for p in points:
-            structs.append(PointStruct(id=p["id"], vector=[float(x) for x in p["vector"]], payload=p.get("payload",{})))
+            structs.append(PointStruct(id=p["id"], vector=[float(x) for x in p["vector"]], payload=p.get("payload", {})))
         try:
             for i in range(0, len(structs), 256):
-                self.client.upsert(collection_name=self.collection, points=structs[i:i+256])
+                self.client.upsert(collection_name=self.collection, points=structs[i:i + 256])
+            return {"ok": True, "inserted": len(structs)}
         except Exception as e:
             log.exception("qdrant upsert error: %s", e)
             raise
@@ -178,17 +219,23 @@ class QdrantWriter:
 class Neo4jWriter:
     def __init__(self, uri: str, user: str, password: str):
         from neo4j import GraphDatabase
-        self.driver = GraphDatabase.driver(uri, auth=(user, password))
+        self._uri = uri
+        self._auth = (user, password)
+        self._log = logging.getLogger("Neo4jWriter")
         try:
+            self.driver = GraphDatabase.driver(self._uri, auth=self._auth)
             with self.driver.session() as s:
                 s.execute_write(lambda tx: tx.run("CREATE CONSTRAINT IF NOT EXISTS FOR (d:Document) REQUIRE d.document_id IS UNIQUE;"))
                 s.execute_write(lambda tx: tx.run("CREATE CONSTRAINT IF NOT EXISTS FOR (c:Chunk) REQUIRE c.chunk_id IS UNIQUE;"))
-        except Exception:
-            pass
+        except Exception as e:
+            self._log.warning("neo4j init warning: %s", e)
+            self.driver = None
 
-    def bulk_write_chunks(self, chunks: List[Dict[str,Any]]):
+    def bulk_write_chunks(self, chunks: List[Dict[str, Any]]):
         if not chunks:
-            return
+            return {"ok": True, "written": 0}
+        if not self.driver:
+            raise RuntimeError("neo4j driver unavailable")
         cypher = """
         UNWIND $chunks AS c
         MERGE (d:Document {document_id: c.document_id})
@@ -199,10 +246,29 @@ class Neo4jWriter:
           ON MATCH SET ch.updated_at = datetime(), ch.qdrant_id = c.qdrant_point_id
         MERGE (d)-[:HAS_CHUNK]->(ch)
         """
+        from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
+        max_attempts = int(os.getenv("NEO4J_WRITE_MAX_ATTEMPTS", "3"))
+        base_backoff = float(os.getenv("NEO4J_WRITE_BASE_BACKOFF", "0.8"))
         for i in range(0, len(chunks), 1000):
-            batch = chunks[i:i+1000]
-            with self.driver.session() as s:
-                s.execute_write(lambda tx: tx.run(cypher, chunks=batch))
+            batch = chunks[i:i + 1000]
+            attempt = 0
+            while attempt < max_attempts:
+                attempt += 1
+                try:
+                    with self.driver.session() as s:
+                        s.execute_write(lambda tx: tx.run(cypher, chunks=batch))
+                    break
+                except (ServiceUnavailable, SessionExpired, TransientError, TimeoutError) as e:
+                    self._log.warning("Neo4j transient error on attempt %d/%d: %s", attempt, max_attempts, e)
+                    time.sleep(base_backoff * (2 ** (attempt - 1)))
+                    continue
+                except Exception as e:
+                    self._log.exception("Neo4j write failed unrecoverably: %s", e)
+                    raise
+            else:
+                self._log.error("Neo4j bulk write exhausted retries for batch starting index %d", i)
+                raise RuntimeError("Neo4j bulk write retries exhausted")
+        return {"ok": True, "written": len(chunks)}
 
 def _ensure_ray_connected():
     if not ray.is_initialized():
@@ -221,41 +287,121 @@ def get_strict_handle(name: str, timeout: float = 30.0, poll: float = 0.5, app_n
     app_name = app_name or SERVE_APP_NAME
     while time.time() - start < timeout:
         try:
+            handle = None
+            # prefer modern get_deployment_handle
             if hasattr(serve, "get_deployment_handle"):
                 try:
-                    try:
-                        handle = serve.get_deployment_handle(name, app_name=app_name, _check_exists=False)
-                    except TypeError:
-                        handle = serve.get_deployment_handle(name, _check_exists=False)
-                    resp_obj = handle.remote({"texts":["__health_check__"], "max_length": INDEXING_EMBEDDER_MAX_TOKENS})
-                    _ = _resolve_ray_response(resp_obj, timeout=EMBED_TIMEOUT)
-                    return handle
-                except Exception as e:
-                    last_exc = e
-            if hasattr(serve, "get_handle"):
+                    handle = serve.get_deployment_handle(name, app_name=app_name, _check_exists=False)
+                except TypeError:
+                    handle = serve.get_deployment_handle(name, _check_exists=False)
+            # fallback to older APIs
+            if handle is None and hasattr(serve, "get_handle"):
                 try:
                     handle = serve.get_handle(name, sync=False)
-                    resp_obj = handle.remote({"texts":["__health_check__"], "max_length": INDEXING_EMBEDDER_MAX_TOKENS})
-                    _ = _resolve_ray_response(resp_obj, timeout=EMBED_TIMEOUT)
-                    return handle
-                except Exception as e:
-                    last_exc = e
-            if hasattr(serve, "get_deployment"):
+                except Exception:
+                    handle = None
+            if handle is None and hasattr(serve, "get_deployment"):
                 try:
                     dep = serve.get_deployment(name)
                     handle = dep.get_handle(sync=False)
-                    resp_obj = handle.remote({"texts":["__health_check__"], "max_length": INDEXING_EMBEDDER_MAX_TOKENS})
-                    _ = _resolve_ray_response(resp_obj, timeout=EMBED_TIMEOUT)
-                    return handle
-                except Exception as e:
-                    last_exc = e
+                except Exception:
+                    handle = None
+            if handle is None:
+                raise RuntimeError("no serve handle API available")
+            # health probe
+            try:
+                ref = handle.remote({"texts": ["__health_check__"], "max_length": INDEXING_EMBEDDER_MAX_TOKENS})
+                _ = _resolve_ray_response(ref, timeout=EMBED_TIMEOUT)
+                return handle
+            except Exception as e:
+                last_exc = e
         except Exception as e:
             last_exc = e
         time.sleep(poll)
     raise RuntimeError(f"timed out resolving serve handle {name}: {last_exc}")
 
+def call_serve(handle, payload, timeout: float = EMBED_TIMEOUT):
+    """
+    Robust invocation of a Serve deployment handle.
+    Handles:
+      - ray.ObjectRef returned by handle.remote
+      - list of ObjectRefs
+      - ray.serve.handle.DeploymentResponse (has .object_refs or .result())
+      - synchronous callable handles (local)
+      - direct return values (dict/list/primitives)
+    """
+    # immediate direct callable attempt (some handles are plain callables)
+    try:
+        if callable(handle) and not hasattr(handle, "remote"):
+            return handle(payload)
+    except Exception:
+        pass
+
+    # try remote invocation path
+    try:
+        if hasattr(handle, "remote"):
+            resp = handle.remote(payload)
+        else:
+            # fallback: try calling and hope for direct return
+            resp = handle(payload)
+    except Exception as e:
+        raise RuntimeError(f"call_serve remote invocation failed: {e}") from e
+
+    # If it's an ObjectRef or list of ObjectRefs
+    try:
+        from ray._raylet import ObjectRef  # type: ignore
+        is_objref = isinstance(resp, ObjectRef)
+    except Exception:
+        # fallback if internal import unavailable
+        is_objref = hasattr(resp, "_ray_object_id") or (hasattr(resp, "__class__") and resp.__class__.__name__ == "ObjectRef")
+
+    # object ref single
+    if is_objref:
+        return ray.get(resp, timeout=timeout)
+
+    # list of object refs
+    if isinstance(resp, list) and resp and all((hasattr(x, "_ray_object_id") or (hasattr(x, "__class__") and x.__class__.__name__ == "ObjectRef")) for x in resp):
+        return ray.get(resp, timeout=timeout)
+
+    # ray.serve DeploymentResponse path: extract object_refs or use result()
+    # DeploymentResponse often exposes object_refs attribute or result() coroutine/method
+    if hasattr(resp, "object_refs"):
+        obj_refs = getattr(resp, "object_refs")
+        if isinstance(obj_refs, list) and obj_refs:
+            # if single ref return single, else list
+            if len(obj_refs) == 1:
+                return ray.get(obj_refs[0], timeout=timeout)
+            return ray.get(obj_refs, timeout=timeout)
+    if hasattr(resp, "result") and callable(getattr(resp, "result")):
+        try:
+            # some DeploymentResponse.result accepts timeout
+            return resp.result(timeout=timeout)
+        except TypeError:
+            return resp.result()
+        except Exception:
+            # continue to other fallbacks
+            pass
+    if hasattr(resp, "get") and callable(getattr(resp, "get")):
+        try:
+            return resp.get(timeout=timeout)
+        except Exception:
+            try:
+                return resp.get()
+            except Exception:
+                pass
+
+    # if it's already a plain python value
+    if isinstance(resp, (dict, list, str, int, float, bool)) or resp is None:
+        return resp
+
+    # final attempt: try ray.get and let exceptions surface
+    try:
+        return ray.get(resp, timeout=timeout)
+    except Exception as e:
+        raise RuntimeError(f"call_serve failed for payload type {type(payload)}: {e}") from e
+
 @ray.remote
-def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, embed_handle, rerank_handle, cfg: Dict[str,Any]) -> int:
+def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, embed_handle, rerank_handle, cfg: Dict[str, Any]) -> int:
     import boto3
     s3_bucket = cfg.get("s3_bucket")
     s3_chunked_prefix = cfg.get("s3_chunked_prefix")
@@ -265,21 +411,21 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, embed
     batch_size = cfg.get("batch_size")
     force_rehash = cfg.get("force_rehash")
     embed_timeout = cfg.get("embed_timeout")
-    boto_client = boto3.client("s3") if s3_bucket else None
+    boto_client = _s3_client_for_bucket(s3_bucket) if s3_bucket else None
 
     manifest = {}
     try:
-        if mode == "s3":
+        if mode == "s3" and boto_client:
             manifest = read_manifest_s3(s3_bucket, raw_key, client=boto_client) or {}
         else:
             manifest = read_manifest_local(raw_key) or {}
     except Exception:
         manifest = {}
 
-    file_hash = manifest.get("file_hash","")
+    file_hash = manifest.get("file_hash", "")
     if not file_hash or force_rehash:
         try:
-            if mode == "s3":
+            if mode == "s3" and boto_client:
                 obj = boto_client.get_object(Bucket=s3_bucket, Key=raw_key)
                 file_hash = sha256_bytes_iter(obj["Body"])
             else:
@@ -289,8 +435,8 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, embed
             log.exception("hash compute failed for %s: %s", raw_key, e)
             return 0
 
-    chunks_meta: List[Dict[str,Any]] = []
-    if mode == "s3":
+    chunks_meta: List[Dict[str, Any]] = []
+    if mode == "s3" and boto_client:
         chunk_keys = list_chunked_files_s3_for_file_hash(s3_bucket, file_hash, client=boto_client)
         for ck in chunk_keys:
             try:
@@ -322,9 +468,9 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, embed
                     chunks_meta.append(p)
 
     if not chunks_meta:
-        manifest["status"] = manifest.get("status","no_chunks")
+        manifest["status"] = manifest.get("status", "no_chunks")
         try:
-            if mode == "s3":
+            if mode == "s3" and boto_client:
                 write_manifest_s3_atomic(s3_bucket, raw_key, manifest, client=boto_client)
             else:
                 write_manifest_local_atomic(raw_key, manifest)
@@ -334,7 +480,7 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, embed
 
     parsed_chunks = []
     for p in chunks_meta:
-        text = p.get("text","") or ""
+        text = p.get("text", "") or ""
         doc_id = p.get("document_id") or p.get("_chunk_source_key") or file_hash
         chunk_id = p.get("chunk_id") or hashlib.sha256((doc_id + text).encode("utf-8")).hexdigest()
         token_count = int(p.get("token_count") or 0)
@@ -343,10 +489,10 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, embed
             "chunk_id": chunk_id,
             "text": text,
             "token_count": token_count,
-            "file_name": p.get("file_name",""),
-            "file_type": p.get("file_type",""),
-            "source_url": p.get("source_url",""),
-            "timestamp": p.get("timestamp",""),
+            "file_name": p.get("file_name", ""),
+            "file_type": p.get("file_type", ""),
+            "source_url": p.get("source_url", ""),
+            "timestamp": p.get("timestamp", ""),
             "content_hash": p.get("content_hash") or hashlib.sha256(text.encode("utf-8")).hexdigest()
         })
 
@@ -361,10 +507,10 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, embed
         log.warning("qdrant existence check failed: %s", e)
         exist_map = {pid: False for pid in point_ids}
 
-    to_embed_idxs = [i for i,pid in enumerate(point_ids) if not exist_map.get(pid, False)]
+    to_embed_idxs = [i for i, pid in enumerate(point_ids) if not exist_map.get(pid, False)]
     if not to_embed_idxs:
         neo_payload = []
-        for c,pid in zip(parsed_chunks, point_ids):
+        for c, pid in zip(parsed_chunks, point_ids):
             neo_payload.append({
                 "chunk_id": c["chunk_id"],
                 "document_id": c["document_id"],
@@ -380,10 +526,10 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, embed
             ray.get(neo4j_actor.bulk_write_chunks.remote(neo_payload))
         except Exception:
             log.exception("neo4j write failed for %s", raw_key)
-        manifest["indexed_chunks"] = manifest.get("indexed_chunks",0) + len(parsed_chunks)
+        manifest["indexed_chunks"] = manifest.get("indexed_chunks", 0) + len(parsed_chunks)
         manifest["status"] = "completed"
         try:
-            if mode == "s3":
+            if mode == "s3" and boto_client:
                 write_manifest_s3_atomic(s3_bucket, raw_key, manifest, client=boto_client)
             else:
                 write_manifest_local_atomic(raw_key, manifest)
@@ -395,15 +541,17 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, embed
     embed_texts = [parsed_chunks[i]["text"][:max_tokens] for i in to_embed_idxs]
     try:
         for i in range(0, len(embed_texts), embed_batch):
-            batch_texts = embed_texts[i:i+embed_batch]
+            batch_texts = embed_texts[i:i + embed_batch]
             payload = {"texts": batch_texts, "max_length": max_tokens}
-            ref = embed_handle.remote(payload)
-            resp = _resolve_embed_response(ref, timeout=embed_timeout)
-            if not isinstance(resp, dict):
-                raise RuntimeError("embed handle returned unexpected type")
-            vecs = resp.get("vectors") or resp.get("embeddings") or resp.get("data")
+            resp = call_serve(embed_handle, payload, timeout=embed_timeout)
+            if isinstance(resp, dict):
+                vecs = resp.get("vectors") or resp.get("embeddings") or resp.get("data")
+            elif isinstance(resp, list):
+                vecs = resp
+            else:
+                raise RuntimeError(f"embed handle returned unexpected type: {type(resp)}")
             if vecs is None:
-                raise RuntimeError("no vectors in embed response")
+                raise RuntimeError("no vectors returned from embed handle")
             if isinstance(vecs, dict) and "embeddings" in vecs:
                 vecs = vecs["embeddings"]
             if not isinstance(vecs, list):
@@ -432,14 +580,17 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, embed
     indexed_new = 0
     try:
         for i in range(0, len(new_points), batch_size):
-            batch = new_points[i:i+batch_size]
-            ray.get(qdrant_actor.upsert_points.remote(batch))
-            indexed_new += len(batch)
+            batch = new_points[i:i + batch_size]
+            r = ray.get(qdrant_actor.upsert_points.remote(batch))
+            if isinstance(r, dict) and r.get("ok"):
+                indexed_new += r.get("inserted", 0)
+            else:
+                indexed_new += len(batch)
     except Exception as e:
         log.exception("qdrant upsert failed: %s", e)
 
     neo_payload = []
-    for c,pid in zip(parsed_chunks, point_ids):
+    for c, pid in zip(parsed_chunks, point_ids):
         neo_payload.append({
             "chunk_id": c["chunk_id"],
             "document_id": c["document_id"],
@@ -456,10 +607,10 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, embed
     except Exception:
         log.exception("neo4j write failure for %s", raw_key)
 
-    manifest["indexed_chunks"] = manifest.get("indexed_chunks",0) + indexed_new
-    manifest["status"] = "completed" if manifest.get("indexed_chunks",0) > 0 else manifest.get("status","partial")
+    manifest["indexed_chunks"] = manifest.get("indexed_chunks", 0) + indexed_new
+    manifest["status"] = "completed" if manifest.get("indexed_chunks", 0) > 0 else manifest.get("status", "partial")
     try:
-        if mode == "s3":
+        if mode == "s3" and boto_client:
             write_manifest_s3_atomic(s3_bucket, raw_key, manifest, client=boto_client)
         else:
             write_manifest_local_atomic(raw_key, manifest)
@@ -467,12 +618,6 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, embed
         pass
 
     return indexed_new
-
-def _resolve_embed_response(ref, timeout: float = EMBED_TIMEOUT):
-    try:
-        return ray.get(ref, timeout=timeout)
-    except Exception:
-        return ray.get(ref)
 
 def main():
     _ensure_ray_connected()
@@ -485,7 +630,7 @@ def main():
         sys.exit(1)
 
     rerank_handle = None
-    if os.getenv("ENABLE_CROSS_ENCODER","false").lower() in ("1","true","yes"):
+    if os.getenv("ENABLE_CROSS_ENCODER", "false").lower() in ("1", "true", "yes"):
         try:
             rerank_handle = get_strict_handle(RERANK_DEPLOYMENT, timeout=30.0, app_name=SERVE_APP_NAME)
         except Exception as e:
@@ -502,13 +647,13 @@ def main():
     except Exception:
         neo4j_actor = ray.get_actor("neo4j_writer", namespace=RAY_NAMESPACE)
 
-    inputs: List[Tuple[str,str]] = []
+    inputs: List[Tuple[str, str]] = []
     if not DATA_IN_LOCAL and S3_BUCKET:
         import boto3
         s3 = boto3.client("s3")
         paginator = s3.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=S3_RAW_PREFIX):
-            for obj in page.get("Contents",[]) or []:
+            for obj in page.get("Contents", []) or []:
                 k = obj["Key"]
                 if k.endswith("/") or k.lower().endswith(".manifest.json"):
                     continue
@@ -540,7 +685,7 @@ def main():
         "embed_timeout": EMBED_TIMEOUT,
     }
 
-    futures = [ingest_file_worker.remote(key, mode, qdrant_actor, neo4j_actor, embed_handle, rerank_handle, cfg) for mode,key in inputs]
+    futures = [ingest_file_worker.remote(key, mode, qdrant_actor, neo4j_actor, embed_handle, rerank_handle, cfg) for mode, key in inputs]
 
     total_indexed = 0
     for f in futures:

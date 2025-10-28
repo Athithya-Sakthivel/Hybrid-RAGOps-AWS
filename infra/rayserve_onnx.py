@@ -15,20 +15,16 @@ _log_level = getattr(logging, _log_level_name.upper(), logging.INFO)
 logging.basicConfig(level=_log_level)
 log = logging.getLogger("rayserve_onnx")
 
-# Ray / Serve connection settings
 RAY_ADDRESS = os.getenv("RAY_ADDRESS") or None
 RAY_NAMESPACE = os.getenv("RAY_NAMESPACE") or None
 
-# Serve HTTP host/port defaults (changed port default to 8003)
 SERVE_HTTP_HOST = os.getenv("SERVE_HTTP_HOST", "127.0.0.1")
 SERVE_HTTP_PORT = int(os.getenv("SERVE_HTTP_PORT", "8003"))
 
-# Deployment names and model paths
 EMBED_DEPLOYMENT = os.getenv("EMBED_DEPLOYMENT", "embed_onxx")
 RERANK_HANDLE_NAME = os.getenv("RERANK_HANDLE_NAME", "rerank_onxx")
 
 ONNX_USE_CUDA = (os.getenv("ONNX_USE_CUDA", "false").lower() in ("1", "true", "yes"))
-# Correct defaults matching your /models layout
 MODEL_DIR_EMBED = os.getenv("MODEL_DIR_EMBED", "/models/gte-modernbert-base")
 MODEL_DIR_RERANK = os.getenv("MODEL_DIR_RERANK", "/models/gte-reranker-modernbert-base")
 ONNX_EMBED_PATH = os.getenv("ONNX_EMBED_PATH", os.path.join(MODEL_DIR_EMBED, "onnx", "model_int8.onnx"))
@@ -36,7 +32,6 @@ ONNX_EMBED_TOKENIZER_PATH = os.getenv("ONNX_EMBED_TOKENIZER_PATH", os.path.join(
 ONNX_RERANK_PATH = os.getenv("ONNX_RERANK_PATH", os.path.join(MODEL_DIR_RERANK, "onnx", "model_int8.onnx"))
 ONNX_RERANK_TOKENIZER_PATH = os.getenv("ONNX_RERANK_TOKENIZER_PATH", os.path.join(MODEL_DIR_RERANK, "tokenizer.json"))
 
-# replicas / resources / runtime
 EMBED_REPLICAS = int(os.getenv("EMBED_REPLICAS", "1"))
 RERANK_REPLICAS = int(os.getenv("RERANK_REPLICAS", "1"))
 EMBED_GPU = int(os.getenv("EMBED_GPU_PER_REPLICA", "0")) if ONNX_USE_CUDA else 0
@@ -45,7 +40,6 @@ MAX_RERANK = int(os.getenv("MAX_RERANK", "256"))
 ORT_INTRA_THREADS = int(os.getenv("ORT_INTRA_THREADS", "1"))
 ORT_INTER_THREADS = int(os.getenv("ORT_INTER_THREADS", "1"))
 
-# tokenizer / token limits
 INDEXING_EMBEDDER_MAX_TOKENS = int(os.getenv("INDEXING_EMBEDDER_MAX_TOKENS", "512"))
 INFERENCE_EMBEDDER_MAX_TOKENS = int(os.getenv("INFERENCE_EMBEDDER_MAX_TOKENS", "64"))
 CROSS_ENCODER_MAX_TOKENS = int(os.getenv("CROSS_ENCODER_MAX_TOKENS", "600"))
@@ -98,7 +92,6 @@ def _effective_max_length(tokenizer: PreTrainedTokenizerFast, requested: Optiona
         caps.append(int(hard_cap))
     if model_max and model_max > 0:
         caps.append(model_max)
-    # choose the smallest positive cap as effective length
     candidates = [c for c in caps if c and c > 0]
     eff = int(min(candidates)) if candidates else int(env_default)
     return max(1, eff)
@@ -339,7 +332,6 @@ class ONNXRerank:
 def main():
     ray.init(address=RAY_ADDRESS, namespace=RAY_NAMESPACE, ignore_reinit_error=True)
 
-    # Use explicit HTTPOptions to bind to chosen port (default 127.0.0.1:8003)
     http_opts = HTTPOptions(host=SERVE_HTTP_HOST, port=SERVE_HTTP_PORT)
     serve.start(detached=True, http_options=http_opts)
 
