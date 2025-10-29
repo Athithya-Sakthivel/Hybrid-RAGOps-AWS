@@ -1,36 +1,62 @@
 #!/usr/bin/env python3
-import sys, os, io, json, time, logging, hashlib, unicodedata, tempfile, csv
+"""
+CSV parser for indexing_pipeline.parse_chunk.formats
+
+Key changes vs your earlier file:
+- No top-level `ray` import and no `sys.exit` on import failure (prevents import-time crashes).
+- Heavy libs (ray, tiktoken, pandas, pyarrow) are imported lazily inside functions.
+- Robust to running as module or script.
+- Preserves original behavior and env var configuration.
+"""
+from __future__ import annotations
+import os
+import io
+import json
+import time
+import logging
+import hashlib
+import unicodedata
+import tempfile
+import csv
+import urllib.parse
 from datetime import datetime
 from typing import Any, Dict, Iterator, Tuple, List, Optional
-import boto3, botocore, urllib.parse
-import pyarrow as pa
-import pandas as pd
-try:
-    import ray
-except Exception as e:
-    print(f"ray import failed: {e}", file=sys.stderr)
-    sys.exit(1)
-try:
-    import tiktoken
-except Exception:
-    tiktoken = None
-try:
-    import colorama; colorama.init()
-except Exception:
-    pass
+
+import boto3
+import botocore
+
+# optional heavy deps - imported lazily
+_tiktoken = None
+_ray = None
+_pd = None
+_pa = None
+
+# logger
 RESET = "\033[0m"
-COLORS = {logging.DEBUG: "\033[90m", logging.INFO: "\033[97m", logging.WARNING: "\033[33m", logging.ERROR: "\033[31m", logging.CRITICAL: "\033[1;41m"}
+COLORS = {
+    logging.DEBUG: "\033[90m",
+    logging.INFO: "\033[97m",
+    logging.WARNING: "\033[33m",
+    logging.ERROR: "\033[31m",
+    logging.CRITICAL: "\033[1;41m",
+}
+
+
 class ColorFormatter(logging.Formatter):
     def format(self, record):
         color = COLORS.get(record.levelno, RESET)
         message = super().format(record)
         return f"{color}{message}{RESET}"
+
+
 logger = logging.getLogger("csv_parser")
-logger.setLevel(logging.INFO)
+logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 handler = logging.StreamHandler()
 handler.setFormatter(ColorFormatter("%(asctime)s %(levelname)s %(message)s"))
 logger.handlers[:] = [handler]
 log = logger
+
+# configuration from environment
 S3_BUCKET = os.getenv("S3_BUCKET")
 S3_RAW_PREFIX = os.getenv("S3_RAW_PREFIX", "").rstrip("/") + "/"
 S3_CHUNKED_PREFIX = os.getenv("S3_CHUNKED_PREFIX", "").rstrip("/") + "/"
@@ -44,21 +70,66 @@ MAX_ROWS_PER_CHUNK = int(os.getenv("CSV_MAX_ROWS_PER_CHUNK", "100"))
 S3_PUT_RETRIES = int(os.getenv("S3_PUT_RETRIES", "3"))
 S3_PUT_BACKOFF = float(os.getenv("S3_PUT_BACKOFF", "0.5"))
 S3_RANGE_BYTES = int(os.getenv("S3_RANGE_BYTES", "131072"))
+
 s3 = boto3.client("s3")
-ENCODER = None
-if tiktoken is not None:
-    try:
-        ENCODER = tiktoken.get_encoding(ENC_NAME)
-    except Exception:
-        ENCODER = None
+
+
+# ---------------------- utility helpers -------------------------------------
+def _lazy_import_tiktoken():
+    global _tiktoken
+    if _tiktoken is None:
+        try:
+            import tiktoken as tk
+
+            _tiktoken = tk
+        except Exception:
+            _tiktoken = None
+    return _tiktoken
+
+
+def _lazy_import_ray():
+    global _ray
+    if _ray is None:
+        try:
+            import ray as r
+
+            _ray = r
+        except Exception:
+            _ray = None
+    return _ray
+
+
+def _lazy_import_pandas_pyarrow():
+    global _pd, _pa
+    if _pd is None:
+        try:
+            import pandas as pd  # type: ignore
+
+            _pd = pd
+        except Exception:
+            _pd = None
+    if _pa is None:
+        try:
+            import pyarrow as pa  # type: ignore
+
+            _pa = pa
+        except Exception:
+            _pa = None
+    return _pd, _pa
+
+
 def sha256_hex(s: str) -> str:
     return hashlib.sha256((s or "").encode("utf-8")).hexdigest()
+
+
 def canonicalize_text(s: Any) -> str:
     if not isinstance(s, str):
         s = str(s or "")
     s = unicodedata.normalize("NFKC", s)
     s = s.replace("\r\n", "\n").replace("\r", "\n")
     return " ".join(s.split()).strip()
+
+
 def s3_object_exists(key: str) -> bool:
     try:
         s3.head_object(Bucket=S3_BUCKET, Key=key)
@@ -67,6 +138,8 @@ def s3_object_exists(key: str) -> bool:
         return False
     except Exception:
         return False
+
+
 def s3_put_object_with_retries(key: str, body: bytes, content_type: str = "application/json") -> None:
     attempt = 0
     while True:
@@ -78,46 +151,82 @@ def s3_put_object_with_retries(key: str, body: bytes, content_type: str = "appli
             if attempt >= max(1, S3_PUT_RETRIES):
                 raise
             time.sleep(S3_PUT_BACKOFF * attempt)
+
+
 def token_count_for(text: str) -> int:
     if not text:
         return 0
-    if ENCODER is not None:
+    tk = _lazy_import_tiktoken()
+    if tk is not None:
         try:
-            return len(ENCODER.encode(text))
+            enc = tk.get_encoding(ENC_NAME)
+            return len(enc.encode(text))
         except Exception:
             pass
     return len(text.split())
+
+
 def split_into_token_windows(text: str, window_tokens: int, overlap: int = 0) -> Iterator[Dict[str, Any]]:
     if not text:
-        yield {"window_index": 0, "text": "", "token_count": 0, "token_start": 0, "token_end": 0}; return
-    if ENCODER is None:
-        tokens = text.split(); total = len(tokens)
-        if window_tokens <= overlap: raise ValueError("window_tokens must be greater than overlap")
-        step = window_tokens - overlap; idx = 0
-        for start in range(0, total, step):
-            end = min(start + window_tokens, total); window_text = " ".join(tokens[start:end])
-            yield {"window_index": idx, "text": canonicalize_text(window_text), "token_count": end - start, "token_start": start, "token_end": end}
-            idx += 1
-            if end >= total: break
+        yield {"window_index": 0, "text": "", "token_count": 0, "token_start": 0, "token_end": 0}
         return
-    tokens = ENCODER.encode(text); total = len(tokens)
-    if window_tokens <= overlap: raise ValueError("window_tokens must be greater than overlap")
-    step = window_tokens - overlap; idx = 0
+    tk = _lazy_import_tiktoken()
+    if tk is None:
+        tokens = text.split()
+        total = len(tokens)
+        if window_tokens <= overlap:
+            raise ValueError("window_tokens must be greater than overlap")
+        step = window_tokens - overlap
+        idx = 0
+        for start in range(0, total, step):
+            end = min(start + window_tokens, total)
+            window_text = " ".join(tokens[start:end])
+            yield {
+                "window_index": idx,
+                "text": canonicalize_text(window_text),
+                "token_count": end - start,
+                "token_start": start,
+                "token_end": end,
+            }
+            idx += 1
+            if end >= total:
+                break
+        return
+    enc = tk.get_encoding(ENC_NAME)
+    tokens = enc.encode(text)
+    total = len(tokens)
+    if window_tokens <= overlap:
+        raise ValueError("window_tokens must be greater than overlap")
+    step = window_tokens - overlap
+    idx = 0
     for start in range(0, total, step):
-        end = start + window_tokens; slice_tokens = tokens[start:end]; window_text = ENCODER.decode(slice_tokens)
-        yield {"window_index": idx, "text": canonicalize_text(window_text), "token_count": len(slice_tokens), "token_start": start, "token_end": min(end, total)}
+        end = start + window_tokens
+        slice_tokens = tokens[start:end]
+        window_text = enc.decode(slice_tokens)
+        yield {
+            "window_index": idx,
+            "text": canonicalize_text(window_text),
+            "token_count": len(slice_tokens),
+            "token_start": start,
+            "token_end": min(end, total),
+        }
         idx += 1
-        if end >= total: break
+        if end >= total:
+            break
+
+
 def row_to_schema_text(row: Any) -> str:
-    parts: List[str] = []
+    # try pyarrow/pandas shapes first (best-effort)
+    pd, pa = _lazy_import_pandas_pyarrow()
     try:
-        if isinstance(row, pa.RecordBatch) or isinstance(row, pa.Table):
+        if pa is not None and (isinstance(row, pa.RecordBatch) or isinstance(row, pa.Table)):
             if isinstance(row, pa.Table):
                 batch = row.to_batches()[0] if row.num_rows > 0 else None
             else:
                 batch = row
             if batch is not None and batch.num_columns > 0:
                 cols = batch.schema.names
+                parts: List[str] = []
                 for i, name in enumerate(cols):
                     col = batch.column(i)
                     try:
@@ -129,19 +238,21 @@ def row_to_schema_text(row: Any) -> str:
                 return canonicalize_text(" | ".join(parts))
     except Exception:
         pass
+
     try:
-        if isinstance(row, pd.Series):
-            for k, v in row.items():
-                parts.append(f"{k}: {'' if v is None else v}")
+        if _pd is not None and isinstance(row, _pd.Series):
+            parts = [f"{k}: {'' if v is None else v}" for k, v in row.items()]
             return canonicalize_text(" | ".join(parts))
     except Exception:
         pass
+
     if isinstance(row, dict):
-        for k, v in row.items():
-            parts.append(f"{k}: {'' if v is None else v}")
+        parts = [f"{k}: {'' if v is None else v}" for k, v in row.items()]
     else:
-        parts.append(str(row))
+        parts = [str(row)]
     return canonicalize_text(" | ".join(parts))
+
+
 def detect_total_memory_bytes() -> int:
     try:
         path_v2 = "/sys/fs/cgroup/memory.max"
@@ -150,42 +261,56 @@ def detect_total_memory_bytes() -> int:
                 val = f.read().strip()
                 if val.isdigit():
                     v = int(val)
-                    if v > 0 and v < 2**60: return v
+                    if v > 0 and v < 2**60:
+                        return v
         path_v1 = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
         if os.path.exists(path_v1):
             with open(path_v1, "r") as f:
                 v = int(f.read().strip())
-                if v > 0: return v
+                if v > 0:
+                    return v
     except Exception:
         pass
     try:
-        import psutil
+        import psutil  # type: ignore
+
         return int(psutil.virtual_memory().total)
     except Exception:
         pass
     try:
-        pages = os.sysconf("SC_PHYS_PAGES"); page_size = os.sysconf("SC_PAGE_SIZE")
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
         return int(pages * page_size)
     except Exception:
         return 512 * (1024 ** 2)
+
+
 def compute_streaming_chunk_size() -> int:
     total = detect_total_memory_bytes()
     size = max(32_000_000, min(256_000_000, max(16_000_000, int(total // 8))))
     return int(size)
+
+
 def try_init_ray_with_object_store():
+    r = _lazy_import_ray()
+    if r is None:
+        log.debug("Ray not available; skipping Ray-based CSV reading.")
+        return
     mem = compute_streaming_chunk_size()
     try:
         if mem:
-            ray.init(address="auto", ignore_reinit_error=True, object_store_memory=int(mem))
+            r.init(address="auto", ignore_reinit_error=True, object_store_memory=int(mem))
             log.info("Initialized Ray with object_store_memory=%d", int(mem))
         else:
-            ray.init(address="auto", ignore_reinit_error=True)
+            r.init(address="auto", ignore_reinit_error=True)
             log.info("Initialized Ray (no object_store_memory set)")
     except TypeError:
-        ray.init(address="auto", ignore_reinit_error=True)
+        r.init(address="auto", ignore_reinit_error=True)
         log.info("Initialized Ray fallback (plain init)")
     except Exception as e:
         log.warning("Ray init failed: %s", e)
+
+
 def get_header_and_sample_tokens(s3_key: str) -> Tuple[str, int]:
     def fallback_from_bytes(body_bytes: bytes) -> Tuple[str, int]:
         try:
@@ -193,29 +318,35 @@ def get_header_and_sample_tokens(s3_key: str) -> Tuple[str, int]:
             lines = [ln for ln in text.splitlines() if ln.strip()]
             if not lines:
                 return "", 32
-            header = lines[0]; sample_line = lines[1] if len(lines) > 1 else ""
+            header = lines[0]
+            sample_line = lines[1] if len(lines) > 1 else ""
             header_cols = [c.strip() for c in header.split(",")] if header else []
             header_text = canonicalize_text(" | ".join(header_cols))
             sample_tokens = max(1, token_count_for(canonicalize_text(sample_line)))
             return header_text, sample_tokens
         except Exception:
             return "", 32
+
     try:
         range_header = {"Range": f"bytes=0-{S3_RANGE_BYTES-1}"}
         resp = s3.get_object(Bucket=S3_BUCKET, Key=s3_key, Range=range_header["Range"])
         body_bytes = resp.get("Body").read()
     except Exception:
         try:
-            obj = s3.get_object(Bucket=S3_BUCKET, Key=s3_key); body_bytes = obj.get("Body").read()
+            obj = s3.get_object(Bucket=S3_BUCKET, Key=s3_key)
+            body_bytes = obj.get("Body").read()
         except Exception:
             return "", 32
-    if ray is not None:
+
+    # Try Ray-based sampling for large CSVs if ray available
+    r = _lazy_import_ray()
+    if r is not None:
         try:
             try_init_ray_with_object_store()
             s3_path = f"s3://{S3_BUCKET}/{s3_key}" if S3_BUCKET else None
             if s3_path:
                 try:
-                    ds = ray.data.read_csv(s3_path, file_extensions=["csv"])
+                    ds = r.data.read_csv(s3_path, file_extensions=["csv"])
                     sample = ds.take(2) if hasattr(ds, "take") else []
                     if sample:
                         first = sample[0] if len(sample) > 0 else {}
@@ -228,176 +359,353 @@ def get_header_and_sample_tokens(s3_key: str) -> Tuple[str, int]:
                     pass
         except Exception:
             pass
+
     return fallback_from_bytes(body_bytes)
+
+
 def make_doc_id(s3_key: str, last_modified: Any) -> str:
     return sha256_hex(s3_key + str(last_modified or ""))
+
+
 def filename_from_source_url(source_url: Optional[str]) -> str:
-    if not source_url: return ""
+    if not source_url:
+        return ""
     try:
-        if source_url.startswith("s3://"): return os.path.basename(source_url)
+        if source_url.startswith("s3://"):
+            return os.path.basename(source_url)
         parsed = urllib.parse.urlparse(source_url)
-        if parsed.path: return os.path.basename(parsed.path)
+        if parsed.path:
+            return os.path.basename(parsed.path)
         return os.path.basename(source_url)
     except Exception:
         return os.path.basename(str(source_url))
+
+
 class S3DocWriter:
     def __init__(self, doc_id: str, s3_path: str, ext: str, content_type: str = "application/json"):
-        self.doc_id = doc_id; self.s3_path = s3_path; self.ext = ext; self.content_type = content_type
+        self.doc_id = doc_id
+        self.s3_path = s3_path
+        self.ext = ext
+        self.content_type = content_type
         self.temp = tempfile.NamedTemporaryFile(mode="wb", delete=False, dir="/tmp", prefix=f"{doc_id}_", suffix=f".{ext}")
-        self.count = 0; self._first = True
+        self.count = 0
+        self._first = True
         if self.ext == "json":
-            self.temp.write(b"[\n"); self.temp.flush()
+            self.temp.write(b"[\n")
+            self.temp.flush()
+
     def write_payload(self, payload: Dict[str, Any]) -> int:
         self.count += 1
         if self.ext == "jsonl":
-            line = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"); self.temp.write(line)
+            line = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+            self.temp.write(line)
         else:
-            pretty = json.dumps(payload, ensure_ascii=False, indent=2); indented = ("\n".join("  " + ln for ln in pretty.splitlines()) + "\n").encode("utf-8")
-            if not self._first: self.temp.write(b",\n")
-            self.temp.write(indented); self._first = False
-        self.temp.flush(); return 1
+            pretty = json.dumps(payload, ensure_ascii=False, indent=2)
+            indented = ("\n".join("  " + ln for ln in pretty.splitlines()) + "\n").encode("utf-8")
+            if not self._first:
+                self.temp.write(b",\n")
+            self.temp.write(indented)
+            self._first = False
+        self.temp.flush()
+        return 1
+
     def finalize_and_upload(self, out_key: str) -> Tuple[int, str]:
-        if self.ext == "json": self.temp.write(b"]\n")
-        self.temp.flush(); self.temp.close()
+        if self.ext == "json":
+            self.temp.write(b"]\n")
+        self.temp.flush()
+        self.temp.close()
         s3.upload_file(self.temp.name, S3_BUCKET, out_key, ExtraArgs={"ContentType": "application/json"})
-        try: os.unlink(self.temp.name)
-        except Exception: pass
+        try:
+            os.unlink(self.temp.name)
+        except Exception:
+            pass
         return self.count, out_key
+
+
 def sanitize_payload_for_weaviate(payload: Dict[str, Any]) -> None:
     for k in list(payload.keys()):
         v = payload.get(k)
         if k == "tags":
-            if v is None: payload[k] = []
-            elif isinstance(v, (list, tuple)): payload[k] = [str(x) for x in v]
-            else: payload[k] = [str(v)]
+            if v is None:
+                payload[k] = []
+            elif isinstance(v, (list, tuple)):
+                payload[k] = [str(x) for x in v]
+            else:
+                payload[k] = [str(v)]
             continue
         if v is None:
-            payload.pop(k, None); continue
+            payload.pop(k, None)
+            continue
         if isinstance(v, dict):
-            try: payload[k] = json.dumps(v, ensure_ascii=False)
-            except Exception: payload[k] = str(v)
+            try:
+                payload[k] = json.dumps(v, ensure_ascii=False)
+            except Exception:
+                payload[k] = str(v)
             continue
         if isinstance(v, (list, tuple)):
             new = []
             for x in v:
-                if isinstance(x, (str, int, float, bool)) or x is None: new.append(x)
-                else: new.append(str(x))
-            payload[k] = new; continue
-        if not isinstance(v, (str, int, float, bool)): payload[k] = str(v)
-def _flush_rows_chunk(writer: S3DocWriter, doc_id: str, chunk_index: int, header_text: str, rows_text: List[str], start_row_num: int, manifest_tags: List[str] = None) -> Tuple[int, int]:
-    if not rows_text: return 0, chunk_index
-    chunk_index += 1; chunk_id = f"{doc_id}_{chunk_index}"
+                if isinstance(x, (str, int, float, bool)) or x is None:
+                    new.append(x)
+                else:
+                    new.append(str(x))
+            payload[k] = new
+            continue
+        if not isinstance(v, (str, int, float, bool)):
+            payload[k] = str(v)
+
+
+def _flush_rows_chunk(writer: S3DocWriter, doc_id: str, chunk_index: int, header_text: str, rows_text: List[str],
+                      start_row_num: int, manifest_tags: List[str] = None) -> Tuple[int, int]:
+    if not rows_text:
+        return 0, chunk_index
+    chunk_index += 1
+    chunk_id = f"{doc_id}_{chunk_index}"
     chunk_text = header_text + "\n" + "\n".join(rows_text) if header_text else "\n".join(rows_text)
-    token_ct = token_count_for(chunk_text); end_row_num = start_row_num + len(rows_text) - 1
+    token_ct = token_count_for(chunk_text)
+    end_row_num = start_row_num + len(rows_text) - 1
     source_url = f"s3://{S3_BUCKET}/{writer.s3_path}" if S3_BUCKET else None
-    payload: Dict[str, Any] = {"document_id": doc_id or "", "chunk_id": chunk_id or "", "chunk_type": "row_group", "text": canonicalize_text(chunk_text) or "", "token_count": int(token_ct or 0), "figures": [], "embedding": None, "file_type": "text/csv", "source_url": source_url, "file_name": filename_from_source_url(source_url) if source_url else "", "page_number": None, "slide_range": None, "row_range": json.dumps([int(start_row_num), int(end_row_num)]), "token_range": None, "audio_range": None, "timestamp": datetime.utcnow().isoformat() + "Z", "parser_version": PARSER_VERSION or "", "tags": manifest_tags or [], "layout_tags": [], "used_ocr": False, "heading_path": [], "headings": [], "line_range": None}
-    sanitize_payload_for_weaviate(payload); writer.write_payload(payload); log.info("Buffered CSV row_group chunk %s", payload.get("chunk_id")); return 1, chunk_index
-def _process_batch_rows(rows_iterable, doc_id, s3_path, chunk_index, header_text, next_row_num, writer: S3DocWriter, manifest_tags: List[str] = None):
-    saved = 0; rows_text: List[str] = []; start_row_of_current = next_row_num
+    payload: Dict[str, Any] = {
+        "document_id": doc_id or "",
+        "chunk_id": chunk_id or "",
+        "chunk_type": "row_group",
+        "text": canonicalize_text(chunk_text) or "",
+        "token_count": int(token_ct or 0),
+        "figures": [],
+        "embedding": None,
+        "file_type": "text/csv",
+        "source_url": source_url,
+        "file_name": filename_from_source_url(source_url) if source_url else "",
+        "page_number": None,
+        "slide_range": None,
+        "row_range": json.dumps([int(start_row_num), int(end_row_num)]),
+        "token_range": None,
+        "audio_range": None,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "parser_version": PARSER_VERSION or "",
+        "tags": manifest_tags or [],
+        "layout_tags": [],
+        "used_ocr": False,
+        "heading_path": [],
+        "headings": [],
+        "line_range": None,
+    }
+    sanitize_payload_for_weaviate(payload)
+    writer.write_payload(payload)
+    log.info("Buffered CSV row_group chunk %s", payload.get("chunk_id"))
+    return 1, chunk_index
+
+
+def _process_batch_rows(rows_iterable, doc_id, s3_path, chunk_index, header_text, next_row_num, writer: S3DocWriter,
+                        manifest_tags: List[str] = None):
+    saved = 0
+    rows_text: List[str] = []
+    start_row_of_current = next_row_num
     for _, row in rows_iterable:
         if isinstance(row, dict):
             row_text = canonicalize_text(" | ".join([f"{k}: {v}" for k, v in row.items()]))
         else:
             row_text = canonicalize_text(str(row))
-        row_num = next_row_num; next_row_num += 1
-        row_tokens = token_count_for(row_text); header_tokens = token_count_for(header_text) if header_text else 0
+        row_num = next_row_num
+        next_row_num += 1
+        row_tokens = token_count_for(row_text)
+        header_tokens = token_count_for(header_text) if header_text else 0
+
         if row_tokens > TARGET_TOKENS_PER_CHUNK:
             if rows_text:
-                wrote, chunk_index = _flush_rows_chunk(writer, doc_id, chunk_index, header_text, rows_text, start_row_of_current, manifest_tags); saved += wrote; rows_text = []
+                wrote, chunk_index = _flush_rows_chunk(writer, doc_id, chunk_index, header_text, rows_text,
+                                                      start_row_of_current, manifest_tags)
+                saved += wrote
+                rows_text = []
             windows = list(split_into_token_windows(row_text, TARGET_TOKENS_PER_CHUNK, overlap=int(TARGET_TOKENS_PER_CHUNK * 0.1)))
             for w in windows:
-                chunk_index += 1; chunk_id = f"{doc_id}_{chunk_index}"
+                chunk_index += 1
+                chunk_id = f"{doc_id}_{chunk_index}"
                 candidate_text = header_text + "\n" + w["text"] if header_text and (header_tokens + w["token_count"] <= TARGET_TOKENS_PER_CHUNK) else w["text"]
                 token_ct = token_count_for(candidate_text)
-                payload: Dict[str, Any] = {"document_id": doc_id or "", "chunk_id": chunk_id or "", "chunk_type": "token_window", "text": canonicalize_text(candidate_text) or "", "token_count": int(token_ct or 0), "figures": [], "embedding": None, "file_type": "text/csv", "source_url": f"s3://{S3_BUCKET}/{s3_path}" if S3_BUCKET else None, "file_name": filename_from_source_url(f"s3://{S3_BUCKET}/{s3_path}") if S3_BUCKET else "", "page_number": None, "slide_range": None, "row_range": json.dumps([int(row_num), int(row_num)]), "token_range": [int(w.get("token_start")), int(w.get("token_end"))], "audio_range": None, "timestamp": datetime.utcnow().isoformat() + "Z", "parser_version": PARSER_VERSION or "", "tags": manifest_tags or [], "layout_tags": [], "used_ocr": False, "heading_path": [], "headings": [], "line_range": None}
-                sanitize_payload_for_weaviate(payload); writer.write_payload(payload); log.info("Buffered CSV token_window %s", payload.get("chunk_id")); saved += 1
-            start_row_of_current = next_row_num; continue
+                payload: Dict[str, Any] = {
+                    "document_id": doc_id or "",
+                    "chunk_id": chunk_id or "",
+                    "chunk_type": "token_window",
+                    "text": canonicalize_text(candidate_text) or "",
+                    "token_count": int(token_ct or 0),
+                    "figures": [],
+                    "embedding": None,
+                    "file_type": "text/csv",
+                    "source_url": f"s3://{S3_BUCKET}/{s3_path}" if S3_BUCKET else None,
+                    "file_name": filename_from_source_url(f"s3://{S3_BUCKET}/{s3_path}") if S3_BUCKET else "",
+                    "page_number": None,
+                    "slide_range": None,
+                    "row_range": json.dumps([int(row_num), int(row_num)]),
+                    "token_range": [int(w.get("token_start")), int(w.get("token_end"))],
+                    "audio_range": None,
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "parser_version": PARSER_VERSION or "",
+                    "tags": manifest_tags or [],
+                    "layout_tags": [],
+                    "used_ocr": False,
+                    "heading_path": [],
+                    "headings": [],
+                    "line_range": None,
+                }
+                sanitize_payload_for_weaviate(payload)
+                writer.write_payload(payload)
+                log.info("Buffered CSV token_window %s", payload.get("chunk_id"))
+                saved += 1
+            start_row_of_current = next_row_num
+            continue
+
         candidate_text = header_text + "\n" + "\n".join(rows_text + [row_text]) if header_text else "\n".join(rows_text + [row_text])
         candidate_tokens = token_count_for(candidate_text)
         if candidate_tokens <= TARGET_TOKENS_PER_CHUNK:
-            if not rows_text: start_row_of_current = row_num
-            rows_text.append(row_text); continue
+            if not rows_text:
+                start_row_of_current = row_num
+            rows_text.append(row_text)
+            continue
         else:
-            wrote, chunk_index = _flush_rows_chunk(writer, doc_id, chunk_index, header_text, rows_text, start_row_of_current, manifest_tags); saved += wrote; rows_text = [row_text]; start_row_of_current = row_num
+            wrote, chunk_index = _flush_rows_chunk(writer, doc_id, chunk_index, header_text, rows_text, start_row_of_current, manifest_tags)
+            saved += wrote
+            rows_text = [row_text]
+            start_row_of_current = row_num
+
     if rows_text:
-        wrote, chunk_index = _flush_rows_chunk(writer, doc_id, chunk_index, header_text, rows_text, start_row_of_current, manifest_tags); saved += wrote
+        wrote, chunk_index = _flush_rows_chunk(writer, doc_id, chunk_index, header_text, rows_text, start_row_of_current, manifest_tags)
+        saved += wrote
     return saved, chunk_index, next_row_num
+
+
 def parse_file(s3_key: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Main entry called by router.py
+    Returns dict with keys: saved_chunks, total_parse_duration_ms, (optional) skipped, error
+    """
     start_all = time.perf_counter()
     try:
         head_obj = s3.head_object(Bucket=S3_BUCKET, Key=s3_key)
     except Exception as e:
-        logger.error("Could not head S3 object %s: %s", s3_key, e); return {"saved_chunks": 0, "total_parse_duration_ms": 0, "skipped": True, "error": str(e)}
-    last_modified = head_obj.get("LastModified", ""); doc_id = manifest.get("file_hash") or make_doc_id(s3_key, last_modified); s3_path = f"{s3_key}"
-    ext = "json"; out_key = f"{S3_CHUNKED_PREFIX}{doc_id}.{ext}"
+        log.error("Could not head S3 object %s: %s", s3_key, e)
+        return {"saved_chunks": 0, "total_parse_duration_ms": 0, "skipped": True, "error": str(e)}
+
+    last_modified = head_obj.get("LastModified", "")
+    doc_id = manifest.get("file_hash") or make_doc_id(s3_key, last_modified)
+    s3_path = f"{s3_key}"
+    ext = "json"
+    out_key = f"{S3_CHUNKED_PREFIX}{doc_id}.{ext}"
+
     if not FORCE_OVERWRITE and s3_object_exists(out_key):
-        total_ms = int((time.perf_counter() - start_all) * 1000); logger.info("Skipping entire file because chunked file exists: %s", out_key); return {"saved_chunks": 0, "total_parse_duration_ms": total_ms, "skipped": True}
-    header_text, sample_row_tokens = get_header_and_sample_tokens(s3_key); header_tokens = token_count_for(header_text) if header_text else 0
+        total_ms = int((time.perf_counter() - start_all) * 1000)
+        logger.info("Skipping entire file because chunked file exists: %s", out_key)
+        return {"saved_chunks": 0, "total_parse_duration_ms": total_ms, "skipped": True}
+
+    header_text, sample_row_tokens = get_header_and_sample_tokens(s3_key)
+    header_tokens = token_count_for(header_text) if header_text else 0
     if header_tokens >= TARGET_TOKENS_PER_CHUNK:
-        logger.warning("CSV header token count >= target chunk size. Header will not be prepended to row_group chunks."); header_text = ""; header_tokens = 0
+        logger.warning("CSV header token count >= target chunk size. Header will not be prepended to row_group chunks.")
+        header_text = ""
+        header_tokens = 0
+
     if ROWS_PER_CHUNK_OVERRIDE:
         rows_per_chunk = max(MIN_ROWS_PER_CHUNK, min(MAX_ROWS_PER_CHUNK, int(ROWS_PER_CHUNK_OVERRIDE)))
     else:
-        available_for_rows = max(1, TARGET_TOKENS_PER_CHUNK - header_tokens); estimated_rows = max(1, int(available_for_rows / max(1, sample_row_tokens))); rows_per_chunk = max(MIN_ROWS_PER_CHUNK, min(MAX_ROWS_PER_CHUNK, estimated_rows))
+        available_for_rows = max(1, TARGET_TOKENS_PER_CHUNK - header_tokens)
+        estimated_rows = max(1, int(available_for_rows / max(1, sample_row_tokens)))
+        rows_per_chunk = max(MIN_ROWS_PER_CHUNK, min(MAX_ROWS_PER_CHUNK, estimated_rows))
+
     logger.info("%s sample_row_tokens=%d header_tokens=%d rows_per_chunk=%d", s3_key, sample_row_tokens, header_tokens, rows_per_chunk)
-    saved = 0; chunk_index = 0; next_row_num = 1; manifest_tags = manifest.get("tags", []) if isinstance(manifest, dict) else []; writer = S3DocWriter(doc_id=doc_id, s3_path=s3_path, ext=ext)
+
+    saved = 0
+    chunk_index = 0
+    next_row_num = 1
+    manifest_tags = manifest.get("tags", []) if isinstance(manifest, dict) else []
+    writer = S3DocWriter(doc_id=doc_id, s3_path=s3_path, ext=ext)
+
     try:
-        obj = s3.get_object(Bucket=S3_BUCKET, Key=s3_key); body = obj.get("Body"); text_stream = io.TextIOWrapper(body, encoding="utf-8", errors="replace", newline="")
-        reader = csv.DictReader(text_stream, delimiter=","); buffer: List[Dict[str, Any]] = []
+        obj = s3.get_object(Bucket=S3_BUCKET, Key=s3_key)
+        body = obj.get("Body")
+        text_stream = io.TextIOWrapper(body, encoding="utf-8", errors="replace", newline="")
+        reader = csv.DictReader(text_stream, delimiter=",")
+        buffer: List[Dict[str, Any]] = []
         for row in reader:
             buffer.append(row)
             if len(buffer) >= rows_per_chunk:
                 indexed_iter = ((i, r) for i, r in enumerate(buffer))
                 saved_chunk, chunk_index, next_row_num = _process_batch_rows(indexed_iter, doc_id, s3_path, chunk_index, header_text, next_row_num, writer, manifest_tags)
-                saved += saved_chunk; buffer = []
+                saved += saved_chunk
+                buffer = []
         if buffer:
             indexed_iter = ((i, r) for i, r in enumerate(buffer))
             saved_chunk, chunk_index, next_row_num = _process_batch_rows(indexed_iter, doc_id, s3_path, chunk_index, header_text, next_row_num, writer, manifest_tags)
             saved += saved_chunk
     except Exception as e_pd:
-        total_ms = int((time.perf_counter() - start_all) * 1000); logger.error("Skipping malformed or unreadable CSV %s error=%s", s3_key, str(e_pd))
+        total_ms = int((time.perf_counter() - start_all) * 1000)
+        logger.error("Skipping malformed or unreadable CSV %s error=%s", s3_key, str(e_pd))
         try:
             if writer and writer.temp:
-                try: os.unlink(writer.temp.name)
-                except Exception: pass
+                try:
+                    os.unlink(writer.temp.name)
+                except Exception:
+                    pass
         except Exception:
             pass
         return {"saved_chunks": 0, "total_parse_duration_ms": total_ms, "skipped": True, "error": str(e_pd)}
+
     try:
         if saved == 0:
             try:
-                if writer and writer.temp: os.unlink(writer.temp.name)
+                if writer and writer.temp:
+                    os.unlink(writer.temp.name)
             except Exception:
                 pass
-            total_ms = int((time.perf_counter() - start_all) * 1000); logger.info("No chunks produced for %s", s3_key); return {"saved_chunks": 0, "total_parse_duration_ms": total_ms}
-        count, uploaded_key = writer.finalize_and_upload(out_key); total_ms = int((time.perf_counter() - start_all) * 1000); logger.info("Wrote %d chunks for %s → %s (%d ms)", count, s3_key, uploaded_key, total_ms); return {"saved_chunks": count, "total_parse_duration_ms": total_ms}
+            total_ms = int((time.perf_counter() - start_all) * 1000)
+            logger.info("No chunks produced for %s", s3_key)
+            return {"saved_chunks": 0, "total_parse_duration_ms": total_ms}
+
+        count, uploaded_key = writer.finalize_and_upload(out_key)
+        total_ms = int((time.perf_counter() - start_all) * 1000)
+        logger.info("Wrote %d chunks for %s → %s (%d ms)", count, s3_key, uploaded_key, total_ms)
+        return {"saved_chunks": count, "total_parse_duration_ms": total_ms}
     except Exception as e_up:
-        total_ms = int((time.perf_counter() - start_all) * 1000); logger.error("Failed to upload chunked file for %s error=%s", s3_key, str(e_up))
+        total_ms = int((time.perf_counter() - start_all) * 1000)
+        logger.error("Failed to upload chunked file for %s error=%s", s3_key, str(e_up))
         try:
             if writer and writer.temp:
-                try: os.unlink(writer.temp.name)
-                except Exception: pass
+                try:
+                    os.unlink(writer.temp.name)
+                except Exception:
+                    pass
         except Exception:
             pass
         return {"saved_chunks": 0, "total_parse_duration_ms": total_ms, "skipped": True, "error": str(e_up)}
+
+
+# Allow running as a script for local testing (safe)
 if __name__ == "__main__":
-    try_init_ray_with_object_store()
+    try:
+        try_init_ray_with_object_store()
+    except Exception:
+        pass
+
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=S3_RAW_PREFIX):
         for obj in page.get("Contents", []):
             key = obj["Key"]
-            if not key.lower().endswith(".csv"): continue
+            if not key.lower().endswith(".csv"):
+                continue
             log.info("Routing parse_file for s3://%s/%s", S3_BUCKET, key)
             manifest_key = key + ".manifest.json"
             try:
-                mf_obj = s3.get_object(Bucket=S3_BUCKET, Key=manifest_key); manifest = json.load(mf_obj["Body"])
+                mf_obj = s3.get_object(Bucket=S3_BUCKET, Key=manifest_key)
+                manifest = json.load(mf_obj["Body"])
             except Exception:
                 manifest = {}
             try:
                 parse_file(key, manifest)
             except Exception as e:
                 log.exception("Failed to parse %s: %s", key, e)
+    # shutdown Ray if we started it
+    r = _lazy_import_ray()
     try:
-        ray.shutdown()
+        if r is not None:
+            r.shutdown()
     except Exception:
         pass

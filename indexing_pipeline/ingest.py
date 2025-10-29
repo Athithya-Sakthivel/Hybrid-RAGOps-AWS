@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import os
-import sys
 import time
 import json
 import uuid
@@ -9,9 +8,8 @@ import hashlib
 import logging
 import subprocess
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 
-# minimal, deterministic logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("ingest")
@@ -19,7 +17,7 @@ log = logging.getLogger("ingest")
 import ray
 from ray import serve
 
-# Configuration (override with env)
+# Config
 RAY_ADDRESS = os.getenv("RAY_ADDRESS", "auto")
 RAY_NAMESPACE = os.getenv("RAY_NAMESPACE", "ragops")
 SERVE_APP_NAME = os.getenv("SERVE_APP_NAME", "default")
@@ -31,7 +29,6 @@ S3_RAW_PREFIX = os.getenv("S3_RAW_PREFIX", "data/raw/").rstrip("/") + "/"
 S3_CHUNKED_PREFIX = os.getenv("S3_CHUNKED_PREFIX", "data/chunked/").rstrip("/") + "/"
 
 EMBED_DEPLOYMENT = os.getenv("EMBED_DEPLOYMENT", "embed_onxx")
-RERANK_DEPLOYMENT = os.getenv("RERANK_HANDLE_NAME", "rerank_onxx")
 INDEXING_EMBEDDER_MAX_TOKENS = int(os.getenv("INDEXING_EMBEDDER_MAX_TOKENS", "512"))
 
 QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
@@ -165,11 +162,10 @@ def read_json_objects_from_text(text: str) -> List[Dict[str, Any]]:
             pass
     return out
 
-# --- Actors: Qdrant & Neo4j (always return serializable dicts) ---
+# Actors
 @ray.remote(num_cpus=0)
 class QdrantWriter:
     def __init__(self, url: str, api_key: Optional[str], collection: str, vector_dim: int, on_disk_payload: bool = True):
-        # keep any exceptions internal and preserve actor up
         self.collection = collection
         self.vector_dim = vector_dim
         self.on_disk_payload = on_disk_payload
@@ -178,7 +174,6 @@ class QdrantWriter:
             from qdrant_client import QdrantClient
             prefer_grpc = not (url.startswith("http://") or url.startswith("https://"))
             self.client = QdrantClient(url=url, api_key=api_key, prefer_grpc=prefer_grpc)
-            # Ensure collection exists; swallow failures
             try:
                 cols = [c.name for c in self.client.get_collections().collections]
                 if collection not in cols:
@@ -206,18 +201,12 @@ class QdrantWriter:
         return out
 
     def upsert_points(self, points: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Return serializable dict. Never raise.
-        If collection missing, try to create and retry once.
-        """
         if not self.client:
             return {"ok": False, "error": "qdrant_client_unavailable"}
-
         try:
             from qdrant_client.http.models import PointStruct, VectorParams, Distance
         except Exception:
             return {"ok": False, "error": "qdrant_models_missing"}
-
         structs = []
         for p in points:
             try:
@@ -225,8 +214,6 @@ class QdrantWriter:
             except Exception as e:
                 return {"ok": False, "error": f"invalid_vector:{e}"}
             structs.append(PointStruct(id=p["id"], vector=vec, payload=p.get("payload", {})))
-
-        # attempt upsert with one retry if collection missing
         attempts = 0
         while attempts < 2:
             attempts += 1
@@ -237,7 +224,6 @@ class QdrantWriter:
             except Exception as e:
                 msg = str(e)
                 log.warning("QdrantWriter upsert attempt %d failed: %s", attempts, msg)
-                # Try to handle missing collection
                 if ("doesn't exist" in msg) or ("Not found: Collection" in msg) or ("404" in msg) or ("NotFound" in msg):
                     try:
                         self.client.create_collection(collection_name=self.collection, vectors_config=VectorParams(size=self.vector_dim, distance=Distance.COSINE), on_disk_payload=self.on_disk_payload)
@@ -246,7 +232,6 @@ class QdrantWriter:
                     except Exception as e2:
                         log.exception("QdrantWriter: create_collection retry failed: %s", e2)
                         return {"ok": False, "error": f"create_collection_failed:{e2}"}
-                # Generic failure - return error string (serializable)
                 return {"ok": False, "error": msg}
         return {"ok": False, "error": "upsert_retries_exhausted"}
 
@@ -308,7 +293,25 @@ class Neo4jWriter:
                 return {"ok": False, "error": "neo4j_write_retries_exhausted"}
         return {"ok": True, "written": written}
 
-# --- Ray helpers and serve call wrapper ---
+    def get_chunks_info(self, chunk_ids: List[str]) -> Dict[str, Dict[str, Optional[str]]]:
+        out = {cid: {"exists": False, "qdrant_id": None} for cid in chunk_ids}
+        if not self.driver:
+            return out
+        try:
+            with self.driver.session() as s:
+                res = s.run(
+                    "MATCH (c:Chunk) WHERE c.chunk_id IN $ids "
+                    "RETURN c.chunk_id AS id, c.qdrant_id AS qdrant_id",
+                    ids=chunk_ids,
+                )
+                for row in res:
+                    cid = row["id"]
+                    out[cid] = {"exists": True, "qdrant_id": row.get("qdrant_id")}
+        except Exception as e:
+            self._log.warning("neo4j get_chunks_info failed: %s", e)
+        return out
+
+# Ray helpers
 def _ensure_ray_connected():
     if not ray.is_initialized():
         ray.init(address=(RAY_ADDRESS if RAY_ADDRESS and RAY_ADDRESS != "auto" else None), namespace=RAY_NAMESPACE, ignore_reinit_error=True)
@@ -345,7 +348,6 @@ def get_strict_handle(name: str, timeout: float = 30.0, poll: float = 0.5, app_n
                     handle = None
             if handle is None:
                 raise RuntimeError("no serve handle API available")
-            # perform health call
             try:
                 ref = handle.remote({"texts": ["__health_check__"], "max_length": INDEXING_EMBEDDER_MAX_TOKENS})
                 _ = _resolve_ray_response(ref, timeout=10.0)
@@ -358,13 +360,6 @@ def get_strict_handle(name: str, timeout: float = 30.0, poll: float = 0.5, app_n
     raise RuntimeError(f"timed out resolving serve handle {name}: {last_exc}")
 
 def call_serve(handle, payload, timeout: float = EMBED_TIMEOUT):
-    """
-    Robustly call a Serve handle. Accepts:
-      - handle.remote(...) → ObjectRef or DeploymentResponse
-      - handle(...) synchronous result
-      - DeploymentResponse with object_refs/result/get attributes
-    Always returns resolved python object or raises a RuntimeError with stringified error.
-    """
     try:
         if hasattr(handle, "remote"):
             resp = handle.remote(payload)
@@ -373,17 +368,14 @@ def call_serve(handle, payload, timeout: float = EMBED_TIMEOUT):
     except Exception as e:
         raise RuntimeError(f"serve invocation failed: {e}") from e
 
-    # direct primitive
     if isinstance(resp, (dict, list, str, int, float, bool)) or resp is None:
         return resp
 
-    # ray ObjectRef
     try:
         return ray.get(resp, timeout=timeout)
     except Exception:
         pass
 
-    # DeploymentResponse-like object with object_refs
     if hasattr(resp, "object_refs"):
         obj_refs = getattr(resp, "object_refs")
         try:
@@ -394,7 +386,6 @@ def call_serve(handle, payload, timeout: float = EMBED_TIMEOUT):
         except Exception:
             pass
 
-    # .result(), .get() fallbacks
     if hasattr(resp, "result") and callable(getattr(resp, "result")):
         try:
             return resp.result(timeout=timeout)
@@ -412,41 +403,42 @@ def call_serve(handle, payload, timeout: float = EMBED_TIMEOUT):
             except Exception:
                 pass
 
-    # final attempt
     try:
         return ray.get(resp, timeout=timeout)
     except Exception as e:
         raise RuntimeError(f"call_serve failed resolving response: {e}") from e
 
-# caches
-_EMBED_HANDLE: Optional[Any] = None
-
-def get_embed_handle_cached(timeout: float = 10.0):
-    global _EMBED_HANDLE
-    if _EMBED_HANDLE is not None:
-        return _EMBED_HANDLE
-    _EMBED_HANDLE = get_strict_handle(EMBED_DEPLOYMENT, timeout=timeout, app_name=SERVE_APP_NAME)
-    return _EMBED_HANDLE
-
-# pre-conversion runner (optional)
-def run_preconversions(workdir: str) -> int:
-    script = Path(workdir) / "pre_conversions" / "convert_all.sh"
-    if not script.exists():
-        log.info("preconvert script not found at %s, skipping", script)
-        return 0
+# actor ensure helper
+def ensure_actor(actor_cls, name: str, required_methods: List[str], *args):
     try:
-        proc = subprocess.Popen([str(script)], cwd=workdir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    except Exception as e:
-        log.exception("failed to start pre_conversions: %s", e)
-        return 1
-    for line in proc.stdout or []:
-        log.info("[preconv] %s", line.rstrip())
-    rc = proc.wait()
-    if rc != 0:
-        log.error("pre_conversions script exited rc=%s", rc)
-    return rc
+        return actor_cls.options(name=name, lifetime="detached").remote(*args)
+    except Exception:
+        try:
+            existing = ray.get_actor(name, namespace=RAY_NAMESPACE)
+        except Exception:
+            return actor_cls.options(name=name, lifetime="detached").remote(*args)
+        try:
+            missing = False
+            for m in required_methods:
+                if not hasattr(existing, m):
+                    missing = True
+                    break
+            if missing:
+                log.info("Existing actor %s missing methods; killing and recreating", name)
+                try:
+                    ray.kill(existing)
+                except Exception:
+                    log.warning("Failed to kill actor %s; attempting recreate anyway", name)
+                return actor_cls.options(name=name, lifetime="detached").remote(*args)
+            return existing
+        except Exception:
+            try:
+                ray.kill(existing)
+            except Exception:
+                pass
+            return actor_cls.options(name=name, lifetime="detached").remote(*args)
 
-# --- worker function ---
+# worker
 @ray.remote
 def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: Dict[str, Any]) -> int:
     import boto3
@@ -459,9 +451,8 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
     embed_timeout = cfg.get("embed_timeout")
     boto_client = _s3_client_for_bucket(s3_bucket) if s3_bucket else None
 
-    # try resolve embed handle (workers may call directly)
     try:
-        embed_handle = get_embed_handle_cached(timeout=10.0)
+        embed_handle = get_strict_handle(EMBED_DEPLOYMENT, timeout=10.0)
     except Exception:
         embed_handle = None
         log.warning("worker: embed handle unresolved")
@@ -474,6 +465,9 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
             manifest = read_manifest_local(raw_key) or {}
     except Exception:
         manifest = {}
+
+    if force_rehash:
+        manifest["indexed_chunks"] = 0
 
     file_hash = manifest.get("file_hash", "")
     if not file_hash or force_rehash:
@@ -549,17 +543,37 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
         return 0
 
     point_ids = [deterministic_point_id(c["chunk_id"]) for c in parsed_chunks]
+    chunk_ids = [c["chunk_id"] for c in parsed_chunks]
 
-    # check existing points
+    # Query Qdrant
     try:
-        exist_map = ray.get(qdrant_actor.check_points_exist.remote(point_ids))
+        exist_map_q = ray.get(qdrant_actor.check_points_exist.remote(point_ids))
     except Exception as e:
         log.warning("qdrant existence check failed: %s", e)
-        exist_map = {pid: False for pid in point_ids}
+        exist_map_q = {pid: False for pid in point_ids}
 
-    to_embed_idxs = [i for i, pid in enumerate(point_ids) if not exist_map.get(pid, False)]
+    # Query Neo4j
+    try:
+        neo_info = ray.get(neo4j_actor.get_chunks_info.remote(chunk_ids))
+    except Exception as e:
+        log.warning("neo4j existence check failed: %s", e)
+        neo_info = {cid: {"exists": False, "qdrant_id": None} for cid in chunk_ids}
 
-    # if nothing to embed write neo4j and finish
+    # Decide embedding candidates
+    to_embed_idxs: List[int] = []
+    for i, c in enumerate(parsed_chunks):
+        pid = point_ids[i]
+        q_present = bool(exist_map_q.get(pid, False))
+        ninfo = neo_info.get(c["chunk_id"], {"exists": False, "qdrant_id": None})
+        if q_present:
+            continue
+        if not ninfo["exists"]:
+            to_embed_idxs.append(i)
+            continue
+        if not ninfo.get("qdrant_id"):
+            to_embed_idxs.append(i)
+
+    # If nothing to embed, ensure neo4j contains chunks and update manifest then exit.
     if not to_embed_idxs:
         neo_payload = []
         for c, pid in zip(parsed_chunks, point_ids):
@@ -580,6 +594,22 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
                 log.warning("neo4j write returned error: %s", r)
         except Exception:
             log.exception("neo4j write failed for %s", raw_key)
+
+        # compute indexed_chunks count only (do not store indexed_chunk_ids or last_indexed_at)
+        indexed_count = 0
+        for i, c in enumerate(parsed_chunks):
+            pid = point_ids[i]
+            if exist_map_q.get(pid, False) or neo_info.get(c["chunk_id"], {}).get("exists", False):
+                indexed_count += 1
+        manifest["indexed_chunks"] = indexed_count
+
+        try:
+            if mode == "s3" and boto_client:
+                write_manifest_s3_atomic(s3_bucket, raw_key, manifest, client=boto_client)
+            else:
+                write_manifest_local_atomic(raw_key, manifest)
+        except Exception:
+            log.exception("failed writing manifest for %s", raw_key)
         return 0
 
     # embed missing
@@ -625,7 +655,7 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
         log.exception("embedding failed for %s: %s", raw_key, e)
         return 0
 
-    # upsert to qdrant using actor which returns serializable dict
+    # upsert new vectors to Qdrant
     indexed_new = 0
     try:
         for i in range(0, len(new_points), batch_size):
@@ -638,7 +668,7 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
     except Exception as e:
         log.exception("qdrant upsert invocation failed: %s", e)
 
-    # write neo4j (best-effort)
+    # write neo4j with the canonical qdrant ids (MERGE is idempotent)
     neo_payload = []
     for c, pid in zip(parsed_chunks, point_ids):
         neo_payload.append({
@@ -659,38 +689,40 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
     except Exception:
         log.exception("neo4j write failed for %s", raw_key)
 
+    # update manifest: compute indexed_chunks count only (do not store indexed_chunk_ids or last_indexed_at)
+    existing_count = 0
+    embedded_chunk_ids = {parsed_chunks[i]["chunk_id"] for i in to_embed_idxs}
+    for i, c in enumerate(parsed_chunks):
+        pid = point_ids[i]
+        if exist_map_q.get(pid, False) or neo_info.get(c["chunk_id"], {}).get("exists", False) or (c["chunk_id"] in embedded_chunk_ids):
+            existing_count += 1
+
+    manifest["indexed_chunks"] = existing_count
+
+    try:
+        if mode == "s3" and boto_client:
+            write_manifest_s3_atomic(s3_bucket, raw_key, manifest, client=boto_client)
+        else:
+            write_manifest_local_atomic(raw_key, manifest)
+    except Exception:
+        log.exception("failed writing manifest for %s", raw_key)
+
     return indexed_new
 
-# --- main ---
+# main
 def main():
     _ensure_ray_connected()
     log.info("Connected to Ray (namespace=%s)", RAY_NAMESPACE)
 
-    # optional preconversions
-    workdir = os.getenv("WORKDIR", "/indexing_pipeline")
     try:
-        rc = run_preconversions(workdir)
-        if rc != 0:
-            log.warning("preconversions returned rc=%s", rc)
-    except Exception:
-        log.debug("preconversions failure ignored")
-
-    # try to resolve embed handle early (workers try too)
-    try:
-        _ = get_embed_handle_cached(timeout=10.0)
+        _ = get_strict_handle(EMBED_DEPLOYMENT, timeout=10.0)
     except Exception:
         log.warning("embed handle unresolved on driver; workers will resolve")
 
-    # create detached actors
-    try:
-        qdrant_actor = QdrantWriter.options(name="qdrant_writer", lifetime="detached").remote(QDRANT_URL, QDRANT_API_KEY, QDRANT_COLLECTION, VECTOR_DIM, QDRANT_ON_DISK_PAYLOAD)
-    except Exception:
-        qdrant_actor = ray.get_actor("qdrant_writer", namespace=RAY_NAMESPACE)
-
-    try:
-        neo4j_actor = Neo4jWriter.options(name="neo4j_writer", lifetime="detached").remote(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
-    except Exception:
-        neo4j_actor = ray.get_actor("neo4j_writer", namespace=RAY_NAMESPACE)
+    # create / ensure actors and that they expose required methods. If an existing detached actor lacks required methods
+    # we kill it and recreate so workers can call get_chunks_info.
+    qdrant_actor = ensure_actor(QdrantWriter, "qdrant_writer", ["check_points_exist", "upsert_points"], QDRANT_URL, QDRANT_API_KEY, QDRANT_COLLECTION, VECTOR_DIM, QDRANT_ON_DISK_PAYLOAD)
+    neo4j_actor = ensure_actor(Neo4jWriter, "neo4j_writer", ["bulk_write_chunks", "get_chunks_info"], NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
 
     # discover inputs
     inputs: List[Tuple[str, str]] = []
@@ -732,7 +764,6 @@ def main():
     }
 
     total_indexed = 0
-    # small parallel batches to keep control and avoid flooding qdrant/serve
     batch_inputs = int(os.getenv("BATCH_INPUTS", "8"))
     for i in range(0, len(inputs), batch_inputs):
         group = inputs[i:i + batch_inputs]

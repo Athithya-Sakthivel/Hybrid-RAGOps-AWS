@@ -1,198 +1,318 @@
+#!/usr/bin/env python3
+"""
+Final local runner that enforces a standard import path.
+
+Behavior changes:
+- Prepends repo root and workdir to sys.path so both:
+    import indexing_pipeline.parse_chunk
+  and
+    import parse_chunk
+  work reliably.
+- Keeps AWS sanitization, auto-venv, preconvert controls, skip-s3, and robust in-process execution.
+"""
 from __future__ import annotations
 import argparse
 import logging
 import os
-import signal
+import runpy
+import shutil
 import subprocess
 import sys
-import threading
+import venv
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-import ray
+from typing import Optional
 
-DEFAULT_WORKDIR = "/indexing_pipeline"
-ROUTER = "parse_chunk/router.py"
-INDEX = "ingest.py"
-PRECONVERT = "pre_conversions/convert_all.sh"
+# Defaults
+DEFAULT_WORKDIR = os.environ.get("WORKDIR") or str(Path(__file__).resolve().parent)
+DEFAULT_ROUTER = os.environ.get("ROUTER", "parse_chunk/router.py")
+DEFAULT_INDEX = os.environ.get("INDEX", "ingest.py")
+DEFAULT_PRECONVERT = os.environ.get("PRECONVERT", "pre_conversions/convert_all.sh")
 
-# logging setup
-class ColoredFormatter(logging.Formatter):
-    RESET = "\x1b[0m"
-    COLORS = {
-        "DEBUG": "\x1b[38;20m",
-        "INFO": "\x1b[32;20m",
-        "WARNING": "\x1b[33;20m",
-        "ERROR": "\x1b[31;20m",
-        "CRITICAL": "\x1b[41;30;20m"
-    }
-    def __init__(self, fmt=None, datefmt=None, use_colors: Optional[bool] = None):
-        super().__init__(fmt=fmt, datefmt=datefmt)
-        if use_colors is None:
-            use_colors = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
-        self.use_colors = use_colors
+RESET = "\x1b[0m"
+COLORS = {
+    "DEBUG": "\x1b[38;20m",
+    "INFO": "\x1b[32;20m",
+    "WARNING": "\x1b[33;20m",
+    "ERROR": "\x1b[31;20m",
+    "CRITICAL": "\x1b[41;30;20m",
+}
+
+
+class ColorFormatter(logging.Formatter):
     def format(self, record):
         levelname = record.levelname
-        if self.use_colors and levelname in self.COLORS:
-            color = self.COLORS[levelname]
-            record.levelname = f"{color}{levelname}{self.RESET}"
+        color = COLORS.get(levelname, "")
+        record.levelname = f"{color}{levelname}{RESET}"
         return super().format(record)
 
-handler = logging.StreamHandler(sys.stdout)
-base_fmt = "%(asctime)s.%(msecs)03d %(levelname)s %(message)s"
-formatter = ColoredFormatter(fmt=base_fmt)
-handler.setFormatter(formatter)
-root = logging.getLogger()
-for h in list(root.handlers):
-    root.removeHandler(h)
-root.addHandler(handler)
-root.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
-logger = logging.getLogger("indexing_pipeline")
 
-def log_and_exit(msg: str, code: int = 1, extra: Optional[Dict] = None):
-    logger.error(msg)
-    if extra:
-        for k, v in extra.items():
-            logger.error("%s: %s", k, v)
-    for h in logger.handlers:
-        try:
-            h.flush()
-        except Exception:
-            pass
-    # ensure Ray shuts down cleanly before exit
-    try:
-        ray.shutdown()
-    except Exception:
-        pass
-    sys.exit(code)
+def setup_logging(level: int = logging.INFO) -> None:
+    root = logging.getLogger()
+    root.setLevel(level)
+    handler = logging.StreamHandler(sys.stdout)
+    fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    handler.setFormatter(ColorFormatter(fmt=fmt, datefmt="%Y-%m-%d %H:%M:%S"))
+    if root.handlers:
+        root.handlers.clear()
+    root.addHandler(handler)
 
-def _stream_process(proc: subprocess.Popen, name: str):
-    out_lines: List[str] = []
-    err_lines: List[str] = []
-    def _read(stream, collect, log_fn):
-        try:
-            for line in iter(stream.readline, ""):
-                if not line:
-                    break
-                collect.append(line)
-                log_fn(line.rstrip())
-        except Exception:
-            pass
-    t_out = threading.Thread(target=_read, args=(proc.stdout, out_lines, lambda l: logger.info("[%s] %s", name, l)), daemon=True)
-    t_err = threading.Thread(target=_read, args=(proc.stderr, err_lines, lambda l: logger.error("[%s:ERR] %s", name, l)), daemon=True)
-    t_out.start()
-    t_err.start()
-    proc.wait()
-    t_out.join(timeout=1.0)
-    t_err.join(timeout=1.0)
-    return proc.returncode, "".join(out_lines), "".join(err_lines)
 
-@ray.remote
-def run_cmd_remote(cmd: List[str], cwd: str) -> Dict:
+def resolve_workdir(preferred: str) -> Path:
+    p = Path(preferred)
+    if p.exists():
+        return p.resolve()
+    here = Path(__file__).resolve().parent
+    if here.exists():
+        return here
+    return Path.cwd()
+
+
+def ensure_import_paths(workdir: Path) -> None:
     """
-    Runs a command and streams stdout/stderr to logger.
-    Returns dict with rc, stdout, stderr.
+    Ensure repo-root and workdir are in sys.path and PYTHONPATH.
+    repo_root := parent of workdir if parent contains other project files.
     """
-    import subprocess, threading, logging
-    log = logging.getLogger("indexing_pipeline.ray")
-    try:
-        proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
-    except Exception as e:
-        return {"rc": 1, "stdout": "", "stderr": f"Failed to start {cmd}: {e}"}
-    out_lines = []
-    err_lines = []
-    def reader(stream, collect, level):
-        try:
-            for line in iter(stream.readline, ""):
-                if not line:
-                    break
-                collect.append(line)
-                if level == "info":
-                    log.info("[remote] %s", line.rstrip())
-                else:
-                    log.error("[remote] %s", line.rstrip())
-        except Exception:
-            pass
-    t_out = threading.Thread(target=reader, args=(proc.stdout, out_lines, "info"), daemon=True)
-    t_err = threading.Thread(target=reader, args=(proc.stderr, err_lines, "error"), daemon=True)
-    t_out.start()
-    t_err.start()
-    rc = proc.wait()
-    t_out.join(timeout=1.0)
-    t_err.join(timeout=1.0)
-    return {"rc": rc, "stdout": "".join(out_lines), "stderr": "".join(err_lines)}
+    # determine repo root candidate: if workdir is a subfolder named 'indexing_pipeline'
+    # then repo_root is parent; otherwise repo_root==workdir.parent
+    repo_root = workdir.parent if workdir.name == "indexing_pipeline" else workdir.parent
+    # canonical strings
+    rp = str(repo_root.resolve())
+    wd = str(workdir.resolve())
+    # build ordered unique list
+    new_paths = []
+    for p in (wd, rp):
+        if p not in sys.path:
+            new_paths.append(p)
+    # insert at front preserving earlier path0
+    for p in reversed(new_paths):
+        sys.path.insert(0, p)
+    # sync PYTHONPATH (prepend)
+    existing = os.environ.get("PYTHONPATH", "")
+    parts = [wd, rp] + ([existing] if existing else [])
+    # keep unique while preserving order
+    seen = set()
+    final = []
+    for x in parts:
+        if not x:
+            continue
+        if x not in seen:
+            final.append(x)
+            seen.add(x)
+    os.environ["PYTHONPATH"] = os.pathsep.join(final)
+    # optional debug output
+    logging.getLogger("indexing_pipeline").debug("sys.path[0:5]=%s", sys.path[:5])
+    logging.getLogger("indexing_pipeline").debug("PYTHONPATH=%s", os.environ["PYTHONPATH"])
 
-def run_task(cmd: List[str], cwd: str, task_name: str) -> int:
-    logger.info("Launching task %s: %s (cwd=%s)", task_name, " ".join(cmd), cwd)
-    fut = run_cmd_remote.remote(cmd, cwd)
-    res = ray.get(fut)
-    rc = int(res.get("rc", 1))
-    if rc != 0:
-        logger.error("Task %s failed rc=%s", task_name, rc)
-        logger.debug("stdout:\n%s", res.get("stdout", ""))
-        logger.debug("stderr:\n%s", res.get("stderr", ""))
+
+def sanitize_aws_env(logger: logging.Logger) -> None:
+    for k in ("AWS_REGION", "AWS_DEFAULT_REGION"):
+        v = os.environ.get(k, None)
+        if v is not None and str(v).strip() == "":
+            logger.debug("Removing empty env %s", k)
+            os.environ.pop(k, None)
+    if os.environ.get("AWS_REGION") and not os.environ.get("AWS_DEFAULT_REGION"):
+        os.environ["AWS_DEFAULT_REGION"] = os.environ["AWS_REGION"]
+        logger.debug("Set AWS_DEFAULT_REGION from AWS_REGION: %s", os.environ["AWS_DEFAULT_REGION"])
+
+
+def create_and_install_venv(venv_path: Path, requirements: Optional[Path], logger: logging.Logger) -> int:
+    if venv_path.exists() and (venv_path / "bin" / "python").exists():
+        logger.info("Using existing venv: %s", venv_path)
     else:
-        logger.info("Task %s finished rc=%s", task_name, rc)
-    return rc
+        logger.info("Creating venv at %s", venv_path)
+        try:
+            venv.EnvBuilder(with_pip=True).create(str(venv_path))
+        except Exception as e:
+            logger.exception("Failed to create venv: %s", e)
+            return 1
+    pip = venv_path / "bin" / "pip"
+    if not pip.exists():
+        logger.error("pip not found in venv at %s", pip)
+        return 2
+    if requirements and requirements.exists():
+        subprocess.run([str(pip), "install", "--upgrade", "pip", "setuptools", "wheel"],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        res = subprocess.run([str(pip), "install", "-r", str(requirements)],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.returncode != 0:
+            logger.error("Failed to install requirements: %s", res.stderr.strip())
+            return res.returncode
+    return 0
 
-def run_pipeline(workdir: str):
-    workdir = str(Path(workdir).resolve())
-    # start Ray in local_mode for simple orchestration
-    logger.info("Starting Ray in local_mode for orchestration.")
-    ray.init(local_mode=True, ignore_reinit_error=True)
 
-    # pre-conversion
-    pre_path = Path(workdir) / PRECONVERT
-    if not pre_path.exists():
-        log_and_exit(f"Pre-conversion script missing: {pre_path}", 1)
-    # ensure script executable
+def run_preconvert(script_path: Path, continue_on_fail: bool) -> int:
+    logger = logging.getLogger("preconvert")
+    if not script_path.exists():
+        logger.info("No pre-conversion script at %s. Skipping.", script_path)
+        return 0
     try:
-        pre_path.chmod(pre_path.stat().st_mode | 0o111)
+        if not os.access(str(script_path), os.X_OK):
+            script_path.chmod(script_path.stat().st_mode | 0o111)
     except Exception:
-        pass
-    rc = run_task([str(pre_path)], workdir, "preconvert")
-    if rc != 0:
-        log_and_exit("Pre-conversion failed", rc)
+        logger.debug("Could not chmod %s; will try shell runner.", script_path)
+    if os.access(str(script_path), os.X_OK):
+        cmd = [str(script_path)]
+    elif script_path.suffix == ".sh" and shutil.which("bash"):
+        cmd = ["bash", str(script_path)]
+    else:
+        cmd = [str(script_path)]
+    logger.info("Running pre-conversion: %s (cmd: %s)", script_path, cmd)
+    try:
+        res = subprocess.run(cmd, cwd=str(script_path.parent), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.stdout:
+            logger.debug("preconvert stdout:\n%s", res.stdout.strip())
+        if res.stderr:
+            logger.debug("preconvert stderr:\n%s", res.stderr.strip())
+        if res.returncode != 0:
+            logger.error("pre-conversion exited with %d", res.returncode)
+            if continue_on_fail:
+                logger.warning("Continuing despite pre-convert failure due to flag.")
+                return res.returncode
+            return res.returncode
+        logger.info("Pre-conversion completed successfully.")
+        return 0
+    except Exception as e:
+        logger.exception("Failed to run pre-conversion: %s", e)
+        if continue_on_fail:
+            logger.warning("Continuing despite exception in pre-convert due to flag.")
+            return 2
+        return 2
 
-    # router
-    router_path = Path(workdir) / ROUTER
-    if not router_path.exists():
-        log_and_exit(f"Router missing: {router_path}", 1)
-    rc = run_task([sys.executable, str(router_path)], workdir, "router")
-    if rc != 0:
-        log_and_exit("Router failed", rc)
 
-    # index
-    index_path = Path(workdir) / INDEX
-    if not index_path.exists():
-        log_and_exit(f"Index missing: {index_path}", 1)
-    rc = run_task([sys.executable, str(index_path)], workdir, "index")
-    if rc != 0:
-        log_and_exit("Index failed", rc)
+def run_python_script(script_path: Path, workdir: Path) -> int:
+    logger = logging.getLogger(script_path.stem if script_path.exists() else "script")
+    if not script_path.exists():
+        logger.error("Python script not found: %s", script_path)
+        return 3
+    logger.info("Executing %s in-process.", script_path)
+    prev_cwd = Path.cwd()
+    prev_path0: Optional[str] = sys.path[0] if sys.path else None
+    try:
+        os.chdir(str(workdir))
+        # ensure workdir and repo root are in sys.path while running
+        ensure_import_paths(workdir)
+        workdir_str = str(workdir)
+        if sys.path:
+            if sys.path[0] != workdir_str:
+                if workdir_str in sys.path:
+                    sys.path.remove(workdir_str)
+                sys.path.insert(0, workdir_str)
+        else:
+            sys.path.insert(0, workdir_str)
+        runpy.run_path(str(script_path), run_name="__main__")
+        logger.info("%s finished.", script_path)
+        return 0
+    except SystemExit as e:
+        code = 0
+        if isinstance(e.code, int):
+            code = e.code
+        elif e.code is None:
+            code = 0
+        else:
+            try:
+                code = int(e.code)
+            except Exception:
+                code = 1
+        if code != 0:
+            logger.error("%s exited with SystemExit(%s)", script_path, e.code)
+        return code
+    except Exception:
+        logger.exception("Unhandled exception while running %s", script_path)
+        return 4
+    finally:
+        try:
+            os.chdir(prev_cwd)
+        except Exception:
+            pass
+        if prev_path0 is not None and sys.path:
+            sys.path[0] = prev_path0
 
-    logger.info("Pipeline completed successfully.")
-    ray.shutdown()
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Local runner for indexing_pipeline.")
+    p.add_argument("--workdir", help="Working directory for pipeline.")
+    p.add_argument("--router", help="Router script path relative to workdir.")
+    p.add_argument("--index", help="Index/ingest script path relative to workdir.")
+    p.add_argument("--preconvert", help="Pre-conversion script path relative to workdir.")
+    p.add_argument("--skip-preconvert", action="store_true", help="Skip pre-conversion step.")
+    p.add_argument("--force-preconvert", action="store_true", help="Run preconvert even if required envs missing.")
+    p.add_argument("--continue-on-preconvert-fail", action="store_true", help="Proceed if pre-conversion exits non-zero.")
+    p.add_argument("--auto-venv", action="store_true", help="Create venv and install requirements.txt into it before running.")
+    p.add_argument("--venv-path", default=None, help="Path for auto venv (default: <workdir>/.venv).")
+    p.add_argument("--skip-s3", action="store_true", help="Skip steps requiring S3 (router/index).")
+    p.add_argument("--log-level", default="INFO", help="Log level (DEBUG, INFO, WARNING, ERROR).")
+    return p.parse_args()
+
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--workdir", default=os.getenv("WORKDIR", DEFAULT_WORKDIR))
-    args = parser.parse_args()
-    try:
-        run_pipeline(args.workdir)
-    except SystemExit as e:
-        logger.error("Exiting with SystemExit: %s", getattr(e, "code", None))
-        raise
-    except Exception:
-        logger.exception("Unhandled exception in main")
-        raise
+    args = parse_args()
+    workdir = resolve_workdir(args.workdir or os.environ.get("WORKDIR") or DEFAULT_WORKDIR)
+    router = Path(args.router or os.environ.get("ROUTER") or DEFAULT_ROUTER)
+    index = Path(args.index or os.environ.get("INDEX") or DEFAULT_INDEX)
+    preconvert = Path(args.preconvert or os.environ.get("PRECONVERT") or DEFAULT_PRECONVERT)
+
+    log_level = getattr(logging, (args.log_level or os.environ.get("LOG_LEVEL", "INFO")).upper(), logging.INFO)
+    setup_logging(log_level)
+    logger = logging.getLogger("indexing_pipeline")
+
+    # sanitize AWS envs before boto3 usage
+    sanitize_aws_env(logger)
+
+    # ensure import paths (repo root + workdir) so both package and plain imports work
+    ensure_import_paths(Path(workdir))
+
+    logger.info("Using workdir: %s", workdir)
+    router_path = (workdir / router).resolve()
+    index_path = (workdir / index).resolve()
+    preconvert_path = (workdir / preconvert).resolve()
+
+    # optional auto venv
+    if args.auto_venv:
+        venv_target = Path(args.venv_path) if args.venv_path else (Path(workdir) / ".venv")
+        requirements = (Path(workdir) / "requirements.txt")
+        rc = create_and_install_venv(venv_target, requirements if requirements.exists() else None, logger)
+        if rc != 0:
+            logger.error("Auto venv setup failed with code %d. Aborting.", rc)
+            sys.exit(rc)
+        bin_dir = str(venv_target / "bin")
+        os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+        logger.info("Prepended venv bin to PATH: %s", bin_dir)
+
+    # pre-conversion
+    if args.skip_preconvert:
+        logger.info("Skipping pre-conversion as requested.")
+    else:
+        rc = run_preconvert(preconvert_path, continue_on_fail=args.continue_on_preconvert_fail)
+        if rc != 0 and not args.continue_on_preconvert_fail:
+            logger.error("Pre-conversion failed with code %d. Aborting.", rc)
+            sys.exit(rc)
+
+    # S3 checks
+    if args.skip_s3:
+        logger.info("--skip-s3 set. Skipping S3-dependent steps (router & index).")
+        logger.info("Done.")
+        sys.exit(0)
+
+    s3_bucket = os.environ.get("S3_BUCKET") or os.environ.get("BACKUP_S3_BUCKET")
+    if not s3_bucket or str(s3_bucket).strip() == "":
+        logger.error("S3_BUCKET not set. Set S3_BUCKET environment variable or run with --skip-s3.")
+        sys.exit(1)
+
+    # run router
+    rc = run_python_script(router_path, workdir)
+    if rc != 0:
+        logger.error("Router failed with code %d. Aborting.", rc)
+        sys.exit(rc)
+
+    # run index/ingest
+    rc = run_python_script(index_path, workdir)
+    if rc != 0:
+        logger.error("Index (ingest) failed with code %d. Aborting.", rc)
+        sys.exit(rc)
+
+    logger.info("Pipeline completed successfully.")
+    sys.exit(0)
+
 
 if __name__ == "__main__":
-    def _handler(sig, frame):
-        logger.info("Signal %s received, shutting down.", sig)
-        try:
-            ray.shutdown()
-        except Exception:
-            pass
-        sys.exit(1)
-    signal.signal(signal.SIGINT, _handler)
-    signal.signal(signal.SIGTERM, _handler)
     main()

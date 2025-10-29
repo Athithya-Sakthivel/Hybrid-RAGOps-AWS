@@ -1,124 +1,176 @@
-# Retrieval plan (ideal, concrete & deterministic)
+# Get started
 
-## Environment toggles (add these to your runtime)
+## Prerequesities
+ 1. Docker enabled on boot and is running
+ 2. Vscode with `Dev Containers` extension installed
+ 3. AWS root account or IAM user with admin access for S3, EC2 and IAM role management
+ 
+# STEP 0/3 environment setup
 
-* `ENABLE_METADATA_CHUNKS` (`true` / `false`) — default: `false`
-  When `true` run a payload keyword search (Qdrant MatchText) and include that ranked list in first-stage RRF. Controlled size: `MAX_METADATA_CHUNKS`.
-* `MAX_METADATA_CHUNKS` (integer) — default: `50`
-  Max results to return from payload/metadata keyword search.
-* `ENABLE_CROSS_ENCODER` (`true` / `false`) — default: `true`
-  If `true` run cross-encoder (Serve) on top candidates and use its scores to re-rank before selecting LLM context. If `false` skip cross-encoder and pass deduped ordered chunks to LLM.
+#### Clone the repo and build the devcontainer
+```sh 
+git clone https://github.com/Athithya-Sakthivel/RAG8s.git && cd RAG8s && code .
+ctrl + shift + P -> paste `Dev containers: Rebuild Container` and enter
+```
 
-(You may also keep the other envs we discussed: `TOP_VECTOR_CHUNKS`, `TOP_BM25_CHUNKS`, `FIRST_STAGE_RRF_K`, `MAX_CHUNKS_FOR_GRAPH_EXPANSION`, `GRAPH_EXPANSION_HOPS`, `SECOND_STAGE_RRF_K`, `MAX_CHUNKS_TO_CROSSENCODER`, `MAX_CHUNKS_TO_LLM`, `INFERENCE_EMBEDDER_MAX_TOKENS`, `CROSS_ENCODER_MAX_TOKENS` etc.)
+#### This will take 20-30 minutes. If the image matches your system, you are ready to proceed.
+![alt text](.devcontainer/env_setup_success.png)
+
+#### Open a new terminal and login to your gh account
+```sh
+git config --global user.name "Your Name" && git config --global user.email you@example.com
+gh auth login
+
+? What account do you want to log into? GitHub.com
+? What is your preferred protocol for Git operations? SSH
+? Generate a new SSH key to add to your GitHub account? No
+? How would you like to authenticate GitHub CLI? Login with a web browser
+
+! First copy your one-time code: <code>
+- Press Enter to open github.com in your browser... 
+✓ Authentication complete. Press Enter to continue...
+
+```
+#### Create a private repo in your gh account
+```sh
+export REPO_NAME="rag-45"
+
+git remote remove origin 2>/dev/null || true
+gh repo create "$REPO_NAME" --private >/dev/null 2>&1
+REMOTE_URL="https://github.com/$(gh api user | jq -r .login)/$REPO_NAME.git"
+git remote add origin "$REMOTE_URL" 2>/dev/null || true
+git branch -M main 2>/dev/null || true
+git push -u origin main
+git pull
+git remote -v
+echo "[INFO] A private repo '$REPO_NAME' created and pushed. Only visible from your account."
+```
+
+
+# indexing pipeline configs
+```sh
+export AWS_REGION="ap-south-1"                        # AWS region to deploy infrastructure (e.g., ap-south-1 for Mumbai)
+export S3_BUCKET=e2e-rag-system-42                    # Set any globally unique complex name, Pulumi S3 backend -> s3://$S3_BUCKET/pulumi/
+export S3_RAW_PREFIX=data/raw/                        # raw ingest prefix (change to isolate datasets)
+export S3_CHUNKED_PREFIX=data/chunked/                # chunked output prefix (change to separate processed data)
+export OVERWRITE_DOC_DOCX_TO_PDF=true                 # true to delete and replace docx with PDF, false to keep the originals
+export OVERWRITE_ALL_AUDIO_FILES=true     # true to delete and replace .mp3, .m4a, .aac, etc as .mav 16khz, false to keep the originals
+export OVERWRITE_SPREADSHEETS_WITH_CSV=true  # true to delete and replace .xls, .xlsx, .ods, etc as .csv files, false to keep the originals
+export OVERWRITE_PPT_WITH_PPTS=true                   # true to delete and replace .ppt files as .pptx, false to keep the originals
+
+export CHUNK_FORMAT=json                              # 'json' (readable) or 'jsonl' (stream/space efficient)
+export MAX_TOKENS_PER_CHUNK=512        # Cummulatively append text sentences of .pdf, .html, .mp3, .png ,etc as a chunk till max token limit  
+export MIN_TOKENS_PER_CHUNK=100        # If a chunk less than min token limit, it will be appended to previous chunk even if max tokens slightly exceeds
+export NUMBER_OF_OVERLAPPING_SENTENCES=2 # Overlap text btw chunks for better embedding similarity, increase for retrival,decrease for cost
+export PDF_DISABLE_OCR=false                          # true to skip OCR (very fast) or false to extract text from images(but not embedded due to noise)
+export PDF_OCR_ENGINE=rapidocr                        # 'tesseract' (faster/multilingual) or 'rapidocr' (high accuracy, slightly slower)
+export PDF_TESSERACT_LANG=eng                         # only considered if PDF_OCR_ENGINE=tesseract
+export PDF_FORCE_OCR=false                            # true to always OCR(use if only scanned pdfs but not recommended for scaling)
+export PDF_OCR_RENDER_DPI=400                         # increase for detecting tiny/complex text; lower for speed/cost
+export PDF_MIN_IMG_SIZE_BYTES=3072                    # ignore images smaller than 3KB (often unneccessary black images)
+export IMAGE_OCR_ENGINE=rapidocr                  # OR 'tesseract' (faster/multilingual), 'rapidocr' (high english accuracy, slightly slower)
+export IMAGE_TESSERACT_LANG="eng"                # if PDF_OCR_ENGINE=tesseract. Only 1 language to avoid noise
+export TESSERACT_CONFIG="--oem 1 --psm 6"        # OR '--oem 1 --psm 3' if full image ocr instead of cropped boxes ocr
+export IMAGE_MIN_IMG_SIZE_BYTES=3072             # ignore images smaller than 3KB (often unneccessary black images)
+export IMAGE_RENDER_DPI=600                      # increase for detecting tiny/complex text with rapidocr; lower for speed/cost
+export IMAGE_UPSCALE_FACTOR=2.0         # controls how much the image is enlarged for small/complex text detection , lower for speed/cost
+export CSV_TARGET_TOKENS_PER_CHUNK=600      # (Including header)Increase if very large .csv or Decrease if higher precision required
+export JSONL_TARGET_TOKENS_PER_CHUNK=600    # (Including header)Increase if very large .jsonl or Decrease if higher precision required
+export PPTX_SLIDES_PER_CHUNK=4                        # Number of slides per chunk. Increase or decrease based on text 
+export PPTX_OCR_ENGINE=rapidocr                       # 'tesseract' (faster), 'rapidocr' (high accuracy , slightly slower)
+export PYTHONUNBUFFERED=1                             # To force Python to display logs/output immediately instead of buffering
+
+
+export LOG_LEVEL="INFO"                              # python logging level, use DEBUG for troubleshooting, INFO for normal runs, WARNING/ERROR to reduce log volume in production
+export RAY_ADDRESS="auto"                             # Ray address or 'auto', set to a specific redis address when connecting to a remote Ray cluster
+export RAY_NAMESPACE="ragops"                         # Ray namespace used for actors, change to isolate multiple environments or teams on the same Ray cluster
+export SERVE_APP_NAME="default"                       # Ray Serve application name, change if your Serve deployments run under a different app
+export DATA_IN_LOCAL="false"                          # true to read raw inputs from LOCAL_DIR_PATH instead of S3, set true for local dev or CI
+export LOCAL_DIR_PATH="./data"                        # local data base path, point to your repo/local mount when DATA_IN_LOCAL=true
+export EMBED_DEPLOYMENT="embed_onxx"                  # name of the Ray Serve embed deployment, update if your embedder deployment uses another name
+export INDEXING_EMBEDDER_MAX_TOKENS=512               # max tokens sent to embedder per chunk, lower to reduce embed cost or raise for longer chunks/semantic fidelity
+export QDRANT_URL="http://127.0.0.1:6333"             # Qdrant endpoint, use grpc://host:port or http(s) URL depending on your Qdrant setup
+export QDRANT_API_KEY=""                              # Qdrant API key if your server requires authentication, leave empty for local unsecured Qdrant
+export COLLECTION="my_collection"                     # Qdrant collection name, change per dataset to isolate vectors
+export QDRANT_ON_DISK_PAYLOAD="true"                  # store payload on disk in Qdrant, set false to keep payload in-memory if you need faster writes and have RAM
+export NEO4J_URI="bolt://localhost:7687"              # Neo4j connection URI, change to bolt://host:port or neo4j+s://host for cloud instances
+export NEO4J_USER="neo4j"                             # Neo4j username, update for different DB users or service accounts
+export NEO4J_PASSWORD=""                              # Neo4j password, populate in CI/production (use secrets manager instead of plain env in production)
+export BATCH_SIZE=64                                  # qdrant upsert batch size, lower if Qdrant rejects large batches or raise for throughput if resources allow
+export EMBED_BATCH=32                                 # embedder batch size, tune to fit embedder memory/latency constraints
+export EMBED_TIMEOUT=60                               # embedder call timeout in seconds, increase for slower models or reduce to fail fast on issues
+export FORCE_REHASH="0"                               # set to "1"/"true" to force recompute file hash and re-evaluate chunk files, use for debugging or repopulating manifests
+export VECTOR_DIM=768                                 # vector dimension expected by Qdrant, must match your embedder output dimension
+export AWS_DEFAULT_REGION=""                          # fallback AWS region if AWS_REGION unset, set to your default AWS region for boto3 clients
+export BATCH_INPUTS=8                                 # parallel raw inputs per batch, increase for higher concurrency but watch service load
+export NEO4J_WRITE_MAX_ATTEMPTS=3                     # retry attempts for Neo4j writes, raise for transient networks or lower to fail faster
+export NEO4J_WRITE_BASE_BACKOFF=0.8                   # base backoff seconds for Neo4j retries, increase to reduce retry pressure during outages
+
+
+
+```
+
+docker run --rm -it -p 8000:8000 \
+  -e AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \
+  -e AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \
+    -e NEO4J_URI=$NEO4J_URI \
+  -e NEO4J_USER=neo4j \
+  -e NEO4J_PASSWORD=$NEO4J_PASSWORD \
+    -e QDRANT_URL=$QDRANT_URL \
+  -e QDRANT_API_KEY=$QDRANT_API_KEY \
+    -e QDRANT_URL=$QDRANT_URL \
+  -e DEBIAN_FRONTEND=noninteractive \
+  indexing_pipeline:latest
+
+
+
+
+## 🔗 **References & specialties of the default models**
 
 ---
 
-## High-level summary (1 sentence)
+### 🔹 **\[1] Alibaba-NLP/gte-modernbert-base**
 
-Embed query → fetch candidate lists (vectors, BM25, optional metadata) → **first-stage RRF** fuse → dedupe → seed graph expansion → assemble candidate details → **second-stage RRF** fuse → optional cross-encoder re-rank → choose final top chunks for LLM.
+* Embedding-only onnx model for dense retrieval in RAG pipelines
+* Long-context support: up to **8192 tokens**
+* Based on **ModernBERT** (FlashAttention 2, RoPE, no position embeddings)
+* Embedding dimension: **768**
+* Parameter size: **149M**
+
+* Fast GPU inference with ONNX (FlashAttention 2)
+  🔗 [https://huggingface.co/Alibaba-NLP/gte-modernbert-base](https://huggingface.co/Alibaba-NLP/gte-modernbert-base)
+
+---
+
+### 🔹 **\[2] Alibaba-NLP/gte-reranker-modernbert-base**
+
+* **Cross-encoder reranker** for re-ranking retrieved docs from RRF ranked bm25, vector, graph retreival
+* High BEIR benchmark score (**nDCG\@10 ≈ 90.7%**)
+* Same architecture & size as embedding model (149M), supports **8192 tokens**
+* Fast GPU inference with ONNX (FlashAttention 2)
+  🔗 [https://huggingface.co/Alibaba-NLP/gte-reranker-modernbert-base](https://huggingface.co/Alibaba-NLP/gte-reranker-modernbert-base)
+
+> **Use case**: Ideal for **re-ranking top-k retrieved passages** after dense and sparse retrieval to improve precision in RAG answer selection.
 
 ---
 
-## Step-by-step concrete workflow
+### 🔹 **\[3] Qwen/Qwen3-4B-AWQ**
 
-### 0) Pre-reqs / constants (recommended defaults)
+A compact, high-throughput **instruction-tuned LLM** quantized using **AWQ**. Built on **Qwen3-4B**, this variant supports **32,768-token context** natively and achieves performance comparable to models 10× its size (e.g., Qwen2.5-72B). Optimized for **SGLang inference**, it balances **speed, memory efficiency, and accuracy**, running seamlessly on GPUs like A10G, L4, and L40S.
 
-* `TOP_VECTOR_CHUNKS = 200` (ANN fetch window)
-* `TOP_BM25_CHUNKS = 100`
-* `ENABLE_METADATA_CHUNKS = true|false`
-* `MAX_METADATA_CHUNKS = 50` (only used if `ENABLE_METADATA_CHUNKS=true`)
-* `FIRST_STAGE_RRF_K = 60`
-* `MAX_CHUNKS_FOR_GRAPH_EXPANSION = 20`
-* `GRAPH_EXPANSION_HOPS = 1`
-* `SECOND_STAGE_RRF_K = 60`
-* `ENABLE_CROSS_ENCODER = true|false` 
-* `MAX_CHUNKS_TO_CROSSENCODER = 64 (only used if `ENABLE_CROSS_ENCODER = true`)`
-* `MAX_CHUNKS_TO_LLM = 8`
+* Architecture: **Transformer** (Qwen3 series, multilingual)
+* Context Length: **32k tokens**
+* Quantization: **AWQ** 
+* VRAM Usage: **\~4.8–5.2 GiB for 5K tokens** (fits on 24 GiB GPUs with headroom)
+ 
+🔗 [Qwen/Qwen3-4B-AWQ](https://huggingface.co/Qwen/Qwen3-4B-AWQ)
 
+> “Even a tiny model like Qwen3-4B can rival the performance of Qwen2.5-72B-Instruct.”
+> — [Qwen3 Blog](https://qwenlm.github.io/blog/qwen3/)
+> — [Thinking-mode](https://qwenlm.github.io/blog/qwen3/#key-features)
 
-### 1) Embed query (single call)
+> **Use case**: Smaller models (e.g., Qwen3-4B-AWQ) **fit on a single VM** , making them better suited for data-parallel engines like **SGLang** than tensor-parallel engine like **vLLM**.
 
-* Call embedder with `INFERENCE_EMBEDDER_MAX_TOKENS` (e.g. 60).
-* Produce `q_vec` (normalized).
-
-### 2) Retrieve raw ranked lists (parallel)
-
-Run these **in parallel** to minimize latency:
-
-A. **Vector ANN fetch** (Qdrant) — get top `TOP_VECTOR_CHUNKS` candidate IDs & (preferably) their stored vectors.
-
-* Immediately **fetch vectors** for those candidates and compute exact cosine similarity locally with `q_vec` (this yields the *bi-encoder rescored vector ranking* — important step).
-
-B. **Neo4j fulltext (BM25-style)** — `CALL db.index.fulltext.queryNodes(...)` to return top `TOP_BM25_CHUNKS` candidate chunk IDs with Lucene scores.
-
-C. **Optional: payload keyword search (metadata)** — *only if* `ENABLE_METADATA_CHUNKS=true`: run Qdrant payload MatchText/MATCH on `text` (or other metadata) and return up to `MAX_METADATA_CHUNKS`. This is treated as a third ranked list (fall-back/metadata).
-
-Outputs: three ordered lists of chunk IDs with scores:
-
-* `vec_rank` (by exact cosine on fetched vectors)
-* `bm25_rank` (Neo4j Lucene scores)
-* `kw_rank` (optional metadata/payload search)
-
-> Note: **Do not** use raw ANN distance ordering for RRF — always do local rescoring (cosine) on the ANN window.
-
-### 3) First-stage fusion (RRF)
-
-* Input: `vec_rank`, `bm25_rank`, optional `kw_rank`.
-* Use Reciprocal Rank Fusion: for each ranked list, for an item at rank `r` add score `1/(k + r)` to that item, with `k = FIRST_STAGE_RRF_K`. Sum across lists.
-* Sort by fused score descending → `fused_list`.
-
-### 4) Deduplicate fused list (important)
-
-* Remove duplicate chunk IDs while keeping **first occurrence order** (stable). Call this `deduped_fused`.
-* Rationale: avoid expanding same chunk multiple times and keep highest-first-stage precedence.
-
-### 5) Choose seeds and Graph expansion
-
-* Seeds = `deduped_fused[:MAX_CHUNKS_FOR_GRAPH_EXPANSION]`.
-* Run graph expansion in Neo4j for `GRAPH_EXPANSION_HOPS` hops. **Expansion logic:** for each seed chunk, collect neighbor chunks according to relationships you care about (Document→Chunk neighbors, citations, same-author, etc.). Limit per-seed neighbors (e.g. `max_additional_per_start = RERANK_TOP`).
-* Add expanded neighbor chunk IDs to pool, preserving uniqueness. Call result `combined_unique_candidates`.
-
-### 6) Assemble detailed candidate records
-
-For each chunk in `combined_unique_candidates`:
-
-* Fetch payload (text, document_id, token_count) and vector from Qdrant (`with_vector=True`) — this provides text + vector + any metadata.
-* If BM25 produced a score for that chunk, include it in a `bm25_map`. If not present, treat bm25=0.
-* If metadata kw list produced score, include in `kw_map`.
-
-You now have for each candidate: `{chunk_id, text, vector, bm25_score, kw_score, doc_id, token_count}`.
-
-### 7) Compute fresh vector similarity ranking
-
-* Compute exact cosine similarity between `q_vec` and each candidate vector. Produce `vec_map` and `vec_rank2` (descending).
-
-### 8) Second-stage fusion (RRF) over assembled candidates
-
-* Build ranked lists over the candidate pool:
-
-  * `vec_rank2` (by computed cosine)
-  * `bm25_rank2` (by `bm25_map`)
-  * `kw_rank2` (if enabled, by `kw_map`)
-  * Optionally, `graph_rank` (score by number-of-seed-connections or inverse distance)
-* Fuse with RRF with `SECOND_STAGE_RRF_K`. Sort -> `final_fused_order`.
-* Deduplicate again (stable).
-
-### 9) Cross-encoder re-ranking (conditional)
-
-* If `ENABLE_CROSS_ENCODER=true`:
-
-  * Take top `MAX_CHUNKS_TO_CROSSENCODER` from `final_fused_order` (or fewer if list shorter).
-  * Call cross-encoder with `max_length = CROSS_ENCODER_MAX_TOKENS` (truncate/pad as needed). Provide pairs `(query, chunk_text)`.
-  * Receive dense relevance scores; combine with second-stage fused scores: e.g. `combined_score = w_cross * cross_score + (1 - w_cross) * base_score` (suggest `w_cross=0.8` by default). Sort by `combined_score`.
-* If `ENABLE_CROSS_ENCODER=false`:
-
-  * Skip cross-encoder and use `final_fused_order` directly.
-
-### 10) Final selection → LLM prompt assembly
-
-* Choose top `MAX_CHUNKS_TO_LLM` chunks after cross-encoder (or after final fused if cross off).
-* **Optional token budget enforcement**: iterate chunks in order, accumulate tokens (use `token_count` from payload or estimate via tokenizer) and stop when `SUM(tokens) + estimated_prompt_tokens >= MAX_PROMPT_TOKENS`. This prevents wasted compute & exceeds LLM limits.
-* Assemble prompt using selected chunks, include provenance (document_id, chunk_id, score).
-
+> Qwen3-0.6B model answers accurately even from 20 noisy chunks https://colab.research.google.com/drive/1aefiADR4pqXLkOL8WQXJMmiNJlJhzOnK?usp=sharing
 ---
-# Hybrid-RAGOps-AWS
+

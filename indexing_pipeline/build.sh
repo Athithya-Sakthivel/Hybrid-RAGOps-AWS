@@ -1,2 +1,61 @@
 cd indexing_pipeline
 docker build -t indexing_pipeline_cpu:v1 -f Dockerfile .
+
+docker run --rm -it -p 8000:8000 \
+  -e AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
+  -e AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+  -e AWS_REGION="ap-south-1" \
+  -e AWS_DEFAULT_REGION="" \
+  -e S3_BUCKET="e2e-rag-system-42" \
+  -e S3_RAW_PREFIX="data/raw/" \
+  -e S3_CHUNKED_PREFIX="data/chunked/" \
+  -e OVERWRITE_DOC_DOCX_TO_PDF="true" \
+  -e OVERWRITE_ALL_AUDIO_FILES="true" \
+  -e OVERWRITE_SPREADSHEETS_WITH_CSV="true" \
+  -e OVERWRITE_PPT_WITH_PPTS="true" \
+  -e CHUNK_FORMAT="json" \
+  -e MAX_TOKENS_PER_CHUNK="512" \
+  -e MIN_TOKENS_PER_CHUNK="100" \
+  -e NUMBER_OF_OVERLAPPING_SENTENCES="2" \
+  -e PDF_DISABLE_OCR="false" \
+  -e PDF_OCR_ENGINE="rapidocr" \
+  -e PDF_TESSERACT_LANG="eng" \
+  -e PDF_FORCE_OCR="false" \
+  -e PDF_OCR_RENDER_DPI="400" \
+  -e PDF_MIN_IMG_SIZE_BYTES="3072" \
+  -e IMAGE_OCR_ENGINE="rapidocr" \
+  -e IMAGE_TESSERACT_LANG="eng" \
+  -e TESSERACT_CONFIG='--oem 1 --psm 6' \
+  -e IMAGE_MIN_IMG_SIZE_BYTES="3072" \
+  -e IMAGE_RENDER_DPI="600" \
+  -e IMAGE_UPSCALE_FACTOR="2.0" \
+  -e CSV_TARGET_TOKENS_PER_CHUNK="600" \
+  -e JSONL_TARGET_TOKENS_PER_CHUNK="600" \
+  -e PPTX_SLIDES_PER_CHUNK="4" \
+  -e PPTX_OCR_ENGINE="rapidocr" \
+  -e PYTHONUNBUFFERED="1" \
+  -e LOG_LEVEL="INFO" \
+  -e RAY_ADDRESS="auto" \
+  -e RAY_NAMESPACE="ragops" \
+  -e SERVE_APP_NAME="default" \
+  -e DATA_IN_LOCAL="false" \
+  -e LOCAL_DIR_PATH="./data" \
+  -e EMBED_DEPLOYMENT="embed_onxx" \
+  -e INDEXING_EMBEDDER_MAX_TOKENS="512" \
+  -e QDRANT_URL="$QDRANT_URL" \
+  -e QDRANT_API_KEY="$QDRANT_API_KEY" \
+  -e COLLECTION="my_collection" \
+  -e QDRANT_ON_DISK_PAYLOAD="true" \
+  -e NEO4J_URI="bolt://localhost:7687" \
+  -e NEO4J_USER="neo4j" \
+  -e NEO4J_PASSWORD="$NEO4J_PASSWORD" \
+  -e BATCH_SIZE="64" \
+  -e EMBED_BATCH="32" \
+  -e EMBED_TIMEOUT="60" \
+  -e FORCE_REHASH="0" \
+  -e VECTOR_DIM="768" \
+  -e BATCH_INPUTS="8" \
+  -e NEO4J_WRITE_MAX_ATTEMPTS="3" \
+  -e NEO4J_WRITE_BASE_BACKOFF="0.8" \
+  -e DEBIAN_FRONTEND="noninteractive" \
+  indexing_pipeline_cpu:v1

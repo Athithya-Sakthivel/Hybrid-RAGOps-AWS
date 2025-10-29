@@ -15,6 +15,7 @@ aws s3 ls "s3://$S3_BUCKET/data/" --recursive | tail -n 100
 aws s3 ls "s3://$SNAPSHOT_S3_BUCKET/" --recursive | tail -n 100
 aws s3 ls "s3://weaviate-backups-515/" --recursive | tail -n 100
 aws s3 ls "s3://e2e-rag-system-42/data/" --recursive | tail -n 100
+
 """
 
 from __future__ import annotations
