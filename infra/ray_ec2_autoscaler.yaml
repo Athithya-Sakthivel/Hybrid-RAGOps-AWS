@@ -1,0 +1,49 @@
+# ray_ec2_autoscaler.yaml
+cluster_name: ray-cluster
+min_workers: 0
+max_workers: 10
+provider:
+  type: aws
+  region: us-east-1
+
+auth:
+  ssh_user: ubuntu
+  ssh_private_key: ~/.ssh/id_rsa
+
+head_node:
+  InstanceType: m5.large
+  ImageId: ami-HEAD-AMI-ID        # replace with your head AMI
+  KeyName: your-ec2-keypair
+
+available_node_types:
+  ray.head.default:
+    node_config:
+      InstanceType: m5.large
+      ImageId: ami-HEAD-AMI-ID
+    max_workers: 0
+    resources: {"CPU": 4}
+  ray.worker.cpu:
+    node_config:
+      InstanceType: m5.xlarge
+      ImageId: ami-CPU-AMI-ID      # AMI with python, pip, system libs
+    min_workers: 1
+    max_workers: 6
+    resources: {"CPU_NODE": 1, "CPU": 8}
+  ray.worker.gpu:
+    node_config:
+      InstanceType: p3.2xlarge
+      ImageId: ami-GPU-AMI-ID      # GPU AMI with CUDA + drivers installed
+    min_workers: 0
+    max_workers: 4
+    resources: {"GPU_NODE": 1, "CPU": 8, "GPU": 1}
+
+head_node_type: ray.head.default
+worker_default_node_type: ray.worker.cpu
+
+setup_commands:
+  - "sudo apt-get update -y"
+  - "sudo apt-get install -y python3 python3-pip git build-essential"
+  - "python3 -m pip install -U pip"
+  - "pip3 install ray==2.5.0"        # pin to your Ray version
+  - "if [ ! -d /opt/myrepo ]; then git clone https://github.com/you/your-repo.git /opt/myrepo; fi"
+  - "cd /opt/myrepo || true"

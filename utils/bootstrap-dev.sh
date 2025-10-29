@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 IFS=$'\n\t'
-set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 export TZ=Etc/UTC
@@ -76,7 +75,8 @@ for line in \
   "export HF_ASSETS_CACHE=\"${HF_ASSETS_CACHE}\"" \
   "export RAPIDOCR_MODEL_DIR=\"${RAPIDOCR_MODEL_DIR}\"" \
   'export DEBIAN_FRONTEND=noninteractive' \
-  'export PYTHONPATH=$(pwd)'
+  'export PYTHONPATH=$(pwd)' \
+  'source .venv/bin/activate'
 do
   grep -Fxq "$line" ~/.bashrc 2>/dev/null || printf '%s\n' "$line" >> ~/.bashrc
 done
@@ -99,8 +99,7 @@ pip3 install pulumi==${PULUMI_VERSION} pulumi-aws==7.7.0 || true
 sudo mkdir -p /opt/models/rapidocr && sudo chown -R "$(id -u):$(id -g)" /opt/models && cd /opt/models/rapidocr || true
 for url in \
   "https://huggingface.co/SWHL/RapidOCR/resolve/main/PP-OCRv4/ch_PP-OCRv4_det_infer.onnx" \
-  "https://huggingface.co/SWHL/RapidOCR/resolve/main/PP-OCRv4/ch_PP-OCRv4_rec_infer.onnx" \
-  "https://huggingface.co/SWHL/RapidOCR/resolve/main/PP-OCRv4/ch_ppocr_mobile_v2.0_cls_infer.onnx"
+  "https://huggingface.co/SWHL/RapidOCR/resolve/main/PP-OCRv4/ch_PP-OCRv4_rec_infer.onnx"
 do
   out=$(basename "$url")
   [ -f "$out" ] || (echo "Downloading $out" && curl -fSL --retry 5 -C - -o "$out" "$url")
@@ -148,7 +147,9 @@ sudo apt-get update -y && sudo apt-get install -y docker-buildx-plugin || (
 )
 sudo apt-get install -y uuid-runtime
 
+
 pip install -r indexing_pipeline/requirements.txt || true
+pip install -r infra/requirements.txt || true
 
 clear
 echo "Bootstrap completed. Open a new terminal or run: source ~/.bashrc"

@@ -1,7 +1,7 @@
 ray==2.50.0
 onnxruntime==1.23.2
 transformers==4.57.1
-numpy==2.3.4
+numpy==2.2.2
 qdrant-client==1.15.1
 neo4j==5.17.0
 neo4j-graphrag==1.10.0
