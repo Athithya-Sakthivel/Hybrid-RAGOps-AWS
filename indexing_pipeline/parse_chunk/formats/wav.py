@@ -48,7 +48,7 @@ FFMPEG = os.getenv("FFMPEG_PATH", "ffmpeg")
 FW_COMPUTE = os.getenv("FW_COMPUTE", "int8")
 FW_CPU_THREADS = int(os.getenv("FW_CPU_THREADS", str(max(1, (os.cpu_count() or 1) // 2))))
 
-WORKSPACE_MODELS: Path = Path(os.getenv("WORKSPACE_MODELS", "/indexing_pipeline/models")).resolve()
+WORKSPACE_MODELS: Path = Path(os.getenv("WORKSPACE_MODELS", "/models")).resolve()
 FW_MODEL_PATH: Path = WORKSPACE_MODELS / "faster_whisper" / "faster-whisper-base"
 FW_MODEL_BIN: Path = FW_MODEL_PATH / "model.bin"
 

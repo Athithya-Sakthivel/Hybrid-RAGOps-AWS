@@ -150,6 +150,8 @@ sudo apt-get install -y uuid-runtime
 
 pip install -r indexing_pipeline/requirements.txt || true
 pip install -r infra/requirements.txt || true
+sudo python3 utils/archive/download_faster_whisper.py /models
+sudo python3 utils/download_onnx.py /models
 
 clear
 echo "Bootstrap completed. Open a new terminal or run: source ~/.bashrc"
