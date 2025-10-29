@@ -11,3 +11,5 @@ qdrant
 *.db
 *.tar.gz
 run
+models
+*.onnx
