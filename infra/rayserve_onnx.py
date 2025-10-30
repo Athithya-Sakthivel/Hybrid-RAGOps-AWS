@@ -42,7 +42,7 @@ ORT_INTER_THREADS = int(os.getenv("ORT_INTER_THREADS", "1"))
 INDEXING_EMBEDDER_MAX_TOKENS = int(os.getenv("INDEXING_EMBEDDER_MAX_TOKENS", "512"))
 INFERENCE_EMBEDDER_MAX_TOKENS = int(os.getenv("INFERENCE_EMBEDDER_MAX_TOKENS", "64"))
 CROSS_ENCODER_MAX_TOKENS = int(os.getenv("CROSS_ENCODER_MAX_TOKENS", "600"))
-ENABLE_CROSS_ENCODER = (os.getenv("ENABLE_CROSS_ENCODER", "true").lower() in ("1", "true", "yes"))
+ENABLE_CROSS_ENCODER = (os.getenv("ENABLE_CROSS_ENCODER", "false").lower() in ("1", "true", "yes"))
 
 try:
     import onnxruntime as ort

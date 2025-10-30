@@ -14,7 +14,7 @@ except Exception as e:
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("download_hf")
 
-WORKSPACE_MODELS = Path(os.getenv("WORKSPACE_MODELS", "/workspace/indexing_pipeline/models"))
+WORKSPACE_MODELS = Path(os.getenv("WORKSPACE_MODELS", "/models"))
 FORCE = os.getenv("FORCE_DOWNLOAD", "0").lower() in ("1", "true", "yes")
 
 MODELS = [

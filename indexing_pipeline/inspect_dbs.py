@@ -2,7 +2,6 @@ from __future__ import annotations
 import os, sys, json, time, traceback
 from textwrap import indent
 
-# Config (env)
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", None)
 PREFER_GRPC = os.getenv("PREFER_GRPC", "false").lower() in ("1", "true", "yes")

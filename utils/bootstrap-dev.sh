@@ -76,7 +76,8 @@ for line in \
   "export RAPIDOCR_MODEL_DIR=\"${RAPIDOCR_MODEL_DIR}\"" \
   'export DEBIAN_FRONTEND=noninteractive' \
   'export PYTHONPATH=$(pwd)' \
-  'source .venv/bin/activate'
+  'source .venv/bin/activate' \
+  'export PIP_ROOT_USER_ACTION=ignore'
 do
   grep -Fxq "$line" ~/.bashrc 2>/dev/null || printf '%s\n' "$line" >> ~/.bashrc
 done

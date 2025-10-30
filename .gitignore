@@ -13,3 +13,6 @@ qdrant
 run
 models
 *.onnx
+*.pyc
+.venv_infra
+.index

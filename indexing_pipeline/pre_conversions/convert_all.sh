@@ -1,12 +1,4 @@
 #!/usr/bin/env bash
-#
-# idempotent convert_all.sh
-# - avoids re-downloading/re-uploading already-converted audio files
-# - records conversion metadata (converted-from, converted-etag, converted-sr, converted-ch)
-# - honors OVERWRITE_ALL_AUDIO_FILES but still skips when target already matches source
-# - safe for repeated runs
-#
-
 S3_BUCKET="${S3_BUCKET:?S3_BUCKET required}"
 S3_RAW_PREFIX="${S3_RAW_PREFIX:-data/raw/}"
 S3_RAW_PREFIX="${S3_RAW_PREFIX#/}"

@@ -121,4 +121,5 @@ You now have for each candidate: `{chunk_id, text, vector, bm25_score, kw_score,
 * Assemble prompt using selected chunks, include provenance (document_id, chunk_id, score).
 
 ---
-# Hybrid-RAGOps-AWS
+
+
