@@ -40,24 +40,6 @@ export RSV_ORT_INTER_THREADS="1"
 export RAY_SERVE_QUEUE_LENGTH_RESPONSE_DEADLINE_S=5.0
 
 
-docker run --rm --privileged --cap-add=sys_nice \
-  --ipc=host --shm-size=16g \
-  -p 8081:80 \
-  -v "/workspace/models/qwen/Qwen3-0.6B-AWQ":/model:ro \
-  -e OMP_NUM_THREADS=4 \
-  -e MKL_NUM_THREADS=4 \
-  -e ONEDNN_MAX_CPU_ISA=AVX2 \
-  ghcr.io/huggingface/text-generation-inference:latest-intel-cpu \
-  --model-id /model \
-  --hostname 0.0.0.0 \
-  --port 80 \
-  --validation-workers 1 \
-  --max-batch-size 1 \
-  --max-input-tokens 128 \
-  --max-total-tokens 256 \
-  --max-batch-total-tokens 1024
-
-
 
 
 ray stop --force || true && sudo rm -rf /tmp/ray/ && ray start --head && python3 infra/rayserve_models.py

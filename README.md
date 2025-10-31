@@ -46,6 +46,39 @@ git remote -v
 echo "[INFO] A private repo '$REPO_NAME' created and pushed. Only visible from your account."
 ```
 
+# infra
+
+```sh
+export AWS_ACCESS_KEY_ID="AKIA..."                    
+export AWS_SECRET_ACCESS_KEY="..."    
+
+
+export AWS_REGION="ap-south-1"                        # AWS region to deploy infrastructure (e.g., ap-south-1 for Mumbai)
+export S3_BUCKET=e2e-rag-system-42                    # Set any globally unique complex name, Pulumi S3 backend -> s3://$S3_BUCKET/pulumi/
+export PULUMI_CONFIG_PASSPHRASE="mypassword"          # Passphrase to encrypt Pulumi secrets (required for headless automation)
+
+
+export VPC_CIDR="10.0.0.0/16"                         # VPC network range (all subnets must fall inside)
+export PULUMI_PUBLIC_SUBNET_COUNT="2"                 # 2 or more if multi AZ required. Must match number of CIDRs
+export PUBLIC_SUBNET_CIDRS="10.0.1.0/24,10.0.2.0/24"  # CIDR blocks for public subnets in the VPC (must match VPC_CIDR and AZ count)
+export MY_SSH_CIDR="203.0.113.42/32"                  # Your IP allowed for SSH access (must be a /32 single IP)
+export WEAVIATE_INSTANCE_TYPE="c8gd.medium"           # c8gd is the most appropriate local NVMe based ec2 type. Increase size if large data
+export WEAVIATE_EBS_TYPE="gp3"                        # gp3 baseline 3000 iops is sufficient since storage is local NVMe based
+export WEAVIATE_EBS_SIZE="8"                          # Root EBS volume size in GiB (set larger if storing any data outside NVMe)
+
+export MULTI_AZ_WEAVIATE_DEPLOYMENT="false"          # true = deploy across multiple AZs (HA, more cost) / false = single AZ (cheaper, simpler)
+export WEAVIATE_PRIVATE_IP="10.0.1.10"               # Deterministic private IP for Weaviate if multi-az=false
+export WEAVIATE_PRIVATE_IPS="10.0.1.10,10.0.2.10"    # Private IP(s) for Weaviate (comma-separated, one per AZ if multi-AZ=true)
+
+export BACKUP_PREFIX="weaviate/backups/"              # S3 folder prefix where Weaviate backups will be stored
+export BACKUP_MANIFEST_KEY="latest_weaviate_backup.manifest.json" # S3 key name for the latest backup manifest file
+export DELETE_OR_ARCHIVE_OLD_BACKUPS="archive"        # archive=move to cold storage, delete=remove after retention, none=disable lifecycle
+export ARCHIVE_AFTER_DAYS="30"                        # Days after which backups transition to archive (only used if archive mode)
+export ARCHIVE_STORAGE_CLASS="GLACIER"                # S3 storage class for archived backups (GLACIER/DEEP_ARCHIVE/GLACIER_IR/STANDARD_IA)
+export RETENTION_DAYS="365"                           # Total days to keep backups before deletion (used in archive/delete modes)
+
+
+```
 
 # indexing pipeline configs
 ```sh
@@ -126,9 +159,7 @@ docker run --rm -it -p 8000:8000 \
 
 
 ## 🔗 **References & specialties of the default models**
-
 ---
-
 ### 🔹 **\[1] Alibaba-NLP/gte-modernbert-base**
 
 * Embedding-only onnx model for dense retrieval in RAG pipelines
@@ -141,36 +172,41 @@ docker run --rm -it -p 8000:8000 \
   🔗 [https://huggingface.co/Alibaba-NLP/gte-modernbert-base](https://huggingface.co/Alibaba-NLP/gte-modernbert-base)
 
 ---
+### 🔹 **\[2] cross-encoder/ms-marco-TinyBERT-L2-v2(Optional)**
 
-### 🔹 **\[2] Alibaba-NLP/gte-reranker-modernbert-base**
+* **Cross-encoder reranker** trained on the **MS MARCO Passage Ranking** task  
+* Extremely lightweight (**4.39M parameters**) and optimized for **high‑throughput reranking**  
+* Benchmark scores: **nDCG@10 = 69.84 (TREC DL 2019)**, **MRR@10 = 32.56 (MS MARCO Dev)**  
+* Very fast inference — up to **~9000 docs/sec on V100 GPU**  
+* Available in PyTorch, ONNX, and SentenceTransformers for easy integration  
+  🔗 [https://huggingface.co/cross-encoder/ms-marco-TinyBERT-L2-v2](https://huggingface.co/cross-encoder/ms-marco-TinyBERT-L2-v2)
 
-* **Cross-encoder reranker** for re-ranking retrieved docs from RRF ranked bm25, vector, graph retreival
-* High BEIR benchmark score (**nDCG\@10 ≈ 90.7%**)
-* Same architecture & size as embedding model (149M), supports **8192 tokens**
-* Fast GPU inference with ONNX (FlashAttention 2)
-  🔗 [https://huggingface.co/Alibaba-NLP/gte-reranker-modernbert-base](https://huggingface.co/Alibaba-NLP/gte-reranker-modernbert-base)
-
-> **Use case**: Ideal for **re-ranking top-k retrieved passages** after dense and sparse retrieval to improve precision in RAG answer selection.
+> **Use case**: Best suited for **low‑latency reranking of top‑k candidates** from BM25, vector, or graph retrieval. Ideal when **speed and scale** are more important than peak precision in RAG pipelines.
 
 ---
 
-### 🔹 **\[3] Qwen/Qwen3-4B-AWQ**
+### 🔹 **[3] Qwen/Qwen3-4B-AWQ**
 
-A compact, high-throughput **instruction-tuned LLM** quantized using **AWQ**. Built on **Qwen3-4B**, this variant supports **32,768-token context** natively and achieves performance comparable to models 10× its size (e.g., Qwen2.5-72B). Optimized for **SGLang inference**, it balances **speed, memory efficiency, and accuracy**, running seamlessly on GPUs like A10G, L4, and L40S.
+A compact, high-throughput **instruction-tuned LLM** quantized using **AWQ**. Built on **Qwen3-4B**, this variant supports **32,768-token context** natively and achieves performance comparable to models 10× its size (e.g., Qwen2.5-72B). Optimized for [TGI v3 inference](https://huggingface.co/docs/text-generation-inference/conceptual/chunking), it benefits from enhanced memory management techniques such as [PagedAttention](https://arxiv.org/abs/2309.06180), [prefix caching, and dynamic batching](https://deepwiki.com/huggingface/text-generation-inference/2.3-memory-management-and-optimization). These improvements deliver higher throughput and lower latency for long‑context workloads. The result is a balance of speed, memory efficiency, and accuracy, running seamlessly on GPUs like A10G, L4, and L40S.
 
-* Architecture: **Transformer** (Qwen3 series, multilingual)
-* Context Length: **32k tokens**
-* Quantization: **AWQ** 
-* VRAM Usage: **\~4.8–5.2 GiB for 5K tokens** (fits on 24 GiB GPUs with headroom)
- 
+* Architecture: **Transformer** (Qwen3 series, multilingual)  
+* Context Length: **32k tokens**  
+* Quantization: **AWQ**  
+* VRAM Usage: **~9.5–10.5 GiB for 10K tokens on g5.xlarge (A10G, 24 GiB)**, leaving ample headroom for batching or longer contexts  
+
 🔗 [Qwen/Qwen3-4B-AWQ](https://huggingface.co/Qwen/Qwen3-4B-AWQ)
 
-> “Even a tiny model like Qwen3-4B can rival the performance of Qwen2.5-72B-Instruct.”
-> — [Qwen3 Blog](https://qwenlm.github.io/blog/qwen3/)
-> — [Thinking-mode](https://qwenlm.github.io/blog/qwen3/#key-features)
+> “Even a tiny model like Qwen3-4B can rival the performance of Qwen2.5-72B-Instruct.” — [Qwen3 Blog](https://qwenlm.github.io/blog/qwen3/)  
 
-> **Use case**: Smaller models (e.g., Qwen3-4B-AWQ) **fit on a single VM** , making them better suited for data-parallel engines like **SGLang** than tensor-parallel engine like **vLLM**.
-
-> Qwen3-0.6B model answers accurately even from 20 noisy chunks https://colab.research.google.com/drive/1aefiADR4pqXLkOL8WQXJMmiNJlJhzOnK?usp=sharing
 ---
+
+> "Performance leap: TGI processes 3x more tokens, 13x faster than vLLM on long prompts. Zero config !"
+> — [TGI v3](https://huggingface.co/docs/text-generation-inference/conceptual/chunking) 
+---
+> **Use case**: Smaller models (e.g., Qwen3-4B-AWQ) **fit on a single VM**, making them well-suited for **TGI v3’s optimized batching and long-context inference**, while avoiding the complexity of tensor-parallel engines like vLLM.
+
+> Qwen3-0.6B model answers accurately even from 20 noisy chunks: [Colab Demo](https://colab.research.google.com/drive/1aefiADR4pqXLkOL8WQXJMmiNJlJhzOnK?usp=sharing)
+
+---
+
 
