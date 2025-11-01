@@ -140,6 +140,8 @@ export NEO4J_WRITE_MAX_ATTEMPTS=3                     # retry attempts for Neo4j
 export NEO4J_WRITE_BASE_BACKOFF=0.8                   # base backoff seconds for Neo4j retries, increase to reduce retry pressure during outages
 
 
+export AWS_REGION=ap-south-1
+export AWS_PROFILE=default
 
 ```
 

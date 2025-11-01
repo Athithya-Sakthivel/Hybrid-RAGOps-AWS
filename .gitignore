@@ -16,3 +16,5 @@ models
 *.pyc
 .venv_infra
 .index
+*.log
+log

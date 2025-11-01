@@ -1,95 +1,85 @@
-# infra/rayserve_three_independent.py
+#!/usr/bin/env python3
 from __future__ import annotations
-import os
-import json
-import logging
-from typing import Dict, Any, Optional, List
+import os, sys, json, logging, signal
+from typing import Dict, Any, Optional
 import numpy as np
 import ray
 from ray import serve
 from ray.serve import HTTPOptions
+from ray.serve.llm import LLMConfig
+from ray.serve.llm.deployment import LLMServer
+from ray.serve.llm.ingress import OpenAiIngress, make_fastapi_ingress
 from transformers import PreTrainedTokenizerFast
-
-# Logging
+try:
+    import onnxruntime as ort
+except Exception:
+    ort = None
 _log_level_name = os.getenv("LOG_LEVEL", "INFO") or "INFO"
 _log_level = getattr(logging, _log_level_name.upper(), logging.INFO)
-logging.basicConfig(level=_log_level)
-log = logging.getLogger("rayserve_three_independent")
-
-# Ray / Serve env
+logging.basicConfig(level=_log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+log = logging.getLogger("serve_prod_final")
 RAY_ADDRESS = os.getenv("RAY_ADDRESS") or None
 RAY_NAMESPACE = os.getenv("RAY_NAMESPACE") or None
-SERVE_HTTP_HOST = os.getenv("SERVE_HTTP_HOST", "127.0.0.1")
+SERVE_HTTP_HOST = os.getenv("SERVE_HTTP_HOST", "0.0.0.0")
 SERVE_HTTP_PORT = int(os.getenv("SERVE_HTTP_PORT", "8003"))
-
-# ONNX env
 EMBED_DEPLOYMENT = os.getenv("EMBED_DEPLOYMENT", "embed_onxx")
-RERANK_DEPLOYMENT = os.getenv("RERANK_DEPLOYMENT", "rerank_onxx")
-
+RERANK_HANDLE_NAME = os.getenv("RERANK_HANDLE_NAME", "rerank_onxx")
 ONNX_USE_CUDA = (os.getenv("ONNX_USE_CUDA", "false").lower() in ("1", "true", "yes"))
-MODEL_DIR_EMBED = os.getenv("MODEL_DIR_EMBED", "/workspace/models/gte-modernbert-base/onnx")
-MODEL_DIR_RERANK = os.getenv("MODEL_DIR_RERANK", "/workspace/models/ms-marco-TinyBERT-L2-v2/onnx/")
+MODEL_DIR_EMBED = os.getenv("MODEL_DIR_EMBED", "/models/gte-modernbert-base")
+MODEL_DIR_RERANK = os.getenv("MODEL_DIR_RERANK", "/models/gte-reranker-modernbert-base")
 ONNX_EMBED_PATH = os.getenv("ONNX_EMBED_PATH", os.path.join(MODEL_DIR_EMBED, "onnx", "model_int8.onnx"))
 ONNX_EMBED_TOKENIZER_PATH = os.getenv("ONNX_EMBED_TOKENIZER_PATH", os.path.join(MODEL_DIR_EMBED, "tokenizer.json"))
-ONNX_RERANK_PATH = os.getenv("ONNX_RERANK_PATH", os.path.join(MODEL_DIR_RERANK, "onnx", "model_quint8_avx2.onnx"))
+ONNX_RERANK_PATH = os.getenv("ONNX_RERANK_PATH", os.path.join(MODEL_DIR_RERANK, "onnx", "model_int8.onnx"))
 ONNX_RERANK_TOKENIZER_PATH = os.getenv("ONNX_RERANK_TOKENIZER_PATH", os.path.join(MODEL_DIR_RERANK, "tokenizer.json"))
-
 EMBED_REPLICAS = int(os.getenv("EMBED_REPLICAS", "1"))
 RERANK_REPLICAS = int(os.getenv("RERANK_REPLICAS", "1"))
-EMBED_GPU = int(os.getenv("EMBED_GPU_PER_REPLICA", "0")) if ONNX_USE_CUDA else 0
-RERANK_GPU = int(os.getenv("RERANK_GPU_PER_REPLICA", "0")) if ONNX_USE_CUDA else 0
-ENABLE_CROSS_ENCODER = (os.getenv("ENABLE_CROSS_ENCODER", "true").lower() in ("1", "true", "yes"))
+EMBED_GPU_PER_REPLICA = float(os.getenv("EMBED_GPU_PER_REPLICA", "0"))
+RERANK_GPU_PER_REPLICA = float(os.getenv("RERANK_GPU_PER_REPLICA", "0"))
+MAX_RERANK = int(os.getenv("MAX_RERANK", "256"))
 ORT_INTRA_THREADS = int(os.getenv("ORT_INTRA_THREADS", "1"))
 ORT_INTER_THREADS = int(os.getenv("ORT_INTER_THREADS", "1"))
 INDEXING_EMBEDDER_MAX_TOKENS = int(os.getenv("INDEXING_EMBEDDER_MAX_TOKENS", "512"))
 CROSS_ENCODER_MAX_TOKENS = int(os.getenv("CROSS_ENCODER_MAX_TOKENS", "600"))
-MAX_RERANK = int(os.getenv("MAX_RERANK", "256"))
-
-# LLM env
-ENABLE_LLM = (os.getenv("ENABLE_LLM", "true").lower() in ("1", "true", "yes"))
-LLM_DEPLOYMENT = os.getenv("LLM_DEPLOYMENT", "llm_model")
+ENABLE_CROSS_ENCODER = (os.getenv("ENABLE_CROSS_ENCODER", "true").lower() in ("1", "true", "yes"))
+EMBED_MAX_REPLICAS_PER_NODE = int(os.getenv("EMBED_MAX_REPLICAS_PER_NODE", "1"))
+RERANKER_MAX_REPLICAS_PER_NODE = int(os.getenv("RERANKER_MAX_REPLICAS_PER_NODE", "1"))
+LLM_MAX_REPLICAS_PER_NODE = int(os.getenv("LLM_MAX_REPLICAS_PER_NODE", "1"))
+LLM_ENABLE_ENV = (os.getenv("LLM_ENABLE", "true").lower() in ("1", "true", "yes"))
+LLM_PATH = os.getenv("LLM_PATH", "/workspace/models/qwen/Qwen3-0.6B")
+LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "qwen-3-0.6b")
 LLM_REPLICAS = int(os.getenv("LLM_REPLICAS", "1"))
-LLM_GPU_PER_REPLICA = int(os.getenv("LLM_GPU_PER_REPLICA", "0"))
-LLM_PATH = os.getenv("LLM_PATH", "/workspace/models/qwen/Qwen3-0.6B-AWQ")
-LLM_USE_CUDA = (os.getenv("LLM_USE_CUDA", "true").lower() in ("1", "true", "yes"))
-LLM_MAX_INPUT = int(os.getenv("LLM_MAX_INPUT", "512"))
-LLM_MAX_NEW_TOKENS = int(os.getenv("LLM_MAX_NEW_TOKENS", "64"))
-LLM_DEVICE_OVERRIDE = os.getenv("LLM_DEVICE", None)
-LLM_TRUST_REMOTE_CODE = (os.getenv("LLM_TRUST_REMOTE_CODE", "false").lower() in ("1", "true", "yes"))
-LLM_LOW_CPU_MEM_USAGE = (os.getenv("LLM_LOW_CPU_MEM_USAGE", "true").lower() in ("1", "true", "yes"))
-
-# ONNX runtime import and check
+LLM_GPU_PER_REPLICA = float(os.getenv("LLM_GPU_PER_REPLICA", "1.0"))
+LLM_DEPLOYMENT_NAME = os.getenv("LLM_DEPLOYMENT_NAME", "llm_server")
+LLM_INGRESS_NAME = os.getenv("LLM_INGRESS_NAME", "openai_ingress")
+LLM_ENGINE_KWARGS = json.loads(os.getenv("LLM_ENGINE_KWARGS", "{}") or "{}")
+LLM_USE_RUNTIME_ENV = (os.getenv("LLM_USE_RUNTIME_ENV", "false").lower() in ("1", "true", "yes"))
+_LLM_APIS_AVAILABLE = True
 try:
-    import onnxruntime as ort
-except Exception as e:
-    raise ImportError("onnxruntime not importable: " + str(e))
-
-if ONNX_USE_CUDA:
+    from ray.serve.llm import LLMConfig as _chk  # noqa: F401
+except Exception:
+    _LLM_APIS_AVAILABLE = False
+LLM_ENABLE = LLM_ENABLE_ENV and _LLM_APIS_AVAILABLE
+def exists_and_readable(p: str) -> bool:
     try:
-        providers_avail = ort.get_available_providers()
+        return os.path.exists(p) and os.access(p, os.R_OK)
     except Exception:
-        providers_avail = []
-    if "CUDAExecutionProvider" not in providers_avail:
-        raise RuntimeError("ONNX_USE_CUDA=true but CUDAExecutionProvider not available: " + str(providers_avail))
-
+        return False
 def make_session(path: str):
+    if ort is None:
+        raise RuntimeError("onnxruntime not available")
     so = ort.SessionOptions()
     so.intra_op_num_threads = ORT_INTRA_THREADS
     so.inter_op_num_threads = ORT_INTER_THREADS
-    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if ONNX_USE_CUDA else ["CPUExecutionProvider"]
-    return ort.InferenceSession(path, sess_options=so, providers=providers)
-
+    providers = (["CUDAExecutionProvider", "CPUExecutionProvider"] if ONNX_USE_CUDA else ["CPUExecutionProvider"])
+    sess = ort.InferenceSession(path, sess_options=so, providers=providers)
+    return sess
 def mean_pool(last_hidden: np.ndarray, attention_mask: np.ndarray) -> np.ndarray:
-    mask = attention_mask.astype(np.float32)[:, :, None]
+    mask = attention_mask.astype(np.float32)
+    mask = mask[:, :, None]
     summed = (last_hidden * mask).sum(axis=1)
     denom = np.maximum(mask.sum(axis=1), 1e-9)
     return summed / denom
-
-def _ensure_file(path: str):
-    if not os.path.exists(path):
-        raise FileNotFoundError(path)
-
-def _effective_max_length(tokenizer: PreTrainedTokenizerFast, requested: Optional[int], env_default: int, hard_cap: Optional[int] = None) -> int:
+def effective_max_length(tokenizer: PreTrainedTokenizerFast, requested: Optional[int], env_default: int, hard_cap: Optional[int] = None) -> int:
     if requested is None:
         requested = env_default
     try:
@@ -104,23 +94,26 @@ def _effective_max_length(tokenizer: PreTrainedTokenizerFast, requested: Optiona
     candidates = [c for c in caps if c and c > 0]
     eff = int(min(candidates)) if candidates else int(env_default)
     return max(1, eff)
-
-# --- Deployments: ONNX Embed ---
-@serve.deployment(name=EMBED_DEPLOYMENT, num_replicas=EMBED_REPLICAS, ray_actor_options={"num_gpus": EMBED_GPU})
-class ONNXEmbed:
+@serve.deployment
+class EmbedDeployment:
     def __init__(self, onnx_path: str = ONNX_EMBED_PATH, tokenizer_path: str = ONNX_EMBED_TOKENIZER_PATH):
-        _ensure_file(tokenizer_path)
+        if ort is None:
+            raise RuntimeError("onnxruntime not available")
+        if not exists_and_readable(tokenizer_path):
+            raise FileNotFoundError(tokenizer_path)
+        if not exists_and_readable(onnx_path):
+            raise FileNotFoundError(onnx_path)
         self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_path)
         if getattr(self.tokenizer, "pad_token", None) is None:
             if getattr(self.tokenizer, "eos_token", None) is not None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
+            elif getattr(self.tokenizer, "sep_token", None) is not None:
+                self.tokenizer.pad_token = self.tokenizer.sep_token
             else:
                 self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-        _ensure_file(onnx_path)
         self.sess = make_session(onnx_path)
         self.input_names = [inp.name for inp in self.sess.get_inputs()]
-
-        probe_len = _effective_max_length(self.tokenizer, INDEXING_EMBEDDER_MAX_TOKENS, INDEXING_EMBEDDER_MAX_TOKENS)
+        probe_len = effective_max_length(self.tokenizer, None, INDEXING_EMBEDDER_MAX_TOKENS)
         toks = self.tokenizer(["health-check"], padding=True, truncation=True, return_tensors="np", max_length=min(8, probe_len))
         ort_inputs = {}
         for k, v in toks.items():
@@ -132,47 +125,53 @@ class ONNXEmbed:
                         if cand in self.input_names:
                             ort_inputs[cand] = v.astype("int64")
                             break
-
         outputs = self.sess.run(None, ort_inputs)
         out = None
         for arr in outputs:
             arr = np.asarray(arr)
             if arr.ndim == 3:
                 attn = toks.get("attention_mask", np.ones(arr.shape[:2], dtype="int64"))
-                out = mean_pool(arr, attn); break
+                out = mean_pool(arr, attn)
+                break
             if arr.ndim == 2:
-                out = arr; break
-
+                out = arr
+                break
         if out is None:
             last = np.asarray(outputs[-1])
             if last.ndim > 2:
                 out = last.reshape((last.shape[0], -1))
             else:
                 out = last
-
         if out is None or out.ndim != 2:
             raise RuntimeError("Unable to infer embedding output shape from ONNX outputs.")
         self._embed_dim = int(out.shape[1])
-        log.info("[%s] startup OK embed_dim=%d", EMBED_DEPLOYMENT, self._embed_dim)
-
-    async def __call__(self, payload):
-        body = payload if isinstance(payload, (dict, list)) else {}
-        if not isinstance(body, dict):
+        log.info("Embed ready dim=%d", self._embed_dim)
+    async def __call__(self, request):
+        body = {}
+        if isinstance(request, (dict, list)):
+            body = request
+        else:
             try:
-                body = await payload.json()
+                body = await request.json()
             except Exception:
                 try:
-                    raw = await payload.body()
+                    raw = await request.body()
                     body = json.loads(raw.decode("utf-8")) if raw else {}
                 except Exception:
                     body = {}
         texts = body.get("texts", []) if isinstance(body, dict) else []
         if not isinstance(texts, list):
             texts = [texts]
-        eff_max = _effective_max_length(self.tokenizer, body.get("max_length", None), INDEXING_EMBEDDER_MAX_TOKENS)
+        requested_max = None
+        if isinstance(body, dict):
+            try:
+                requested_max = int(body.get("max_length", None)) if body.get("max_length", None) is not None else None
+            except Exception:
+                requested_max = None
+        eff_max = effective_max_length(self.tokenizer, requested_max, INDEXING_EMBEDDER_MAX_TOKENS)
         toks = self.tokenizer(texts, padding=True, truncation=True, return_tensors="np", max_length=eff_max)
         batch = toks["input_ids"].shape[0]
-        ort_inputs = {}
+        ort_inputs: Dict[str, Any] = {}
         for k, v in toks.items():
             if k in self.input_names:
                 ort_inputs[k] = v.astype("int64")
@@ -180,16 +179,19 @@ class ONNXEmbed:
                 if k == "input_ids":
                     for cand in ("input_ids", "input", "input.1"):
                         if cand in self.input_names:
-                            ort_inputs[cand] = v.astype("int64"); break
+                            ort_inputs[cand] = v.astype("int64")
+                            break
         outputs = self.sess.run(None, ort_inputs)
         vecs = None
         for arr in outputs:
             arr = np.asarray(arr)
             if arr.ndim == 3 and arr.shape[0] == batch:
                 attn = toks.get("attention_mask", np.ones(arr.shape[:2], dtype="int64"))
-                vecs = mean_pool(arr, attn); break
+                vecs = mean_pool(arr, attn)
+                break
             if arr.ndim == 2 and arr.shape[0] == batch:
-                vecs = arr; break
+                vecs = arr
+                break
         if vecs is None:
             last = np.asarray(outputs[-1])
             if last.ndim > 2 and last.shape[0] == batch:
@@ -200,23 +202,26 @@ class ONNXEmbed:
         norms = np.maximum(norms, 1e-12)
         vecs = (vecs / norms).astype(float)
         return {"vectors": [v.tolist() for v in vecs], "max_length_used": int(eff_max)}
-
-# --- Deployments: ONNX Rerank (optional) ---
-@serve.deployment(name=RERANK_DEPLOYMENT, num_replicas=RERANK_REPLICAS, ray_actor_options={"num_gpus": RERANK_GPU})
-class ONNXRerank:
+@serve.deployment
+class RerankDeployment:
     def __init__(self, onnx_path: str = ONNX_RERANK_PATH, tokenizer_path: str = ONNX_RERANK_TOKENIZER_PATH):
-        _ensure_file(tokenizer_path)
+        if ort is None:
+            raise RuntimeError("onnxruntime not available")
+        if not exists_and_readable(tokenizer_path):
+            raise FileNotFoundError(tokenizer_path)
+        if not exists_and_readable(onnx_path):
+            raise FileNotFoundError(onnx_path)
         self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_path)
         if getattr(self.tokenizer, "pad_token", None) is None:
             if getattr(self.tokenizer, "eos_token", None) is not None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
+            elif getattr(self.tokenizer, "sep_token", None) is not None:
+                self.tokenizer.pad_token = self.tokenizer.sep_token
             else:
                 self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-        _ensure_file(onnx_path)
         self.sess = make_session(onnx_path)
         self.input_names = [inp.name for inp in self.sess.get_inputs()]
-
-        probe_len = _effective_max_length(self.tokenizer, CROSS_ENCODER_MAX_TOKENS, CROSS_ENCODER_MAX_TOKENS)
+        probe_len = effective_max_length(self.tokenizer, None, CROSS_ENCODER_MAX_TOKENS)
         toks = self.tokenizer([("q", "a"), ("q", "b")], padding=True, truncation='only_second', return_tensors="np", max_length=min(8, probe_len))
         ort_inputs = {}
         for k, v in toks.items():
@@ -226,27 +231,31 @@ class ONNXRerank:
                 if k == "input_ids":
                     for cand in ("input_ids", "input", "input.1"):
                         if cand in self.input_names:
-                            ort_inputs[cand] = v.astype("int64"); break
+                            ort_inputs[cand] = v.astype("int64")
+                            break
         outs = self.sess.run(None, ort_inputs)
         derived = None
         for arr in outs:
             arr = np.asarray(arr)
             if arr.ndim == 1 and arr.shape[0] == 2:
-                derived = arr; break
+                derived = arr
+                break
             if arr.ndim == 2 and arr.shape[0] == 2:
-                derived = arr[:, 0]; break
+                derived = arr[:, 0]
+                break
         if derived is None:
             derived = np.asarray(outs[-1]).reshape(2, -1)[:, 0]
-        log.info("[%s] startup OK rerank sample shape %s", RERANK_DEPLOYMENT, derived.shape)
-
-    async def __call__(self, payload):
-        body = payload if isinstance(payload, (dict, list)) else {}
-        if not isinstance(body, dict):
+        log.info("Rerank ready sample-shape=%s", derived.shape)
+    async def __call__(self, request):
+        body = {}
+        if isinstance(request, (dict, list)):
+            body = request
+        else:
             try:
-                body = await payload.json()
+                body = await request.json()
             except Exception:
                 try:
-                    raw = await payload.body()
+                    raw = await request.body()
                     body = json.loads(raw.decode("utf-8")) if raw else {}
                 except Exception:
                     body = {}
@@ -257,9 +266,15 @@ class ONNXRerank:
         cands = cands[:MAX_RERANK]
         if len(cands) == 0:
             return {"scores": []}
-        eff_max = _effective_max_length(self.tokenizer, body.get("max_length", None), CROSS_ENCODER_MAX_TOKENS)
+        requested_max = None
+        if isinstance(body, dict):
+            try:
+                requested_max = int(body.get("max_length", None)) if body.get("max_length", None) is not None else None
+            except Exception:
+                requested_max = None
+        eff_max = effective_max_length(self.tokenizer, requested_max, CROSS_ENCODER_MAX_TOKENS)
         toks = self.tokenizer([(q, t) for t in cands], padding=True, truncation='only_second', return_tensors="np", max_length=eff_max)
-        ort_inputs = {}
+        ort_inputs: Dict[str, Any] = {}
         for k, v in toks.items():
             if k in self.input_names:
                 ort_inputs[k] = v.astype("int64")
@@ -267,15 +282,18 @@ class ONNXRerank:
                 if k == "input_ids":
                     for cand in ("input_ids", "input", "input.1"):
                         if cand in self.input_names:
-                            ort_inputs[cand] = v.astype("int64"); break
+                            ort_inputs[cand] = v.astype("int64")
+                            break
         outputs = self.sess.run(None, ort_inputs)
         scores = None
         for arr in outputs:
             arr = np.asarray(arr)
             if arr.ndim == 1 and arr.shape[0] == len(cands):
-                scores = arr; break
+                scores = arr
+                break
             if arr.ndim == 2 and arr.shape[0] == len(cands):
-                scores = arr[:, 0]; break
+                scores = arr[:, 0]
+                break
         if scores is None:
             last = np.asarray(outputs[-1])
             try:
@@ -283,128 +301,98 @@ class ONNXRerank:
             except Exception as e:
                 raise RuntimeError("unable to parse reranker outputs: " + str(e))
         return {"scores": [float(s) for s in np.asarray(scores).astype(float)], "max_length_used": int(eff_max)}
-
-# --- Deployment: LLM (lazy imports) ---
-@serve.deployment(name=LLM_DEPLOYMENT, num_replicas=LLM_REPLICAS, ray_actor_options={"num_gpus": LLM_GPU_PER_REPLICA})
-class LLMServe:
-    def __init__(self, model_path: str = LLM_PATH, max_input: int = LLM_MAX_INPUT, max_new_tokens: int = LLM_MAX_NEW_TOKENS):
+from fastapi import FastAPI
+app = FastAPI()
+GLOBAL_STATE = {"embed_ready": False, "rerank_ready": False, "llm_ready": False, "started": False}
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok", "started": GLOBAL_STATE["started"]}
+@app.get("/ready")
+def ready():
+    ready_ok = GLOBAL_STATE["embed_ready"]
+    if ENABLE_CROSS_ENCODER:
+        ready_ok = ready_ok and GLOBAL_STATE["rerank_ready"]
+    if LLM_ENABLE:
+        ready_ok = ready_ok and GLOBAL_STATE["llm_ready"]
+    return {"ready": bool(ready_ok), "components": {k: bool(v) for k, v in GLOBAL_STATE.items()}}
+def deploy_all():
+    if LLM_ENABLE_ENV and not _LLM_APIS_AVAILABLE:
+        log.error("LLM requested but Serve LLM APIs unavailable")
+        raise SystemExit(1)
+    if ENABLE_CROSS_ENCODER:
+        if not (exists_and_readable(ONNX_RERANK_PATH) and exists_and_readable(ONNX_RERANK_TOKENIZER_PATH)):
+            log.error("Reranker files missing and ENABLE_CROSS_ENCODER=true")
+            raise SystemExit(1)
+    if not (exists_and_readable(ONNX_EMBED_PATH) and exists_and_readable(ONNX_EMBED_TOKENIZER_PATH)):
+        log.error("Embed files missing")
+        raise SystemExit(1)
+    binds = []
+    embed_resources = {"GPU_NODE": 1} if EMBED_GPU_PER_REPLICA and EMBED_GPU_PER_REPLICA > 0 else {"CPU_NODE": 1}
+    embed_actor_opts = {"num_gpus": float(EMBED_GPU_PER_REPLICA), "resources": embed_resources}
+    embed_bind = EmbedDeployment.options(name=EMBED_DEPLOYMENT, num_replicas=EMBED_REPLICAS, max_replicas_per_node=EMBED_MAX_REPLICAS_PER_NODE, ray_actor_options=embed_actor_opts).bind(ONNX_EMBED_PATH, ONNX_EMBED_TOKENIZER_PATH)
+    binds.append(embed_bind)
+    if ENABLE_CROSS_ENCODER:
+        rerank_resources = {"GPU_NODE": 1} if RERANK_GPU_PER_REPLICA and RERANK_GPU_PER_REPLICA > 0 else {"CPU_NODE": 1}
+        rerank_actor_opts = {"num_gpus": float(RERANK_GPU_PER_REPLICA), "resources": rerank_resources}
+        rerank_bind = RerankDeployment.options(name=RERANK_HANDLE_NAME, num_replicas=RERANK_REPLICAS, max_replicas_per_node=RERANKER_MAX_REPLICAS_PER_NODE, ray_actor_options=rerank_actor_opts).bind(ONNX_RERANK_PATH, ONNX_RERANK_TOKENIZER_PATH)
+        binds.append(rerank_bind)
+    if LLM_ENABLE:
+        model_loading = {"model_id": LLM_MODEL_ID, "model_source": LLM_PATH}
+        deployment_cfg = {"autoscaling_config": {"min_replicas": max(1, LLM_REPLICAS), "max_replicas": max(1, LLM_REPLICAS)}}
+        llm_runtime_env = {"pip": ["vllm==0.11.0"]} if LLM_USE_RUNTIME_ENV else None
+        llm_config = LLMConfig(model_loading_config=model_loading, deployment_config=deployment_cfg, engine_kwargs=LLM_ENGINE_KWARGS or None, runtime_env=llm_runtime_env)
+        server_options = LLMServer.get_deployment_options(llm_config) or {}
+        ray_actor_opts = server_options.get("ray_actor_options", {})
+        ray_actor_opts.setdefault("num_gpus", float(LLM_GPU_PER_REPLICA))
+        # enforce placement label for GPU nodes
+        ray_actor_opts.setdefault("resources", {})
+        ray_actor_opts["resources"].setdefault("GPU_NODE", 1)
+        server_options["ray_actor_options"] = ray_actor_opts
+        server_options.setdefault("max_replicas_per_node", LLM_MAX_REPLICAS_PER_NODE)
+        server_deployment = serve.deployment(LLMServer).options(**server_options).bind(llm_config)
+        ingress_options = OpenAiIngress.get_deployment_options(llm_configs=[llm_config]) or {}
+        ingress_cls = make_fastapi_ingress(OpenAiIngress)
+        ingress_deployment = serve.deployment(ingress_cls).options(**ingress_options).bind([llm_config])
+        binds.append(server_deployment)
+        binds.append(ingress_deployment)
+    health_bind = serve.deployment(name="health", num_replicas=1, route_prefix="/").bind(app)
+    binds.append(health_bind)
+    log.info("Starting serve.run with %d binds", len(binds))
+    serve.run(*binds)
+def main():
+    ray_init_kwargs = {"ignore_reinit_error": True}
+    if RAY_ADDRESS:
+        ray_init_kwargs["address"] = RAY_ADDRESS
+    if RAY_NAMESPACE:
+        ray_init_kwargs["namespace"] = RAY_NAMESPACE
+    ray.init(**ray_init_kwargs)
+    http_opts = HTTPOptions(host=SERVE_HTTP_HOST, port=SERVE_HTTP_PORT)
+    serve.start(http_options=http_opts, detached=False)
+    def _handler(sig, frame):
         try:
-            import torch  # type: ignore
-            from transformers import AutoTokenizer, AutoModelForCausalLM  # type: ignore
-        except Exception as e:
-            raise RuntimeError("transformers and torch must be installed to run LLMServe: " + str(e))
-
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"LLM_PATH not found: {model_path}")
-
-        self.model_path = model_path
-        self.max_input = int(max_input)
-        self.max_new_tokens = int(max_new_tokens)
-
-        if LLM_DEVICE_OVERRIDE:
-            device_str = LLM_DEVICE_OVERRIDE
-        else:
-            if LLM_USE_CUDA and torch.cuda.is_available() and LLM_GPU_PER_REPLICA > 0:
-                device_str = "cuda"
-            else:
-                device_str = "cpu"
-        self.device = torch.device(device_str)
-
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, use_fast=True)
-        if getattr(self.tokenizer, "pad_token", None) is None:
-            if getattr(self.tokenizer, "eos_token", None) is not None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-            else:
-                self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-
-        dtype = torch.float16 if (self.device.type == "cuda") else torch.float32
-        load_kwargs = {"torch_dtype": dtype}
-        if LLM_LOW_CPU_MEM_USAGE:
-            load_kwargs["low_cpu_mem_usage"] = True
-        try:
-            self.model = AutoModelForCausalLM.from_pretrained(self.model_path, trust_remote_code=LLM_TRUST_REMOTE_CODE, **load_kwargs)
-        except Exception as e:
-            log.exception("Failed to load LLM: %s", e)
-            raise
-
-        try:
-            self.model.resize_token_embeddings(len(self.tokenizer))
+            serve.shutdown()
         except Exception:
             pass
-
         try:
-            self.model.to(self.device)
-            self.model.eval()
-        except Exception as e:
-            log.warning("Could not move LLM to device %s: %s", self.device, e)
-
-        log.info("[%s] loaded model=%s device=%s", LLM_DEPLOYMENT, self.model_path, self.device)
-
-    async def __call__(self, payload):
+            ray.shutdown()
+        except Exception:
+            pass
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _handler)
+    signal.signal(signal.SIGINT, _handler)
+    GLOBAL_STATE["started"] = True
+    try:
+        deploy_all()
+    except Exception:
+        log.exception("Deployment failed")
         try:
-            body = payload if isinstance(payload, (dict, list)) else {}
-            if not isinstance(body, dict):
-                try:
-                    body = await payload.json()
-                except Exception:
-                    try:
-                        raw = await payload.body()
-                        body = json.loads(raw.decode("utf-8")) if raw else {}
-                    except Exception:
-                        body = {}
-            prompt = body.get("prompt", "") if isinstance(body, dict) else (body if isinstance(body, str) else "")
-            if not prompt:
-                return {"error": "no prompt provided"}
-            import torch  # local
-            max_len = min(self.max_input, getattr(self.tokenizer, "model_max_length", self.max_input) or self.max_input)
-            toks = self.tokenizer(prompt, truncation=True, padding=True, return_tensors="pt", max_length=max_len)
-            input_ids = toks["input_ids"].to(self.device)
-            attention_mask = toks.get("attention_mask")
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(self.device)
-            with torch.no_grad():
-                out_ids = self.model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=self.max_new_tokens,
-                    do_sample=False,
-                    pad_token_id=getattr(self.tokenizer, "pad_token_id", None) or getattr(self.tokenizer, "eos_token_id", None),
-                )
-            out_text = self.tokenizer.batch_decode(out_ids, skip_special_tokens=True)
-            return {"generated": out_text, "model": self.model_path, "device": str(self.device)}
-        except Exception as e:
-            log.exception("LLM call error: %s", e)
-            raise
-
-# --- main: deploy three independent apps ---
-def main():
-    ray.init(address=RAY_ADDRESS, namespace=RAY_NAMESPACE, ignore_reinit_error=True)
-    http_opts = HTTPOptions(host=SERVE_HTTP_HOST, port=SERVE_HTTP_PORT)
-    serve.start(detached=True, http_options=http_opts)
-
-    # Each bind() returns an Application. We pass one Application at a time to serve.run()
-    embed_app = ONNXEmbed.bind()
-    serve.run(embed_app, name=EMBED_DEPLOYMENT, route_prefix=f"/{EMBED_DEPLOYMENT}")
-    log.info("Deployed %s", EMBED_DEPLOYMENT)
-
-    if ENABLE_CROSS_ENCODER:
-        rerank_app = ONNXRerank.bind()
-        serve.run(rerank_app, name=RERANK_DEPLOYMENT, route_prefix=f"/{RERANK_DEPLOYMENT}")
-        log.info("Deployed %s", RERANK_DEPLOYMENT)
-
-    if ENABLE_LLM:
-        llm_app = LLMServe.bind()
-        serve.run(llm_app, name=LLM_DEPLOYMENT, route_prefix=f"/{LLM_DEPLOYMENT}")
-        log.info("Deployed %s", LLM_DEPLOYMENT)
-
-    log.info("All independent deployments started.")
-
-# --- helpers to call handles from anywhere in cluster ---
-def get_handle_and_call(name: str, payload: Dict[str, Any]):
-    dep = serve.get_deployment(name)
-    handle = dep.get_handle(sync=False)
-    ref = handle.remote(payload)
-    return ray.get(ref)
-
+            serve.shutdown()
+        except Exception:
+            pass
+        try:
+            ray.shutdown()
+        except Exception:
+            pass
+        raise
 if __name__ == "__main__":
     main()
