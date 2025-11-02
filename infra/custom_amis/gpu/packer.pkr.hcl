@@ -20,7 +20,7 @@ variable "volume_size_gb" {
 }
 variable "ami_name" {
   type    = string
-  default = "vllm-py311-ubuntu2204-offline-ami-{{timestamp}}"
+  default = "vllm-py311-offline-ami-{{timestamp}}"
 }
 variable "ami_description" {
   type    = string
@@ -30,18 +30,13 @@ variable "source_ami" {
   type    = string
   default = ""
 }
-
 source "amazon-ebs" "ubuntu2204_gpu" {
   region                      = var.region
   instance_type               = var.instance_type
   ami_name                    = var.ami_name
   ssh_username                = "ubuntu"
   associate_public_ip_address = true
-
-  # If BUILD supplies source_ami via -var it will be used; otherwise the filter below is used.
   source_ami = var.source_ami
-
-  # fallback filter to find latest Ubuntu 22.04 AMI (owner = Canonical)
   source_ami_filter {
     filters = {
       name                = "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"
@@ -51,7 +46,6 @@ source "amazon-ebs" "ubuntu2204_gpu" {
     owners      = ["099720109477"]
     most_recent = true
   }
-
   launch_block_device_mappings {
     device_name = "/dev/xvda"
     volume_size = var.volume_size_gb
@@ -61,7 +55,6 @@ source "amazon-ebs" "ubuntu2204_gpu" {
     delete_on_termination = true
   }
 }
-
 build {
   name    = "vllm-ubuntu2204-offline-ami"
   sources = ["source.amazon-ebs.ubuntu2204_gpu"]

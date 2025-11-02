@@ -49,3 +49,6 @@ export GPU_NODE_LABEL=GPU_NODE            # label advertised by gpu worker nodes
 # - If you want embed/rerank to use GPU nodes, set *_GPU_PER_REPLICA=1 and ensure GPU_NODE label present on worker type.
 # - If you want more packing on a GPU (small models), increase EMBED_MAX_REPLICAS_PER_NODE and consider fractional GPU scheduling (advanced).
 # - If you have fewer nodes than requested replicas, reduce replica counts or enable autoscaler max_workers to scale up.
+
+
+
