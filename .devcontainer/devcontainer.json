@@ -15,7 +15,7 @@
     "--security-opt=seccomp=unconfined",
     "-v",
     "/var/run/docker.sock:/var/run/docker.sock",
-    "--shm-size=6g"
+    "--shm-size=8g"
   ],
   "containerEnv": {
     "DOCKER_GID": "999",

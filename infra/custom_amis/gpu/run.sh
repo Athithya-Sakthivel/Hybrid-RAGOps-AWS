@@ -11,7 +11,7 @@ AWS_REGION="${AWS_REGION:-ap-south-1}"
 AWS_PROFILE="${AWS_PROFILE:-default}"
 PACKER_FILE="${PACKER_FILE:-packer.pkr.hcl}"
 # Default GPU-capable instance type (change only if you know what you're doing)
-INSTANCE_TYPE="${INSTANCE_TYPE:-t2.micro}"
+INSTANCE_TYPE="${INSTANCE_TYPE:-g4dn.xlarge}"
 VOLUME_SIZE_GB="${VOLUME_SIZE_GB:-50}"
 AMI_NAME="${AMI_NAME:-minimal-vllm-py311-gpu-ami-$(date +%Y%m%d-%H%M%S)}"
 AMI_DESC="${AMI_DESC:-Ubuntu22.04 GPU AMI (CUDA, Python3.11, pip venv, vLLM)}"

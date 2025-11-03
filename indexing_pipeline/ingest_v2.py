@@ -1,3 +1,6 @@
+# MODE controls payload placement:
+#   "hybrid"   -> qdrant stores minimal payload (chunk_id document_id); neo4j stores full text & metadata
+#   "vector_only" -> qdrant stores full payload (text + metadata) so neo4j may be optional
 from __future__ import annotations
 import os
 import time
@@ -7,7 +10,7 @@ import hashlib
 import logging
 import subprocess
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple, Set
+from typing import List, Dict, Any, Optional, Tuple
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -16,7 +19,7 @@ log = logging.getLogger("ingest")
 import ray
 from ray import serve
 
-# Config
+# Config (preserve existing envs; add MODE)
 RAY_ADDRESS = os.getenv("RAY_ADDRESS", "auto")
 RAY_NAMESPACE = os.getenv("RAY_NAMESPACE", "ragops")
 SERVE_APP_NAME = os.getenv("SERVE_APP_NAME", "default")
@@ -35,13 +38,11 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", None)
 QDRANT_COLLECTION = os.getenv("COLLECTION", "my_collection")
 QDRANT_ON_DISK_PAYLOAD = os.getenv("QDRANT_ON_DISK_PAYLOAD", "true").lower() in ("1", "true", "yes")
 
-# --- Added safe defaults for common Qdrant HNSW tuning (collection-level) ---
-# These are optional tuning knobs. They are used at collection creation time.
+# Optional Qdrant HNSW tuning (collection-level)
 QDRANT_HNSW_M = int(os.getenv("QDRANT_HNSW_M", "16"))
 QDRANT_HNSW_EF_CONSTRUCTION = int(os.getenv("QDRANT_HNSW_EF_CONSTRUCTION", "200"))
 QDRANT_HNSW_EF_SEARCH = int(os.getenv("QDRANT_HNSW_EF_SEARCH", "50"))
 QDRANT_HNSW_FULL_SCAN_THRESHOLD = int(os.getenv("QDRANT_HNSW_FULL_SCAN_THRESHOLD", "10000"))
-# --------------------------------------------------------------------------------
 
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
@@ -57,9 +58,6 @@ VECTOR_DIM = int(os.getenv("VECTOR_DIM", "768"))
 # lease TTL (seconds)
 LEASE_TTL_SECONDS = int(os.getenv("LEASE_TTL_SECONDS", "300"))
 
-# MODE: "vector_only" | "hybrid"
-# - vector_only: Qdrant stores only point id + minimal payload (chunk_id), Neo4j contains full text + metadata
-# - hybrid: Qdrant payload contains snippet/metadata and Neo4j still stores full text (no truncation)
 MODE = os.getenv("MODE", "hybrid").lower()
 
 # helpers
@@ -106,7 +104,6 @@ def read_manifest_s3(bucket: str, key: str, client=None) -> Optional[Dict[str, A
         return None
 
 def write_manifest_s3_atomic(bucket: str, key: str, manifest: Dict[str, Any], client=None):
-    # keep original behavior: atomic tmp upload then copy
     client = client or _s3_client_for_bucket(bucket)
     final_key = key + ".manifest.json"
     tmp_key = final_key + f".tmp.{int(time.time())}-{uuid.uuid4().hex[:8]}"
@@ -193,7 +190,6 @@ class QdrantWriter:
             try:
                 cols = [c.name for c in self.client.get_collections().collections]
                 if collection not in cols:
-                    # try to create collection with HNSW config when available
                     try:
                         from qdrant_client.http.models import VectorParams, Distance, HnswConfig
                         hnsw_cfg = HnswConfig(
@@ -209,17 +205,14 @@ class QdrantWriter:
                             on_disk_payload=on_disk_payload,
                         )
                     except Exception:
-                        # fallback: try without explicit HNSW object (older/newer client compat)
                         try:
                             from qdrant_client.http.models import VectorParams, Distance
-                            # pass hnsw settings as dict if supported by client
                             hnsw_dict = {
                                 "m": int(os.getenv("QDRANT_HNSW_M", str(QDRANT_HNSW_M))),
                                 "ef_construct": int(os.getenv("QDRANT_HNSW_EF_CONSTRUCTION", str(QDRANT_HNSW_EF_CONSTRUCTION))),
                                 "ef_search": int(os.getenv("QDRANT_HNSW_EF_SEARCH", str(QDRANT_HNSW_EF_SEARCH))),
                                 "full_scan_threshold": int(os.getenv("QDRANT_HNSW_FULL_SCAN_THRESHOLD", str(QDRANT_HNSW_FULL_SCAN_THRESHOLD))),
                             }
-                            # many qdrant client versions accept hnsw_config as dict
                             self.client.create_collection(
                                 collection_name=collection,
                                 vectors_config=VectorParams(size=vector_dim, distance=Distance.COSINE),
@@ -227,7 +220,6 @@ class QdrantWriter:
                                 on_disk_payload=on_disk_payload,
                             )
                         except Exception as e:
-                            # final fallback: create without hnsw config
                             try:
                                 from qdrant_client.http.models import VectorParams, Distance
                                 self.client.create_collection(collection_name=collection, vectors_config=VectorParams(size=vector_dim, distance=Distance.COSINE), on_disk_payload=on_disk_payload)
@@ -291,7 +283,6 @@ class QdrantWriter:
                             )
                             self.client.create_collection(collection_name=self.collection, vectors_config=VectorParams(size=self.vector_dim, distance=Distance.COSINE), hnsw_config=hnsw_cfg, on_disk_payload=self.on_disk_payload)
                         except Exception:
-                            # fallback to dict style or minimal create
                             try:
                                 from qdrant_client.http.models import VectorParams, Distance
                                 hnsw_dict = {
@@ -340,8 +331,21 @@ class Neo4jWriter:
           ON CREATE SET d.file_name = c.file_name, d.created_at = datetime()
           ON MATCH SET d.updated_at = datetime()
         MERGE (ch:Chunk {chunk_id: c.chunk_id})
-          ON CREATE SET ch.text = c.text, ch.token_count = c.token_count, ch.file_type = c.file_type, ch.source_url = c.source_url, ch.timestamp = c.timestamp, ch.file_name = c.file_name, ch.qdrant_id = c.qdrant_point_id
-          ON MATCH SET ch.updated_at = datetime(), ch.qdrant_id = c.qdrant_point_id
+          ON CREATE SET ch.text = c.text,
+                        ch.token_count = c.token_count,
+                        ch.file_type = c.file_type,
+                        ch.source_url = c.source_url,
+                        ch.timestamp = c.timestamp,
+                        ch.file_name = c.file_name,
+                        ch.page_number = c.page_number,
+                        ch.row_range = c.row_range,
+                        ch.token_range = c.token_range,
+                        ch.audio_range = c.audio_range,
+                        ch.headings = c.headings,
+                        ch.headings_path = c.headings_path,
+                        ch.content_hash = c.content_hash,
+                        ch.qdrant_id = c.qdrant_point_id
+          ON MATCH SET ch.updated_at = datetime(), ch.qdrant_id = c.qdrant_point_id, ch.text = c.text
         MERGE (d)-[:HAS_CHUNK]->(ch)
         """
         written = 0
@@ -387,12 +391,7 @@ class Neo4jWriter:
             self._log.warning("neo4j get_chunks_info failed: %s", e)
         return out
 
-    # Lease methods for single-writer per file_hash
     def try_acquire_file_lock(self, file_hash: str, owner: str, ttl_seconds: int) -> Dict[str, Any]:
-        """
-        Returns {"ok": True, "acquired": True/False} on success,
-        or {"ok": False, "error": "..."} on Neo4j error.
-        """
         if not self.driver:
             return {"ok": False, "error": "neo4j_driver_unavailable"}
         try:
@@ -416,9 +415,6 @@ class Neo4jWriter:
             return {"ok": False, "error": str(e)}
 
     def release_file_lock(self, file_hash: str, owner: str) -> Dict[str, Any]:
-        """
-        Returns {"ok": True, "released": True/False} or {"ok": False, "error": "..."}
-        """
         if not self.driver:
             return {"ok": False, "error": "neo4j_driver_unavailable"}
         try:
@@ -576,7 +572,6 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
     embed_timeout = cfg.get("embed_timeout")
     boto_client = _s3_client_for_bucket(s3_bucket) if s3_bucket else None
 
-    # unique owner id for lease
     owner = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
     acquired_lease = False
 
@@ -611,7 +606,6 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
             log.exception("hash compute failed for %s: %s", raw_key, e)
             return 0
 
-    # Try to acquire lease for this file_hash to avoid concurrent workers doing duplicate embedding
     if neo4j_actor:
         try:
             lease_res = ray.get(neo4j_actor.try_acquire_file_lock.remote(file_hash, owner, LEASE_TTL_SECONDS))
@@ -621,12 +615,10 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
                     return 0
                 acquired_lease = True
             else:
-                # if neo4j returned error, proceed without lease for compatibility
                 log.warning("Lease service reported error; proceeding without lease for %s: %s", raw_key, lease_res)
         except Exception as e:
             log.warning("Lease RPC failed; proceeding without lease for %s: %s", raw_key, e)
 
-    # ensure release in finally if we acquired
     try:
         chunks_meta: List[Dict[str, Any]] = []
         try:
@@ -682,6 +674,12 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
                 "file_type": p.get("file_type", ""),
                 "source_url": p.get("source_url", ""),
                 "timestamp": p.get("timestamp", ""),
+                "page_number": p.get("page_number"),
+                "row_range": p.get("row_range"),
+                "token_range": p.get("token_range"),
+                "audio_range": p.get("audio_range"),
+                "headings": p.get("headings"),
+                "headings_path": p.get("headings_path"),
                 "content_hash": p.get("content_hash") or hashlib.sha256(text.encode("utf-8")).hexdigest()
             })
 
@@ -705,7 +703,6 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
             log.warning("neo4j existence check failed: %s", e)
             neo_info = {cid: {"exists": False, "qdrant_id": None} for cid in chunk_ids}
 
-        # Decide embedding candidates
         to_embed_idxs: List[int] = []
         for i, c in enumerate(parsed_chunks):
             pid = point_ids[i]
@@ -723,16 +720,22 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
         if not to_embed_idxs:
             neo_payload = []
             for c, pid in zip(parsed_chunks, point_ids):
-                # store full text in Neo4j (no truncation)
                 neo_payload.append({
                     "chunk_id": c["chunk_id"],
                     "document_id": c["document_id"],
-                    "text": (c["text"] or ""),
+                    "text": c.get("text", ""),
                     "token_count": c["token_count"],
                     "file_name": c["file_name"],
                     "file_type": c["file_type"],
                     "source_url": c["source_url"],
                     "timestamp": c["timestamp"],
+                    "page_number": c.get("page_number"),
+                    "row_range": c.get("row_range"),
+                    "token_range": c.get("token_range"),
+                    "audio_range": c.get("audio_range"),
+                    "headings": c.get("headings"),
+                    "headings_path": c.get("headings_path"),
+                    "content_hash": c.get("content_hash"),
                     "qdrant_point_id": pid
                 })
             try:
@@ -742,7 +745,6 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
             except Exception:
                 log.exception("neo4j write failed for %s", raw_key)
 
-            # compute indexed_chunks count only (do not store indexed_chunk_ids or last_indexed_at)
             indexed_count = 0
             for i, c in enumerate(parsed_chunks):
                 pid = point_ids[i]
@@ -785,26 +787,31 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
                     idx = to_embed_idxs[i + j]
                     c = parsed_chunks[idx]
                     pid = point_ids[idx]
-
-                    # Decide qdrant payload per MODE
                     if MODE == "vector_only":
-                        q_payload = {"chunk_id": c["chunk_id"]}
-                    else:
-                        # hybrid: keep a compact snippet + basic metadata in qdrant payload
-                        q_payload = {
-                            "document_id": c["document_id"],
+                        payload = {
                             "chunk_id": c["chunk_id"],
-                            "snippet": (c["text"] or "")[:512],
+                            "document_id": c["document_id"],
+                            "text": c.get("text", ""),
                             "token_count": c["token_count"],
                             "file_name": c["file_name"],
                             "file_type": c["file_type"],
                             "source_url": c["source_url"],
                             "timestamp": c["timestamp"],
-                            "content_hash": c["content_hash"],
+                            "content_hash": c.get("content_hash"),
+                            "page_number": c.get("page_number"),
+                            "row_range": c.get("row_range"),
+                            "token_range": c.get("token_range"),
+                            "audio_range": c.get("audio_range"),
+                            "headings": c.get("headings"),
+                            "headings_path": c.get("headings_path"),
                             "source_file_hash": file_hash,
                         }
-
-                    new_points.append({"id": pid, "vector": [float(x) for x in vec], "payload": q_payload})
+                    else:
+                        payload = {
+                            "chunk_id": c["chunk_id"],
+                            "document_id": c["document_id"]
+                        }
+                    new_points.append({"id": pid, "vector": [float(x) for x in vec], "payload": payload})
         except Exception as e:
             log.exception("embedding failed for %s: %s", raw_key, e)
             return 0
@@ -854,16 +861,22 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
         for c, pid in zip(parsed_chunks, point_ids):
             ninfo = neo_info_final.get(c["chunk_id"], {"exists": False, "qdrant_id": None})
             if not ninfo.get("exists") or not ninfo.get("qdrant_id"):
-                # store full text in Neo4j (no truncation)
                 neo_payload.append({
                     "chunk_id": c["chunk_id"],
                     "document_id": c["document_id"],
-                    "text": (c["text"] or ""),
+                    "text": c.get("text", ""),
                     "token_count": c["token_count"],
                     "file_name": c["file_name"],
                     "file_type": c["file_type"],
                     "source_url": c["source_url"],
                     "timestamp": c["timestamp"],
+                    "page_number": c.get("page_number"),
+                    "row_range": c.get("row_range"),
+                    "token_range": c.get("token_range"),
+                    "audio_range": c.get("audio_range"),
+                    "headings": c.get("headings"),
+                    "headings_path": c.get("headings_path"),
+                    "content_hash": c.get("content_hash"),
                     "qdrant_point_id": pid
                 })
         try:
@@ -905,7 +918,6 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
         return indexed_new
 
     finally:
-        # release lease if we acquired it
         if acquired_lease and neo4j_actor:
             try:
                 rel = ray.get(neo4j_actor.release_file_lock.remote(file_hash, owner))
@@ -917,19 +929,16 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
 # main
 def main():
     _ensure_ray_connected()
-    log.info("Connected to Ray (namespace=%s)", RAY_NAMESPACE)
+    log.info("Connected to Ray (namespace=%s) MODE=%s", RAY_NAMESPACE, MODE)
 
     try:
         _ = get_strict_handle(EMBED_DEPLOYMENT, timeout=10.0)
     except Exception:
         log.warning("embed handle unresolved on driver; workers will resolve")
 
-    # create / ensure actors and that they expose required methods. If an existing detached actor lacks required methods
-    # we kill it and recreate so workers can call get_chunks_info.
     qdrant_actor = ensure_actor(QdrantWriter, "qdrant_writer", ["check_points_exist", "upsert_points"], QDRANT_URL, QDRANT_API_KEY, QDRANT_COLLECTION, VECTOR_DIM, QDRANT_ON_DISK_PAYLOAD)
     neo4j_actor = ensure_actor(Neo4jWriter, "neo4j_writer", ["bulk_write_chunks", "get_chunks_info", "try_acquire_file_lock", "release_file_lock"], NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
 
-    # discover inputs
     inputs: List[Tuple[str, str]] = []
     if not DATA_IN_LOCAL and S3_BUCKET:
         import boto3
