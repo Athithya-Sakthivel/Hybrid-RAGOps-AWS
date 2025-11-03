@@ -1,5 +1,4 @@
 ray==2.51.0
-vllm
 onnxruntime==1.23.2
 transformers==4.57.1
 numpy==2.2.6
