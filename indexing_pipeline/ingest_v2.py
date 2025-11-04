@@ -11,59 +11,45 @@ import logging
 import subprocess
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
-
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("ingest")
-
 import ray
 from ray import serve
-
 # Config (preserve existing envs; add MODE)
 RAY_ADDRESS = os.getenv("RAY_ADDRESS", "auto")
 RAY_NAMESPACE = os.getenv("RAY_NAMESPACE", "ragops")
 SERVE_APP_NAME = os.getenv("SERVE_APP_NAME", "default")
-
 DATA_IN_LOCAL = os.getenv("DATA_IN_LOCAL", "false").lower() in ("1", "true", "yes")
 LOCAL_DIR_PATH = os.getenv("LOCAL_DIR_PATH", "./data")
 S3_BUCKET = os.getenv("S3_BUCKET", "").strip()
 S3_RAW_PREFIX = os.getenv("S3_RAW_PREFIX", "data/raw/").rstrip("/") + "/"
 S3_CHUNKED_PREFIX = os.getenv("S3_CHUNKED_PREFIX", "data/chunked/").rstrip("/") + "/"
-
 EMBED_DEPLOYMENT = os.getenv("EMBED_DEPLOYMENT", "embed_onxx")
 INDEXING_EMBEDDER_MAX_TOKENS = int(os.getenv("INDEXING_EMBEDDER_MAX_TOKENS", "512"))
-
 QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", None)
 QDRANT_COLLECTION = os.getenv("COLLECTION", "my_collection")
 QDRANT_ON_DISK_PAYLOAD = os.getenv("QDRANT_ON_DISK_PAYLOAD", "true").lower() in ("1", "true", "yes")
-
 # Optional Qdrant HNSW tuning (collection-level)
 QDRANT_HNSW_M = int(os.getenv("QDRANT_HNSW_M", "16"))
 QDRANT_HNSW_EF_CONSTRUCTION = int(os.getenv("QDRANT_HNSW_EF_CONSTRUCTION", "200"))
 QDRANT_HNSW_EF_SEARCH = int(os.getenv("QDRANT_HNSW_EF_SEARCH", "50"))
 QDRANT_HNSW_FULL_SCAN_THRESHOLD = int(os.getenv("QDRANT_HNSW_FULL_SCAN_THRESHOLD", "10000"))
-
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
-
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "64"))
 EMBED_BATCH = int(os.getenv("EMBED_BATCH", "32"))
 EMBED_TIMEOUT = int(os.getenv("EMBED_TIMEOUT", "60"))
-
 FORCE_REHASH = os.getenv("FORCE_REHASH", "0") in ("1", "true", "True")
 VECTOR_DIM = int(os.getenv("VECTOR_DIM", "768"))
-
 # lease TTL (seconds)
 LEASE_TTL_SECONDS = int(os.getenv("LEASE_TTL_SECONDS", "300"))
-
 MODE = os.getenv("MODE", "hybrid").lower()
-
 # helpers
 def deterministic_point_id(chunk_id: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_OID, str(chunk_id)))
-
 def sha256_bytes_iter(stream, chunk_size=1 << 20) -> str:
     import hashlib as _h
     h = _h.sha256()
@@ -73,11 +59,9 @@ def sha256_bytes_iter(stream, chunk_size=1 << 20) -> str:
             break
         h.update(b)
     return h.hexdigest()
-
 def compute_local_file_hash(path: str) -> str:
     with open(path, "rb") as fh:
         return sha256_bytes_iter(fh)
-
 def _s3_client_for_bucket(bucket: str):
     import boto3
     session = boto3.session.Session()
@@ -94,7 +78,6 @@ def _s3_client_for_bucket(bucket: str):
     except Exception:
         fallback = session.region_name or "us-east-1"
         return session.client("s3", region_name=fallback)
-
 def read_manifest_s3(bucket: str, key: str, client=None) -> Optional[Dict[str, Any]]:
     client = client or _s3_client_for_bucket(bucket)
     try:
@@ -102,7 +85,6 @@ def read_manifest_s3(bucket: str, key: str, client=None) -> Optional[Dict[str, A
         return json.loads(obj["Body"].read().decode("utf-8"))
     except Exception:
         return None
-
 def write_manifest_s3_atomic(bucket: str, key: str, manifest: Dict[str, Any], client=None):
     client = client or _s3_client_for_bucket(bucket)
     final_key = key + ".manifest.json"
@@ -113,21 +95,18 @@ def write_manifest_s3_atomic(bucket: str, key: str, manifest: Dict[str, Any], cl
         client.delete_object(Bucket=bucket, Key=tmp_key)
     except Exception:
         pass
-
 def read_manifest_local(path: str) -> Optional[Dict[str, Any]]:
     try:
         with open(path + ".manifest.json", "r", encoding="utf-8") as fh:
             return json.load(fh)
     except Exception:
         return None
-
 def write_manifest_local_atomic(path: str, manifest: Dict[str, Any]):
     final = path + ".manifest.json"
     tmp = final + f".tmp.{int(time.time())}-{uuid.uuid4().hex[:8]}"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2)
     os.replace(tmp, final)
-
 def list_chunked_files_s3_for_file_hash(bucket: str, file_hash: str, client=None) -> List[str]:
     client = client or _s3_client_for_bucket(bucket)
     prefix = S3_CHUNKED_PREFIX
@@ -143,7 +122,6 @@ def list_chunked_files_s3_for_file_hash(bucket: str, file_hash: str, client=None
             if base.startswith(file_hash) and (base.lower().endswith(".json") or base.lower().endswith(".jsonl")):
                 keys.append(k)
     return keys
-
 def read_json_objects_from_text(text: str) -> List[Dict[str, Any]]:
     text = (text or "").strip()
     if not text:
@@ -174,7 +152,6 @@ def read_json_objects_from_text(text: str) -> List[Dict[str, Any]]:
         except Exception:
             pass
     return out
-
 # Actors
 @ray.remote(num_cpus=0)
 class QdrantWriter:
@@ -232,7 +209,6 @@ class QdrantWriter:
         except Exception as e:
             log.warning("QdrantWriter init failed: %s", e)
             self.client = None
-
     def check_points_exist(self, ids: List[str]) -> Dict[str, bool]:
         out = {}
         if not self.client:
@@ -246,7 +222,6 @@ class QdrantWriter:
             except Exception:
                 out[pid] = False
         return out
-
     def upsert_points(self, points: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not self.client:
             return {"ok": False, "error": "qdrant_client_unavailable"}
@@ -301,7 +276,6 @@ class QdrantWriter:
                         return {"ok": False, "error": f"create_collection_failed:{e2}"}
                 return {"ok": False, "error": msg}
         return {"ok": False, "error": "upsert_retries_exhausted"}
-
 @ray.remote(num_cpus=0)
 class Neo4jWriter:
     def __init__(self, uri: str, user: str, password: str):
@@ -319,7 +293,6 @@ class Neo4jWriter:
         except Exception as e:
             self._log.warning("Neo4jWriter init failed: %s", e)
             self.driver = None
-
     def bulk_write_chunks(self, chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not chunks:
             return {"ok": True, "written": 0}
@@ -372,7 +345,6 @@ class Neo4jWriter:
             else:
                 return {"ok": False, "error": "neo4j_write_retries_exhausted"}
         return {"ok": True, "written": written}
-
     def get_chunks_info(self, chunk_ids: List[str]) -> Dict[str, Dict[str, Optional[str]]]:
         out = {cid: {"exists": False, "qdrant_id": None} for cid in chunk_ids}
         if not self.driver:
@@ -390,7 +362,6 @@ class Neo4jWriter:
         except Exception as e:
             self._log.warning("neo4j get_chunks_info failed: %s", e)
         return out
-
     def try_acquire_file_lock(self, file_hash: str, owner: str, ttl_seconds: int) -> Dict[str, Any]:
         if not self.driver:
             return {"ok": False, "error": "neo4j_driver_unavailable"}
@@ -413,7 +384,6 @@ class Neo4jWriter:
         except Exception as e:
             self._log.warning("try_acquire_file_lock failed: %s", e)
             return {"ok": False, "error": str(e)}
-
     def release_file_lock(self, file_hash: str, owner: str) -> Dict[str, Any]:
         if not self.driver:
             return {"ok": False, "error": "neo4j_driver_unavailable"}
@@ -431,18 +401,15 @@ class Neo4jWriter:
         except Exception as e:
             self._log.warning("release_file_lock failed: %s", e)
             return {"ok": False, "error": str(e)}
-
 # Ray helpers
 def _ensure_ray_connected():
     if not ray.is_initialized():
         ray.init(address=(RAY_ADDRESS if RAY_ADDRESS and RAY_ADDRESS != "auto" else None), namespace=RAY_NAMESPACE, ignore_reinit_error=True)
-
 def _resolve_ray_response(obj, timeout: float):
     try:
         return ray.get(obj, timeout=timeout)
     except Exception:
         return obj
-
 def get_strict_handle(name: str, timeout: float = 30.0, poll: float = 0.5, app_name: Optional[str] = None):
     _ensure_ray_connected()
     start = time.time()
@@ -479,7 +446,6 @@ def get_strict_handle(name: str, timeout: float = 30.0, poll: float = 0.5, app_n
             last_exc = e
         time.sleep(poll)
     raise RuntimeError(f"timed out resolving serve handle {name}: {last_exc}")
-
 def call_serve(handle, payload, timeout: float = EMBED_TIMEOUT):
     try:
         if hasattr(handle, "remote"):
@@ -488,15 +454,12 @@ def call_serve(handle, payload, timeout: float = EMBED_TIMEOUT):
             resp = handle(payload)
     except Exception as e:
         raise RuntimeError(f"serve invocation failed: {e}") from e
-
     if isinstance(resp, (dict, list, str, int, float, bool)) or resp is None:
         return resp
-
     try:
         return ray.get(resp, timeout=timeout)
     except Exception:
         pass
-
     if hasattr(resp, "object_refs"):
         obj_refs = getattr(resp, "object_refs")
         try:
@@ -506,7 +469,6 @@ def call_serve(handle, payload, timeout: float = EMBED_TIMEOUT):
                 return ray.get(obj_refs, timeout=timeout)
         except Exception:
             pass
-
     if hasattr(resp, "result") and callable(getattr(resp, "result")):
         try:
             return resp.result(timeout=timeout)
@@ -523,12 +485,10 @@ def call_serve(handle, payload, timeout: float = EMBED_TIMEOUT):
                 return resp.get()
             except Exception:
                 pass
-
     try:
         return ray.get(resp, timeout=timeout)
     except Exception as e:
         raise RuntimeError(f"call_serve failed resolving response: {e}") from e
-
 # actor ensure helper
 def ensure_actor(actor_cls, name: str, required_methods: List[str], *args):
     try:
@@ -558,7 +518,6 @@ def ensure_actor(actor_cls, name: str, required_methods: List[str], *args):
             except Exception:
                 pass
             return actor_cls.options(name=name, lifetime="detached").remote(*args)
-
 # worker
 @ray.remote
 def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: Dict[str, Any]) -> int:
@@ -571,16 +530,13 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
     force_rehash = cfg.get("force_rehash")
     embed_timeout = cfg.get("embed_timeout")
     boto_client = _s3_client_for_bucket(s3_bucket) if s3_bucket else None
-
     owner = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
     acquired_lease = False
-
     try:
         embed_handle = get_strict_handle(EMBED_DEPLOYMENT, timeout=10.0)
     except Exception:
         embed_handle = None
         log.warning("worker: embed handle unresolved")
-
     manifest = {}
     try:
         if mode == "s3" and boto_client:
@@ -589,10 +545,8 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
             manifest = read_manifest_local(raw_key) or {}
     except Exception:
         manifest = {}
-
     if force_rehash:
         manifest["indexed_chunks"] = 0
-
     file_hash = manifest.get("file_hash", "")
     if not file_hash or force_rehash:
         try:
@@ -605,7 +559,6 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
         except Exception as e:
             log.exception("hash compute failed for %s: %s", raw_key, e)
             return 0
-
     if neo4j_actor:
         try:
             lease_res = ray.get(neo4j_actor.try_acquire_file_lock.remote(file_hash, owner, LEASE_TTL_SECONDS))
@@ -618,7 +571,6 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
                 log.warning("Lease service reported error; proceeding without lease for %s: %s", raw_key, lease_res)
         except Exception as e:
             log.warning("Lease RPC failed; proceeding without lease for %s: %s", raw_key, e)
-
     try:
         chunks_meta: List[Dict[str, Any]] = []
         try:
@@ -655,10 +607,8 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
         except Exception as e:
             log.exception("failed reading chunk files for %s: %s", raw_key, e)
             return 0
-
         if not chunks_meta:
             return 0
-
         parsed_chunks = []
         for p in chunks_meta:
             text = p.get("text", "") or ""
@@ -682,27 +632,22 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
                 "headings_path": p.get("headings_path"),
                 "content_hash": p.get("content_hash") or hashlib.sha256(text.encode("utf-8")).hexdigest()
             })
-
         if not parsed_chunks:
             return 0
-
         point_ids = [deterministic_point_id(c["chunk_id"]) for c in parsed_chunks]
         chunk_ids = [c["chunk_id"] for c in parsed_chunks]
-
         # Query Qdrant
         try:
             exist_map_q = ray.get(qdrant_actor.check_points_exist.remote(point_ids))
         except Exception as e:
             log.warning("qdrant existence check failed: %s", e)
             exist_map_q = {pid: False for pid in point_ids}
-
         # Query Neo4j
         try:
             neo_info = ray.get(neo4j_actor.get_chunks_info.remote(chunk_ids))
         except Exception as e:
             log.warning("neo4j existence check failed: %s", e)
             neo_info = {cid: {"exists": False, "qdrant_id": None} for cid in chunk_ids}
-
         to_embed_idxs: List[int] = []
         for i, c in enumerate(parsed_chunks):
             pid = point_ids[i]
@@ -715,7 +660,6 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
                 continue
             if not ninfo.get("qdrant_id"):
                 to_embed_idxs.append(i)
-
         # If nothing to embed, ensure neo4j contains chunks and update manifest then exit.
         if not to_embed_idxs:
             neo_payload = []
@@ -744,14 +688,12 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
                     log.warning("neo4j write returned error: %s", r)
             except Exception:
                 log.exception("neo4j write failed for %s", raw_key)
-
             indexed_count = 0
             for i, c in enumerate(parsed_chunks):
                 pid = point_ids[i]
                 if exist_map_q.get(pid, False) or neo_info.get(c["chunk_id"], {}).get("exists", False):
                     indexed_count += 1
             manifest["indexed_chunks"] = indexed_count
-
             try:
                 if mode == "s3" and boto_client:
                     write_manifest_s3_atomic(s3_bucket, raw_key, manifest, client=boto_client)
@@ -760,14 +702,12 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
             except Exception:
                 log.exception("failed writing manifest for %s", raw_key)
             return 0
-
         # embed missing
         new_points = []
         embed_texts = [parsed_chunks[i]["text"][:max_tokens] for i in to_embed_idxs]
         if embed_handle is None:
             log.error("embed handle not available; skipping embedding for %s", raw_key)
             return 0
-
         try:
             for i in range(0, len(embed_texts), embed_batch):
                 batch_texts = embed_texts[i:i + embed_batch]
@@ -815,7 +755,6 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
         except Exception as e:
             log.exception("embedding failed for %s: %s", raw_key, e)
             return 0
-
         # re-check existence for new_points to avoid duplicate upserts
         try:
             candidate_ids = [p["id"] for p in new_points]
@@ -826,7 +765,6 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
         except Exception as e:
             log.warning("qdrant existence re-check failed: %s", e)
             exist_after_embed = {}
-
         # filter out already-existing points
         filtered_new_points = []
         for p in new_points:
@@ -835,7 +773,6 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
                 log.debug("Skipping upsert for already-existing point %s", pid)
                 continue
             filtered_new_points.append(p)
-
         # upsert new vectors to Qdrant
         indexed_new = 0
         try:
@@ -848,14 +785,12 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
                     log.warning("qdrant upsert returned error for %s: %s", raw_key, r)
         except Exception as e:
             log.exception("qdrant upsert invocation failed: %s", e)
-
         # After upsert, re-check Neo4j to decide what to write
         try:
             neo_info_final = ray.get(neo4j_actor.get_chunks_info.remote(chunk_ids))
         except Exception as e:
             log.warning("neo4j final existence check failed: %s", e)
             neo_info_final = {cid: {"exists": False, "qdrant_id": None} for cid in chunk_ids}
-
         # write neo4j with the canonical qdrant ids (only where needed)
         neo_payload = []
         for c, pid in zip(parsed_chunks, point_ids):
@@ -886,7 +821,6 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
                     log.warning("neo4j write returned error: %s", r)
         except Exception:
             log.exception("neo4j write failed for %s", raw_key)
-
         # compute indexed_chunks count using final Qdrant and Neo4j state
         try:
             exist_map_final = ray.get(qdrant_actor.check_points_exist.remote(point_ids))
@@ -898,15 +832,12 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
         except Exception as e:
             log.warning("neo4j final existence check failed: %s", e)
             neo_info_final = {cid: {"exists": False, "qdrant_id": None} for cid in chunk_ids}
-
         existing_count = 0
         for i, c in enumerate(parsed_chunks):
             pid = point_ids[i]
             if exist_map_final.get(pid, False) or neo_info_final.get(c["chunk_id"], {}).get("exists", False):
                 existing_count += 1
-
         manifest["indexed_chunks"] = existing_count
-
         try:
             if mode == "s3" and boto_client:
                 write_manifest_s3_atomic(s3_bucket, raw_key, manifest, client=boto_client)
@@ -914,9 +845,7 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
                 write_manifest_local_atomic(raw_key, manifest)
         except Exception:
             log.exception("failed writing manifest for %s", raw_key)
-
         return indexed_new
-
     finally:
         if acquired_lease and neo4j_actor:
             try:
@@ -925,20 +854,16 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
                     log.warning("lease release returned error for %s: %s", raw_key, rel)
             except Exception as e:
                 log.warning("lease release RPC failed for %s: %s", raw_key, e)
-
 # main
 def main():
     _ensure_ray_connected()
     log.info("Connected to Ray (namespace=%s) MODE=%s", RAY_NAMESPACE, MODE)
-
     try:
         _ = get_strict_handle(EMBED_DEPLOYMENT, timeout=10.0)
     except Exception:
         log.warning("embed handle unresolved on driver; workers will resolve")
-
     qdrant_actor = ensure_actor(QdrantWriter, "qdrant_writer", ["check_points_exist", "upsert_points"], QDRANT_URL, QDRANT_API_KEY, QDRANT_COLLECTION, VECTOR_DIM, QDRANT_ON_DISK_PAYLOAD)
     neo4j_actor = ensure_actor(Neo4jWriter, "neo4j_writer", ["bulk_write_chunks", "get_chunks_info", "try_acquire_file_lock", "release_file_lock"], NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
-
     inputs: List[Tuple[str, str]] = []
     if not DATA_IN_LOCAL and S3_BUCKET:
         import boto3
@@ -959,12 +884,10 @@ def main():
                     if f.endswith(".manifest.json"):
                         continue
                     inputs.append(("local", os.path.join(root, f)))
-
     if not inputs:
         log.warning("No raw inputs discovered")
         print("Total indexed chunks: 0")
         return
-
     cfg = {
         "s3_bucket": S3_BUCKET,
         "s3_raw_prefix": S3_RAW_PREFIX,
@@ -976,7 +899,6 @@ def main():
         "force_rehash": FORCE_REHASH,
         "embed_timeout": EMBED_TIMEOUT,
     }
-
     total_indexed = 0
     batch_inputs = int(os.getenv("BATCH_INPUTS", "8"))
     for i in range(0, len(inputs), batch_inputs):
@@ -990,8 +912,6 @@ def main():
                 total_indexed += int(n or 0)
             except Exception as e:
                 log.exception("ingest task failed: %s", e)
-
     print(f"Total indexed chunks: {total_indexed}")
-
 if __name__ == "__main__":
     main()
