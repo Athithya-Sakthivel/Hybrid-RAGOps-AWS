@@ -1,0 +1,3 @@
+name: ray-infra
+runtime: python
+description: Pulumi Python project for Ray head resilience + autoscaler

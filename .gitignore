@@ -18,3 +18,5 @@ models
 .index
 *.log
 log
+infra/pulumi-aws/pulumi-outputs.json
+infra/pulumi-aws/Pulumi.ragops.yaml
