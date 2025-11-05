@@ -33,3 +33,6 @@ pull-repo-from-ray:
 monitor-models:
 	ray status
 	serve status
+
+pulumi-setup:
+	
