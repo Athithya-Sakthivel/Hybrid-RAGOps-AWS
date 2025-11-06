@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # infra/pulumi-aws/pulumi_setup.sh
-# Idempotent create/delete for /workspace/infra/pulumi-aws
+# Idempotent create/delete for infra/pulumi-aws
 # - never modifies __main__.py
 # - uses project-local "venv" (not ".venv")
 # - ensures pulumi uses the venv python via PULUMI_PYTHON_CMD
@@ -14,8 +14,9 @@ fi
 
 # ---------------------------
 # Configuration (deterministic absolute path)
+# Default PROJECT_DIR is relative so repo-local paths like infra/pulumi-aws work.
 # ---------------------------
-export PROJECT_DIR="${PROJECT_DIR:-/workspace/infra/pulumi-aws}"
+export PROJECT_DIR="${PROJECT_DIR:-infra/pulumi-aws}"
 # use 'venv' (project-local)
 export VENV_DIR="${VENV_DIR:-${PROJECT_DIR}/venv}"
 export REQ_FILE="${REQ_FILE:-${PROJECT_DIR}/requirements.txt}"
@@ -48,6 +49,30 @@ abs_path() {
 PROJECT_DIR="$(abs_path "$PROJECT_DIR")"
 VENV_DIR="$(abs_path "$VENV_DIR")"
 REQ_FILE="$(abs_path "$REQ_FILE")"
+
+# Ensure project dir exists early and create placeholder files to avoid FileNotFound
+mkdir -p "$PROJECT_DIR"
+# pulumi outputs placeholder (do not overwrite if present)
+out_json="${PROJECT_DIR}/pulumi-outputs.json"
+if [ ! -f "$out_json" ]; then
+  printf '{}' >"$out_json" || true
+fi
+# pulumi exports script placeholder (do not overwrite if present)
+out_exports="${PROJECT_DIR}/pulumi-exports.sh"
+if [ ! -f "$out_exports" ]; then
+  printf '#!/usr/bin/env bash\n# pulumi exports placeholder\n' >"$out_exports" || true
+  chmod +x "$out_exports" || true
+fi
+# project-level helper placeholder (do not overwrite if present)
+out_setup="${PROJECT_DIR}/pulumi_setup.sh"
+if [ ! -f "$out_setup" ]; then
+  cat >"$out_setup" <<'SH'
+#!/usr/bin/env bash
+# project-level helper placeholder created by infra/pulumi-aws/pulumi_setup.sh
+echo "This is a placeholder helper. It does not modify project source."
+SH
+  chmod +x "$out_setup" || true
+fi
 
 # CLI
 prog="$(basename "$0")"
@@ -549,20 +574,31 @@ pulumi_login_and_run() {
   mv "${out_json}.tmp" "$out_json" || true
 
   out_sh="${PROJECT_DIR}/pulumi-exports.sh"
+  # If outputs file exists and has content, convert to shell exports.
+  # Pass both the JSON input file and the desired output file to the python writer.
   if [ -s "$out_json" ] && command -v python3 >/dev/null 2>&1; then
-    python3 - "$out_sh" <<'PY'
-import json,sys
-fn=sys.argv[1]
-with open(fn) as f:
-    data=json.load(f)
-for k,v in data.items():
-    key="PULUMI_"+k.upper().replace("-","_")
-    if isinstance(v,str):
-        val=v
-    else:
-        val=json.dumps(v)
-    val=val.replace('"','\\"')
-    print(f'export {key}="{val}"')
+    python3 - "$out_json" "$out_sh" <<'PY'
+import json,sys,os
+json_fn = sys.argv[1]
+out_fn = sys.argv[2]
+try:
+    with open(json_fn) as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+tmp = out_fn + ".tmp"
+with open(tmp, "w") as o:
+    o.write("#!/usr/bin/env bash\n# pulumi exports generated\n")
+    for k, v in data.items():
+        key = "PULUMI_" + k.upper().replace("-", "_")
+        if isinstance(v, str):
+            val = v
+        else:
+            val = json.dumps(v)
+        val = val.replace('"', '\\"')
+        o.write(f'export {key}="{val}"\n')
+# atomic replace
+os.replace(tmp, out_fn)
 PY
   else
     printf '#!/usr/bin/env bash\n# pulumi exports placeholder\n' >"$out_sh" || true
@@ -626,7 +662,7 @@ if [ "$MODE" = "create" ]; then
   sleep 3
   create_venv_and_install
 
-  mkdir -p "$PROJECT_DIR"
+  # Ensure Pulumi.yaml exists idempotently
   if [ ! -f "${PROJECT_DIR}/Pulumi.yaml" ]; then
     cat >"${PROJECT_DIR}/Pulumi.yaml" <<YAML
 name: ${STACK}-project
@@ -651,19 +687,7 @@ REQ
 
   pulumi_login_and_run
 
-  # ensure pulumi-outputs.json and pulumi_setup.sh exist idempotently
-  mkdir -p "$PROJECT_DIR"
-  out_json="${PROJECT_DIR}/pulumi-outputs.json"
-  out_setup="${PROJECT_DIR}/pulumi_setup.sh"
-  [ -f "$out_json" ] || printf '{}' >"$out_json" || true
-  if [ ! -f "$out_setup" ]; then
-    cat >"$out_setup" <<'SH'
-#!/usr/bin/env bash
-# project-level helper placeholder created by infra/pulumi-aws/pulumi_setup.sh
-echo "This is a placeholder helper. It does not modify project source."
-SH
-    chmod +x "$out_setup" || true
-  fi
+  # ensure pulumi-outputs.json and pulumi_setup.sh exist idempotently (already created early)
   log "ensure: $out_json and $out_setup present"
   log "CREATE complete"
   exit 0
