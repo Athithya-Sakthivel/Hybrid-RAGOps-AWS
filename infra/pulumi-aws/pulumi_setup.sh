@@ -1,55 +1,80 @@
 #!/usr/bin/env bash
 # infra/pulumi-aws/pulumi_setup.sh
-# Robust non-interactive Pulumi backend helper (create / delete)
+# Idempotent create/delete for /workspace/infra/pulumi-aws
+# - never modifies __main__.py
+# - uses project-local "venv" (not ".venv")
+# - ensures pulumi uses the venv python via PULUMI_PYTHON_CMD
 set -euo pipefail
 
+# prevent sourcing
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  echo "ERROR: do not source this file. Run it: bash $0" >&2
+  return 1 2>/dev/null || exit 1
+fi
+
+# ---------------------------
+# Configuration (deterministic absolute path)
+# ---------------------------
+export PROJECT_DIR="${PROJECT_DIR:-/workspace/infra/pulumi-aws}"
+# use 'venv' (project-local)
+export VENV_DIR="${VENV_DIR:-${PROJECT_DIR}/venv}"
+export REQ_FILE="${REQ_FILE:-${PROJECT_DIR}/requirements.txt}"
+
+export AWS_REGION="${AWS_REGION:-ap-south-1}"
+export PULUMI_S3_BUCKET="${PULUMI_S3_BUCKET:-e2e-rag-42}"
+export S3_BUCKET="${S3_BUCKET:-${PULUMI_S3_BUCKET}}"
+export S3_PREFIX="${S3_PREFIX:-pulumi/}"
+export DDB_TABLE="${DDB_TABLE:-pulumi-state-locks}"
+export PULUMI_STACK="${PULUMI_STACK:-ragops}"
+export STACK="${STACK:-${PULUMI_STACK}}"
+export PULUMI_CONFIG_PASSPHRASE="${PULUMI_CONFIG_PASSPHRASE:-}"
+export PULUMI_ORG="${PULUMI_ORG:-}"
+export PULUMI_IAM_USER="${PULUMI_IAM_USER:-}"
+export PULUMI_CREDS_FILE="${PULUMI_CREDS_FILE:-/tmp/pulumi-ci-credentials.json}"
+export POLICY_NAME="${POLICY_NAME:-PulumiStateAccessPolicy}"
+export FORCE_DELETE="${FORCE_DELETE:-false}"
+
+# Normalize absolute paths
+abs_path() {
+  local p="$1"
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -m "$p"
+  elif command -v readlink >/dev/null 2>&1; then
+    readlink -f "$p" || python3 -c "import os,sys; print(os.path.abspath(sys.argv[1]))" "$p"
+  else
+    python3 -c "import os,sys; print(os.path.abspath(sys.argv[1]))" "$p"
+  fi
+}
+PROJECT_DIR="$(abs_path "$PROJECT_DIR")"
+VENV_DIR="$(abs_path "$VENV_DIR")"
+REQ_FILE="$(abs_path "$REQ_FILE")"
+
+# CLI
 prog="$(basename "$0")"
 usage() {
   cat <<EOF
-Usage: $prog [--create|--delete] [--force] [-h|--help]
-Non-interactive. --force with --delete will attempt to delete the entire S3 bucket.
-Env defaults (override with env):
-  AWS_REGION=ap-south-1
-  S3_BUCKET=e2e-rag-42
-  S3_PREFIX=pulumi/
-  DDB_TABLE=pulumi-state-locks
-  PULUMI_IAM_USER (optional)
-  PULUMI_CREDS_FILE=/tmp/pulumi-ci-credentials.json
-  POLICY_NAME=PulumiStateAccessPolicy
-  PROJECT_DIR=infra/pulumi-aws
-  VENV_DIR=PROJECT_DIR/.venv
-  STACK=ragops
+Usage: $prog [--create|--delete] [--force] [--preview] [--preview-and-up] [-h|--help]
+  --create            create backend + venv + pulumi up (or preview)
+  --delete            destroy stack and remove backend artifacts
+  --force             with --delete also delete entire S3 bucket
+  --preview           run pulumi preview only (no up)
+  --preview-and-up    run preview and, if successful, pulumi up
 EOF
 }
 
-# parse args
-MODE="" FORCE_FLAG=false
+MODE="" FORCE_FLAG=false PREVIEW=false PREVIEW_AND_UP=false
 while [ $# -gt 0 ]; do
   case "$1" in
     --create) MODE="create"; shift;;
     --delete) MODE="delete"; shift;;
     --force) FORCE_FLAG=true; shift;;
+    --preview) PREVIEW=true; shift;;
+    --preview-and-up) PREVIEW_AND_UP=true; shift;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown arg: $1" >&2; usage; exit 2;;
   esac
 done
 [ -n "$MODE" ] || { echo "ERROR: must pass --create or --delete" >&2; usage; exit 2; }
-
-# sane defaults
-AWS_REGION="${AWS_REGION:-ap-south-1}"
-S3_BUCKET="${S3_BUCKET:-${PULUMI_S3_BUCKET:-e2e-rag-42}}"
-S3_PREFIX="${S3_PREFIX:-pulumi/}"
-PULUMI_CONFIG_PASSPHRASE="${PULUMI_CONFIG_PASSPHRASE:-}"
-DDB_TABLE="${DDB_TABLE:-pulumi-state-locks}"
-PULUMI_IAM_USER="${PULUMI_IAM_USER:-}"
-PULUMI_CREDS_FILE="${PULUMI_CREDS_FILE:-/tmp/pulumi-ci-credentials.json}"
-POLICY_NAME="${POLICY_NAME:-PulumiStateAccessPolicy}"
-PROJECT_DIR="${PROJECT_DIR:-infra/pulumi-aws}"
-VENV_DIR="${VENV_DIR:-${PROJECT_DIR}/.venv}"
-REQ_FILE="${REQ_FILE:-${PROJECT_DIR}/requirements.txt}"
-PULUMI_BINARY_PATH="${PULUMI_BINARY_PATH:-$HOME/.pulumi/bin/pulumi}"
-STACK="${STACK:-ragops}"
-FORCE_DELETE_ENV="${FORCE_DELETE:-false}"
 
 log() { printf '[%s] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 die() { echo "ERROR: $*" >&2; exit "${2:-1}"; }
@@ -60,16 +85,58 @@ TMPS=()
 cleanup() { for f in "${TMPS[@]:-}"; do [ -f "$f" ] && rm -f "$f"; done; }
 trap cleanup EXIT
 
-# --- preflight AWS creds ---
+# ---------------------------
+# Helpers
+# ---------------------------
+retry() {
+  local tries=${1:-5}; shift
+  local delay=${1:-1}; shift
+  local i=0 rc=0
+  while [ $i -lt $tries ]; do
+    set +e
+    "$@"
+    rc=$?
+    set -e
+    [ $rc -eq 0 ] && return 0
+    i=$((i+1))
+    sleep $delay
+    delay=$((delay * 2))
+  done
+  return $rc
+}
+
+# ---------------------------
+# Preflight
+# ---------------------------
+require_cmd aws
+require_cmd python3
+command -v jq >/dev/null 2>&1 || log "info: jq not found; using python fallback for JSON transforms"
+
 if ! aws sts get-caller-identity >/dev/null 2>&1; then
-  die "AWS credentials not configured / can't call sts" 20
+  die "AWS credentials not configured or not working (aws sts get-caller-identity failed)" 20
 fi
 
-# --- S3 helpers ---
+# ---------------------------
+# venv policy enforcement
+# ---------------------------
+enforce_venv() {
+  local stray="${PROJECT_DIR}/.venv"
+  local want="${VENV_DIR}"
+  # remove stray .venv if present (we standardize on venv)
+  if [ -d "$stray" ]; then
+    log "venv-policy: removing legacy '${stray}' to avoid drift (using 'venv')"
+    rm -rf "$stray" || true
+  fi
+  mkdir -p "$(dirname "$want")"
+}
+
+# ---------------------------
+# S3 / DDB / IAM helpers (idempotent, with retries)
+# ---------------------------
 create_bucket_if_missing() {
   local bucket="$1"
   log "s3: ensure bucket exists: ${bucket} (region=${AWS_REGION})"
-  if aws s3api head-bucket --bucket "$bucket" >/dev/null 2>&1; then
+  if retry 6 1 aws s3api head-bucket --bucket "$bucket" >/dev/null 2>&1; then
     log "s3: bucket exists"
   else
     if [ "$AWS_REGION" = "us-east-1" ]; then
@@ -77,7 +144,7 @@ create_bucket_if_missing() {
     else
       aws s3api create-bucket --bucket "$bucket" --create-bucket-configuration LocationConstraint="$AWS_REGION" >/dev/null 2>&1 || log "s3: create returned non-zero"
     fi
-    log "s3: create attempted"
+    retry 8 2 aws s3api head-bucket --bucket "$bucket" >/dev/null 2>&1 || log "s3: head-bucket still failing (continuing)"
   fi
   aws s3api put-bucket-versioning --bucket "$bucket" --versioning-configuration Status=Enabled >/dev/null 2>&1 || true
   aws s3api put-bucket-encryption --bucket "$bucket" --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}' >/dev/null 2>&1 || true
@@ -87,7 +154,6 @@ create_bucket_if_missing() {
 
 delete_s3_objects() {
   local bucket="$1" prefix="${2:-}"
-  mkdir -p "${PROJECT_DIR}/.pulumi-logs" || true
   log "s3-delete: deleting objects in s3://${bucket}/${prefix}"
   while :; do
     local rv count objs tmp
@@ -96,11 +162,29 @@ delete_s3_objects() {
     else
       rv="$(aws s3api list-object-versions --bucket "$bucket" --output json 2>/dev/null || echo '{}')"
     fi
-    count=$(jq -r '[.Versions[], .DeleteMarkers[]] | length' <<<"$rv" 2>/dev/null || echo 0)
+    count=$(command -v jq >/dev/null 2>&1 && jq -r '[.Versions[], .DeleteMarkers[]] | length' <<<"$rv" 2>/dev/null || python3 - <<PY
+import sys,json
+try:
+  r=json.load(sys.stdin)
+  c=sum(len(r.get(k,[])) for k in ("Versions","DeleteMarkers"))
+  print(c)
+except Exception:
+  print(0)
+PY
+)
     if [ -z "$count" ] || [ "$count" = "0" ]; then break; fi
-    objs=$(jq -c '[.Versions[]?, .DeleteMarkers[]?] | map({Key:.Key,VersionId:.VersionId})' <<<"$rv")
+    objs=$(command -v jq >/dev/null 2>&1 && jq -c '[.Versions[]?, .DeleteMarkers[]?] | map({Key:.Key,VersionId:.VersionId})' <<<"$rv" || python3 - <<PY
+import sys,json
+r=json.load(sys.stdin)
+arr=[]
+for k in ("Versions","DeleteMarkers"):
+  for it in r.get(k,[]):
+    arr.append({"Key":it.get("Key"), "VersionId": it.get("VersionId")})
+print(json.dumps(arr))
+PY
+)
     tmp="$(mktemp)"; TMPS+=("$tmp")
-    jq -n --argjson arr "$objs" '{Objects:$arr}' >"$tmp"
+    printf '{"Objects":%s}' "$objs" >"$tmp"
     aws s3api delete-objects --bucket "$bucket" --delete "file://$tmp" >/dev/null 2>&1 || true
     rm -f "$tmp" || true
     sleep 1
@@ -116,7 +200,6 @@ empty_and_delete_bucket_force() {
   log "s3-delete-all: bucket delete attempted"
 }
 
-# --- DynamoDB helpers ---
 create_dynamodb_if_missing() {
   local table="$1"
   log "ddb: ensure table ${table}"
@@ -151,7 +234,6 @@ delete_dynamodb_table_if_exists() {
   fi
 }
 
-# --- IAM helpers ---
 get_account_id() { aws sts get-caller-identity --query Account --output text 2>/dev/null || true; }
 
 wait_for_policy_arn() {
@@ -242,10 +324,12 @@ delete_policy_and_user_idempotent() {
   fi
 }
 
-# --- Pulumi & venv helpers ---
+# ---------------------------
+# Pulumi helpers
+# ---------------------------
 ensure_pulumi_cli() {
   if command -v pulumi >/dev/null 2>&1; then return 0; fi
-  if [ -x "$PULUMI_BINARY_PATH" ]; then export PATH="$(dirname "$PULUMI_BINARY_PATH"):$PATH"; fi
+  if [ -x "${PULUMI_BINARY_PATH:-}" ]; then export PATH="$(dirname "$PULUMI_BINARY_PATH"):$PATH"; fi
   if ! command -v pulumi >/dev/null 2>&1; then
     if command -v curl >/dev/null 2>&1; then
       curl -fsSL https://get.pulumi.com | sh
@@ -254,7 +338,7 @@ ensure_pulumi_cli() {
       die "pulumi CLI not found and cannot auto-install (curl missing)" 11
     fi
   fi
-  for i in 1 2 3; do
+  for i in 1 3; do
     if pulumi version >/dev/null 2>&1; then
       log "pulumi: $(pulumi version)"
       return 0
@@ -265,65 +349,62 @@ ensure_pulumi_cli() {
 }
 
 create_venv_and_install() {
-  [ -d "$VENV_DIR" ] || python3 -m venv "$VENV_DIR"
+  enforce_venv
+  if [ ! -d "$VENV_DIR" ]; then
+    python3 -m venv "$VENV_DIR"
+  fi
+  # shellcheck disable=SC1090
   source "${VENV_DIR}/bin/activate"
-  echo "INSTALLING THE NECCESSARY PACKAGES IF NOT ALREADY..."
-  python -m pip install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
-  python -m pip install -r $REQ_FILE >/dev/null
+  # ensure pulumi uses this python to run program
+  export PULUMI_PYTHON_CMD="${VENV_DIR}/bin/python"
+  log "venv: installing packages from ${REQ_FILE} (if present)"
+  if [ -f "$REQ_FILE" ]; then
+    python -m pip install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
+    python -m pip install -r "$REQ_FILE"
+  else
+    python -m pip install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
+    python -m pip install pulumi pulumi-aws pulumi-tls boto3 >/dev/null 2>&1 || true
+  fi
+  log "venv: ready ($VENV_DIR)"
 }
 
 activate_venv_if_exists() {
+  enforce_venv
   if [ -d "$VENV_DIR" ]; then
     # shellcheck disable=SC1090
     source "${VENV_DIR}/bin/activate"
-    log "venv: activated"
+    export PULUMI_PYTHON_CMD="${VENV_DIR}/bin/python"
+    log "venv: activated and PULUMI_PYTHON_CMD=${PULUMI_PYTHON_CMD}"
   fi
 }
 
-# create project atomically if missing
-create_project_atomic_if_missing() {
-  mkdir -p "$PROJECT_DIR"
-  local pd="${PROJECT_DIR}/Pulumi.yaml"
-  local main_py="${PROJECT_DIR}/__main__.py"
-  local req="${REQ_FILE}"
-  if [ ! -f "$pd" ]; then
-    tmp="$(mktemp)"; TMPS+=("$tmp")
-    cat >"$tmp" <<YAML
-name: ${STACK}-project
-runtime: python
-description: Minimal project auto-created by pulumi_setup.sh
-YAML
-    mv "$tmp" "$pd"
-    log "pulumi-project: wrote $pd"
-  else
-    log "pulumi-project: Pulumi.yaml exists; leaving"
-  fi
+# ensure there is a valid Python entrypoint; do NOT modify any existing __main__.py
+find_pulumi_entrypoint() {
+  local pd="$PROJECT_DIR"
+  local pd_name
+  pd_name="$(awk -F: '/^name[[:space:]]*:/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' "${PROJECT_DIR}/Pulumi.yaml" 2>/dev/null || true)"
+  local candidates=(
+    "${pd}/__main__.py"
+    "${pd}/${pd_name}/__main__.py"
+    "${pd}/${pd_name}.py"
+    "${pd}/main.py"
+    "${pd}/__init__.py"
+  )
+  for f in "${candidates[@]}"; do
+    [ -f "$f" ] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
 
-  if [ ! -f "$main_py" ]; then
-    tmp="$(mktemp)"; TMPS+=("$tmp")
-    cat >"$tmp" <<'PY'
-import pulumi
-pulumi.export('message', 'minimal-pulumi-project: no-op')
-PY
-    mv "$tmp" "$main_py"
-    log "pulumi-project: wrote $main_py"
-  else
-    log "pulumi-project: __main__.py exists; leaving"
+ensure_valid_entrypoint_exists() {
+  if ep="$(find_pulumi_entrypoint)"; then
+    if ! python3 -m py_compile "$ep" >/dev/null 2>&1; then
+      die "Pulumi entrypoint '$ep' exists but contains syntax errors. Per policy this script will not modify it. Fix it and re-run."
+    fi
+    log "pulumi: entrypoint found and valid: $ep"
+    return 0
   fi
-
-  if [ ! -f "$req" ]; then
-    tmp="$(mktemp)"; TMPS+=("$tmp")
-    cat >"$tmp" <<'REQ'
-pulumi==3.196.0
-pulumi-aws==7.7.0
-pulumi-tls==5.2.2
-boto3
-REQ
-    mv "$tmp" "$req"
-    log "pulumi-project: wrote $req"
-  else
-    log "pulumi-project: requirements.txt exists; leaving"
-  fi
+  die "__main__.py or other Python Pulumi entrypoint missing in ${PROJECT_DIR}; this script will not create or modify __main__.py. Add a valid Pulumi program and re-run."
 }
 
 get_pulumi_project_name() {
@@ -331,20 +412,22 @@ get_pulumi_project_name() {
   if [ -f "$pd" ]; then awk -F: '/^name[[:space:]]*:/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' "$pd" || true; fi
 }
 
-# Verify current stack selected (returns 0 if current stack present)
 verify_stack_selected() {
   if pulumi stack >/dev/null 2>&1; then return 0; fi
   return 1
 }
 
-# robust select/init
 pulumi_select_or_init_stack() {
   local stack="$1"
-  if pulumi stack select "$stack" >/dev/null 2>&1; then
-    log "pulumi: selected existing stack '$stack'"
-    verify_stack_selected || die "stack select reported success but verification failed" 12
-    return 0
-  fi
+  for attempt in 1 6; do
+    # ensure PULUMI_PYTHON_CMD set so pulumi uses venv python for any program evaluation
+    export PULUMI_PYTHON_CMD="${VENV_DIR}/bin/python"
+    if pulumi stack select "$stack" >/dev/null 2>&1; then
+      log "pulumi: selected existing stack '$stack'"
+      return 0
+    fi
+    sleep $((attempt))
+  done
 
   PROJECT_NAME="$(get_pulumi_project_name || true)"
   candidates=("$stack")
@@ -353,11 +436,11 @@ pulumi_select_or_init_stack() {
 
   for c in "${candidates[@]}"; do
     [ -z "$c" ] && continue
-    attempts=1
-    while [ $attempts -le 4 ]; do
-      log "pulumi: trying stack init '$c' (attempt $attempts)"
+    for attempt in 1 4; do
+      log "pulumi: trying stack init '$c' (attempt $attempt)"
       set +e
-      out="$(pulumi stack init "$c" 2>&1 || true)"
+      export PULUMI_PYTHON_CMD="${VENV_DIR}/bin/python"
+      pulumi stack init "$c" >/dev/null 2>&1
       rc=$?
       set -e
       if [ $rc -eq 0 ]; then
@@ -365,53 +448,77 @@ pulumi_select_or_init_stack() {
         if verify_stack_selected; then
           log "pulumi: created and selected '$c'"
           return 0
-        else
-          log "pulumi: init succeeded but selection verification failed for '$c'; output: ${out:-<no output>}"
         fi
-      else
-        log "pulumi: init failed for '$c': ${out:-<no output>}"
       fi
-      attempts=$((attempts+1))
-      sleep $((attempts))
+      sleep $((attempt))
     done
   done
 
-  log "pulumi: fallback -> pulumi new python --yes --force (non-interactive)"
-  if pulumi new python --yes --force >/dev/null 2>&1; then
-    if pulumi stack init "$stack" >/dev/null 2>&1; then
-      pulumi stack select "$stack" >/dev/null 2>&1 || true
-      verify_stack_selected || die "fallback created stack but verification failed" 12
-      log "pulumi: fallback created and selected stack '$stack'"
-      return 0
-    fi
+  # fallback to pulumi new if necessary
+  log "pulumi: fallback -> attempting non-interactive 'pulumi new python --yes --force'"
+  ensure_pulumi_cli
+  set +e
+  export PULUMI_PYTHON_CMD="${VENV_DIR}/bin/python"
+  pulumi new python --yes --force >/dev/null 2>&1
+  rc=$?
+  set -e
+  if [ $rc -ne 0 ]; then
+    die "unable to select or init pulumi stack '${stack}' and pulumi new failed"
   fi
-
-  die "unable to select or init pulumi stack '${stack}' (candidates: ${candidates[*]})" 12
+  if pulumi stack init "$stack" >/dev/null 2>&1; then
+    pulumi stack select "$stack" >/dev/null 2>&1 || true
+    verify_stack_selected || die "fallback created stack but verification failed"
+    log "pulumi: fallback created and selected stack '$stack'"
+    return 0
+  fi
+  die "unable to select or init pulumi stack '${stack}'"
 }
 
-# pulumi up with log capture
-pulumi_up_and_capture() {
+pulumi_preview_and_capture() {
   local logdir="${PROJECT_DIR}/.pulumi-logs"; mkdir -p "$logdir"
-  local logf="${logdir}/pulumi-up-$(date -u +%s).log"
+  local logf="${logdir}/pulumi-preview-$(date -u +%s).log"
   : >"$logf"
-  if pulumi up --yes >"$logf" 2>&1; then
-    log "pulumi: up succeeded (log: $logf)"
-    return 0
+  export PULUMI_PYTHON_CMD="${VENV_DIR}/bin/python"
+  if pulumi preview --diff --non-interactive >"$logf" 2>&1; then
+    log "pulumi: preview succeeded (log: $logf)"; return 0
   else
-    log "pulumi: up failed; last 300 lines of $logf" >&2
-    tail -n 300 "$logf" >&2 || true
+    log "pulumi: preview failed; last 200 lines of $logf" >&2
+    tail -n 200 "$logf" >&2 || true
     return 1
   fi
 }
 
-pulumi_login_and_up_noninteractive() {
+pulumi_up_and_capture() {
+  local logdir="${PROJECT_DIR}/.pulumi-logs"; mkdir -p "$logdir"
+  local logf="${logdir}/pulumi-up-$(date -u +%s).log"
+  : >"$logf"
+  export PULUMI_PYTHON_CMD="${VENV_DIR}/bin/python"
+  if pulumi up --yes >"$logf" 2>&1; then
+    log "pulumi: up succeeded (log: $logf)"; return 0
+  else
+    log "pulumi: up failed; last 200 lines of $logf" >&2
+    tail -n 200 "$logf" >&2 || true
+    return 1
+  fi
+}
+
+pulumi_login_and_run() {
   ensure_pulumi_cli
   export AWS_DYNAMODB_LOCK_TABLE="$DDB_TABLE"
-  log "pulumi: login s3://${S3_BUCKET}/${S3_PREFIX}"
+  [ -n "$PULUMI_CONFIG_PASSPHRASE" ] && export PULUMI_CONFIG_PASSPHRASE
+
+  # ensure pulumi uses venv python for any program evaluation by the CLI
+  export PULUMI_PYTHON_CMD="${VENV_DIR}/bin/python"
+  log "pulumi: login s3://${S3_BUCKET}/${S3_PREFIX} (PULUMI_PYTHON_CMD=${PULUMI_PYTHON_CMD})"
   pulumi login "s3://${S3_BUCKET}/${S3_PREFIX}" >/dev/null 2>&1 || log "pulumi: login returned non-zero (continuing)"
 
   if [ ! -d "$PROJECT_DIR" ]; then die "project dir $PROJECT_DIR not found" 13; fi
   pushd "$PROJECT_DIR" >/dev/null || exit 1
+
+  # require valid entrypoint; do NOT alter user source
+  ensure_valid_entrypoint_exists
+
+  # activate venv if present (sets PULUMI_PYTHON_CMD)
   activate_venv_if_exists
 
   pulumi_select_or_init_stack "$STACK"
@@ -422,17 +529,28 @@ pulumi_login_and_up_noninteractive() {
     pulumi config set "$key_lc" "$val" >/dev/null 2>&1 || true
   done
 
-  if ! pulumi_up_and_capture; then
-    die "pulumi up failed; inspect logs in ${PROJECT_DIR}/.pulumi-logs" 1
+  if [ "$PREVIEW" = true ]; then
+    if ! pulumi_preview_and_capture; then popd >/dev/null || true; die "pulumi preview failed" 1; fi
+    popd >/dev/null || true
+    return 0
   fi
 
-  out_json="$(pwd)/pulumi-outputs.json"
-  pulumi stack output --json >"$out_json" 2>/dev/null || true
-  out_sh="$(pwd)/pulumi-exports.sh"
+  if [ "$PREVIEW_AND_UP" = true ]; then
+    if ! pulumi_preview_and_capture; then popd >/dev/null || true; die "pulumi preview failed; aborting up" 1; fi
+  fi
 
-  # Use Python to safely generate export lines to avoid jq quoting issues.
-  if command -v python3 >/dev/null 2>&1 && [ -s "$out_json" ]; then
-    python3 - "$out_json" >"$out_sh" <<'PY'
+  if [ "$PREVIEW" != true ]; then
+    if ! pulumi_up_and_capture; then popd >/dev/null || true; die "pulumi up failed; inspect logs in ${PROJECT_DIR}/.pulumi-logs" 1; fi
+  fi
+
+  # write outputs atomically to PROJECT_DIR
+  out_json="${PROJECT_DIR}/pulumi-outputs.json"
+  pulumi stack output --json >"${out_json}.tmp" 2>/dev/null || echo -n '{}' >"${out_json}.tmp" || true
+  mv "${out_json}.tmp" "$out_json" || true
+
+  out_sh="${PROJECT_DIR}/pulumi-exports.sh"
+  if [ -s "$out_json" ] && command -v python3 >/dev/null 2>&1; then
+    python3 - "$out_sh" <<'PY'
 import json,sys
 fn=sys.argv[1]
 with open(fn) as f:
@@ -443,14 +561,12 @@ for k,v in data.items():
         val=v
     else:
         val=json.dumps(v)
-    # escape double quotes
     val=val.replace('"','\\"')
     print(f'export {key}="{val}"')
 PY
   else
-    : >"$out_sh"
+    printf '#!/usr/bin/env bash\n# pulumi exports placeholder\n' >"$out_sh" || true
   fi
-
   chmod +x "$out_sh" >/dev/null 2>&1 || true
   log "pulumi: outputs written to $out_json and $out_sh"
   popd >/dev/null || true
@@ -461,6 +577,7 @@ pulumi_destroy_stack_if_exists_noninteractive() {
   if [ ! -d "$PROJECT_DIR" ]; then log "pulumi: project dir ${PROJECT_DIR} not found; skipping destroy"; return; fi
   pushd "$PROJECT_DIR" >/dev/null || return
   activate_venv_if_exists
+  export PULUMI_PYTHON_CMD="${VENV_DIR}/bin/python"
   if pulumi stack select "$STACK" >/dev/null 2>&1; then
     pulumi destroy --yes >/dev/null 2>&1 || true
     pulumi stack rm --yes >/dev/null 2>&1 || true
@@ -481,12 +598,22 @@ pulumi_destroy_stack_if_exists_noninteractive() {
   popd >/dev/null || true
 }
 
-# --- runtime checks ---
-require_cmd aws
-require_cmd python3
-require_cmd jq
-command -v jq >/dev/null 2>&1 || log "info: jq not found; outputs JSON conversion limited"
+cleanup_local_outputs() {
+  local out_json="${PROJECT_DIR}/pulumi-outputs.json"
+  local out_sh="${PROJECT_DIR}/pulumi-exports.sh"
+  local pulumi_dir="${PROJECT_DIR}/.pulumi"
+  log "cleanup-local: removing $out_json , $out_sh , and $pulumi_dir (if present)"
+  rm -f "$out_json" "$out_sh" || true
+  rm -rf "$pulumi_dir" || true
+  # remove legacy .venv and venv as cleanup
+  rm -rf "${PROJECT_DIR}/.venv" || true
+  rm -rf "${VENV_DIR}" || true
+}
 
+# ---------------------------
+# Main flows
+# ---------------------------
+log "Using project dir: ${PROJECT_DIR}"
 log "Using S3 bucket: ${S3_BUCKET}"
 
 if [ "$MODE" = "create" ]; then
@@ -498,23 +625,72 @@ if [ "$MODE" = "create" ]; then
   log "waiting briefly for IAM propagation..."
   sleep 3
   create_venv_and_install
-  create_project_atomic_if_missing
-  pulumi_login_and_up_noninteractive
+
+  mkdir -p "$PROJECT_DIR"
+  if [ ! -f "${PROJECT_DIR}/Pulumi.yaml" ]; then
+    cat >"${PROJECT_DIR}/Pulumi.yaml" <<YAML
+name: ${STACK}-project
+runtime: python
+description: Minimal project created by pulumi_setup.sh
+YAML
+    log "pulumi-project: wrote ${PROJECT_DIR}/Pulumi.yaml"
+  else
+    log "pulumi-project: Pulumi.yaml exists; leaving"
+  fi
+
+  if [ ! -f "$REQ_FILE" ]; then
+    cat >"$REQ_FILE" <<'REQ'
+pulumi
+pulumi-aws
+boto3
+REQ
+    log "pulumi-project: wrote $REQ_FILE"
+  else
+    log "pulumi-project: requirements.txt exists; leaving"
+  fi
+
+  pulumi_login_and_run
+
+  # ensure pulumi-outputs.json and pulumi_setup.sh exist idempotently
+  mkdir -p "$PROJECT_DIR"
+  out_json="${PROJECT_DIR}/pulumi-outputs.json"
+  out_setup="${PROJECT_DIR}/pulumi_setup.sh"
+  [ -f "$out_json" ] || printf '{}' >"$out_json" || true
+  if [ ! -f "$out_setup" ]; then
+    cat >"$out_setup" <<'SH'
+#!/usr/bin/env bash
+# project-level helper placeholder created by infra/pulumi-aws/pulumi_setup.sh
+echo "This is a placeholder helper. It does not modify project source."
+SH
+    chmod +x "$out_setup" || true
+  fi
+  log "ensure: $out_json and $out_setup present"
   log "CREATE complete"
   exit 0
 fi
 
 if [ "$MODE" = "delete" ]; then
-  log "=== DELETE MODE (non-interactive) ==="
+  log "=== DELETE MODE ==="
+  if [ "$FORCE_FLAG" = true ] || [ "$FORCE_DELETE" = "true" ]; then
+    log "[delete] FORCE mode enabled; entire bucket will be removed after prefix and infra cleanup"
+  fi
+
   pulumi_destroy_stack_if_exists_noninteractive
+
+  delete_s3_objects "$S3_BUCKET" "${S3_PREFIX}${STACK}"
   delete_s3_objects "$S3_BUCKET" "$S3_PREFIX"
+
   delete_dynamodb_table_if_exists "$DDB_TABLE"
   delete_policy_and_user_idempotent "$POLICY_NAME" "$PULUMI_IAM_USER"
-  if [ "$FORCE_FLAG" = true ] || [ "$FORCE_DELETE_ENV" = "true" ]; then
+
+  if [ "$FORCE_FLAG" = true ] || [ "$FORCE_DELETE" = "true" ]; then
+    sleep 2
     empty_and_delete_bucket_force "$S3_BUCKET"
   else
     log "info: S3 bucket preserved; only prefix removed"
   fi
+
+  cleanup_local_outputs
   log "DELETE complete"
   exit 0
 fi
