@@ -1,9 +1,7 @@
-#!/usr/bin/env bash
 set -euo pipefail
-REGION="${AWS_REGION:-us-east-1}"
 HEAD_DNS="${HEAD_DNS:-ray-head.prod.internal.example.com:6379}"
 SSM_REDIS_PARAM="${SSM_REDIS_PARAM:-/ray/prod/redis_password}"
-
+REGION="${REGION:-us-east-1}"
 fetch_redis_password(){
   for i in $(seq 1 6); do
     val=$(aws ssm get-parameter --name "$SSM_REDIS_PARAM" --with-decryption --region "$REGION" --query "Parameter.Value" --output text 2>/dev/null || true)
@@ -15,9 +13,7 @@ fetch_redis_password(){
   done
   return 1
 }
-
 REDIS_PASSWORD=$(fetch_redis_password || echo "")
-
 while true; do
   if ! pgrep -f "ray.*start" >/dev/null 2>&1; then
     ray stop || true

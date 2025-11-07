@@ -17,7 +17,7 @@ ENABLE_HEAD = os.getenv("ENABLE_HEAD", "true").lower() != "false"
 
 # Try to import optional modules
 _prereqs = None
-_networking = None
+_auth = None
 _iam = None
 _renderer = None
 _head = None
@@ -30,11 +30,11 @@ except ImportError:
     log("prerequisites module not present; skipping import")
 
 try:
-    import networking as networking
-    _networking = networking
-    log("networking module loaded")
+    import auth as auth
+    _auth = auth
+    log("auth module loaded")
 except ImportError:
-    log("networking module not present; skipping import")
+    log("auth module not present; skipping import")
 
 try:
     import iam as iam
@@ -89,39 +89,48 @@ if _prereqs and ENABLE_PREREQS:
 else:
     log("Skipping prerequisites step (module missing or disabled)")
 
-# --- NETWORKING ---
-if _networking and ENABLE_NETWORKING:
-    log("Running networking step")
+# --- NETWORKING / AUTH (now via auth.create_auth) ---
+if _auth and ENABLE_NETWORKING:
+    log("Running auth (networking + auth) step")
     try:
-        if hasattr(_networking, "create_network"):
-            # read some env-driven defaults; caller can still pass args if desired
+        if hasattr(_auth, "create_auth"):
+            # read env-driven defaults; caller can still pass args if desired
             multi_az = os.getenv("MULTI_AZ_DEPLOYMENT", "false").lower() == "true"
             no_nat = os.getenv("NO_NAT", "false").lower() == "true"
             create_vpc_endpoints = os.getenv("CREATE_VPC_ENDPOINTS", "false").lower() == "true"
-            net = _networking.create_network(name=os.getenv("NETWORK_NAME", "ray"),
-                                             multi_az=multi_az,
-                                             no_nat=no_nat,
-                                             create_vpc_endpoints=create_vpc_endpoints)
-            resources["network"] = net
-            outputs["vpc_id"] = net["vpc"].id if net.get("vpc") else None
-            # export lists as Pulumi Outputs where available
-            pub = net.get("public_subnets") or []
-            priv = net.get("private_subnets") or []
-            outputs["public_subnet_ids"] = [s.id for s in pub] if pub else None
-            outputs["private_subnet_ids"] = [s.id for s in priv] if priv else None
-        else:
-            # try to pick top-level items
-            vpc = getattr(_networking, "vpc", None)
-            public_subnets = getattr(_networking, "public_subnets", None)
-            private_subnets = getattr(_networking, "private_subnets", None)
-            resources["network"] = {"vpc": vpc, "public_subnets": public_subnets, "private_subnets": private_subnets}
+            auth_res = _auth.create_auth(name=os.getenv("NETWORK_NAME", "ray"),
+                                         multi_az=multi_az,
+                                         no_nat=no_nat,
+                                         create_vpc_endpoints=create_vpc_endpoints)
+            resources["network"] = auth_res.get("network") if auth_res.get("network") else auth_res
+            # Export network outputs (maintain compatibility)
+            net = auth_res.get("network") or {}
+            vpc = net.get("vpc") if isinstance(net, dict) else getattr(net, "vpc", None)
+            public_subnets = net.get("public_subnets") if isinstance(net, dict) else getattr(net, "public_subnets", None)
+            private_subnets = net.get("private_subnets") if isinstance(net, dict) else getattr(net, "private_subnets", None)
             outputs["vpc_id"] = getattr(vpc, "id", None)
-            if private_subnets:
-                outputs["private_subnet_ids"] = [s.id for s in private_subnets]
+            outputs["public_subnet_ids"] = [s.id for s in (public_subnets or [])] if public_subnets else None
+            outputs["private_subnet_ids"] = [s.id for s in (private_subnets or [])] if private_subnets else None
+
+            # pass through auth-related outputs if present
+            if auth_res.get("alb"):
+                outputs["alb_dns"] = auth_res["alb"].dns_name
+            if auth_res.get("tg"):
+                outputs["target_group_arn"] = auth_res["tg"].arn
+            if auth_res.get("user_pool"):
+                outputs["cognito_user_pool_id"] = auth_res["user_pool"].id
+            if auth_res.get("user_pool_client"):
+                outputs["cognito_user_pool_client_id"] = auth_res["user_pool_client"].id
+            if auth_res.get("user_pool_domain"):
+                outputs["cognito_user_pool_domain"] = auth_res["user_pool_domain"].domain
+            if auth_res.get("certificate_arn"):
+                outputs["certificate_arn"] = auth_res["certificate_arn"]
+        else:
+            log("auth module present but exposes no create_auth(); skipping")
     except Exception as e:
-        log(f"networking.create_network() failed: {e}")
+        log(f"auth.create_auth() failed: {e}")
 else:
-    log("Skipping networking step (module missing or disabled)")
+    log("Skipping auth/networking step (module missing or disabled)")
 
 # --- IAM ---
 if _iam and ENABLE_IAM:
@@ -237,7 +246,7 @@ for k, v in outputs.items():
 
 log("__main__.py completed. Modules executed: " +
     f"prereqs={bool(_prereqs and ENABLE_PREREQS)}, " +
-    f"networking={bool(_networking and ENABLE_NETWORKING)}, " +
+    f"auth={bool(_auth and ENABLE_NETWORKING)}, " +
     f"iam={bool(_iam and ENABLE_IAM)}, " +
     f"renderer={bool(_renderer and ENABLE_RENDERER)}, " +
     f"head={bool(_head and ENABLE_HEAD)}")
