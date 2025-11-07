@@ -26,14 +26,14 @@ export PULUMI_S3_BUCKET="${PULUMI_S3_BUCKET:-e2e-rag-42}"
 export S3_BUCKET="${S3_BUCKET:-${PULUMI_S3_BUCKET}}"
 export S3_PREFIX="${S3_PREFIX:-pulumi/}"
 export DDB_TABLE="${DDB_TABLE:-pulumi-state-locks}"
-export PULUMI_STACK="${PULUMI_STACK:-ragops}"
+export PULUMI_STACK="${PULUMI_STACK:-prod}"
 export STACK="${STACK:-${PULUMI_STACK}}"
-export PULUMI_CONFIG_PASSPHRASE="${PULUMI_CONFIG_PASSPHRASE:-}"
+export PULUMI_CONFIG_PASSPHRASE="${PULUMI_CONFIG_PASSPHRASE:-"password"}"
 export PULUMI_ORG="${PULUMI_ORG:-}"
 export PULUMI_IAM_USER="${PULUMI_IAM_USER:-}"
 export PULUMI_CREDS_FILE="${PULUMI_CREDS_FILE:-/tmp/pulumi-ci-credentials.json}"
 export POLICY_NAME="${POLICY_NAME:-PulumiStateAccessPolicy}"
-export FORCE_DELETE="${FORCE_DELETE:-false}"
+export FORCE_DELETE="${FORCE_DELETE:-true}"
 
 # Normalize absolute paths
 abs_path() {
