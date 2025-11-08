@@ -1,4 +1,17 @@
-# rayserve_models.py
+"""
+1. Ray Serve orchestrator for multimodal inference serving with ONNX-optimized models
+2. Configures embedding and reranking deployments with dynamic resource allocation
+3. Manages CPU/GPU execution paths through environment-driven parameters
+4. Implements autoscaling with per-model resource isolation for production
+5. Supports configurable tokenization and dynamic max-length handling
+6. Provides cross-encoder reranking with query-candidate pair processing
+7. Optional LLM integration with vLLM runtime for generative AI
+8. Centralized health checking ensures model integrity before traffic routing
+9. HTTP endpoint management for multimodal inference pipelines
+10. Production infrastructure with queue management and fail-fast diagnostics
+"""
+
+
 from __future__ import annotations
 import os
 import json
@@ -15,7 +28,6 @@ _log_level = getattr(logging, _log_level_name.upper(), logging.INFO)
 logging.basicConfig(level=_log_level)
 log = logging.getLogger("rayserve_onnx")
 
-# Core envs
 RAY_ADDRESS = os.getenv("RAY_ADDRESS") or None
 RAY_NAMESPACE = os.getenv("RAY_NAMESPACE") or None
 SERVE_HTTP_HOST = os.getenv("SERVE_HTTP_HOST", "127.0.0.1")
@@ -24,7 +36,6 @@ SERVE_HTTP_PORT = int(os.getenv("SERVE_HTTP_PORT", "8003"))
 EMBED_DEPLOYMENT = os.getenv("EMBED_DEPLOYMENT", "embed_onxx")
 RERANK_HANDLE_NAME = os.getenv("RERANK_HANDLE_NAME", "rerank_onxx")
 
-# ONNX / model paths (defaults set to your workspace layout)
 ONNX_USE_CUDA = (os.getenv("ONNX_USE_CUDA", "false").lower() in ("1", "true", "yes"))
 MODEL_DIR_EMBED = os.getenv("MODEL_DIR_EMBED", "/workspace/models/gte-modernbert-base")
 MODEL_DIR_RERANK = os.getenv("MODEL_DIR_RERANK", "/workspace/models/ms-marco-TinyBERT-L2-v2")
@@ -33,10 +44,8 @@ ONNX_EMBED_TOKENIZER_PATH = os.getenv("ONNX_EMBED_TOKENIZER_PATH", os.path.join(
 ONNX_RERANK_PATH = os.getenv("ONNX_RERANK_PATH", os.path.join(MODEL_DIR_RERANK, "onnx", "model_quint8_avx2.onnx"))
 ONNX_RERANK_TOKENIZER_PATH = os.getenv("ONNX_RERANK_TOKENIZER_PATH", os.path.join(MODEL_DIR_RERANK, "tokenizer.json"))
 
-# global coarse sizing (backwards-compatible)
 EMBED_REPLICAS = int(os.getenv("EMBED_REPLICAS", "1"))
 RERANK_REPLICAS = int(os.getenv("RERANK_REPLICAS", "1"))
-# legacy GPU env read; used as fallback if per-model overrides not present
 EMBED_GPU = float(os.getenv("EMBED_GPU_PER_REPLICA", "0"))
 RERANK_GPU = float(os.getenv("RERANK_GPU_PER_REPLICA", "0"))
 
@@ -49,7 +58,6 @@ INFERENCE_EMBEDDER_MAX_TOKENS = int(os.getenv("INFERENCE_EMBEDDER_MAX_TOKENS", "
 CROSS_ENCODER_MAX_TOKENS = int(os.getenv("CROSS_ENCODER_MAX_TOKENS", "600"))
 ENABLE_CROSS_ENCODER = (os.getenv("ENABLE_CROSS_ENCODER", "true").lower() in ("1", "true", "yes"))
 
-# LLM envs (defaults updated to available model)
 LLM_MAX_REPLICAS_PER_NODE = int(os.getenv("LLM_MAX_REPLICAS_PER_NODE", "1"))
 LLM_ENABLE_ENV = (os.getenv("LLM_ENABLE", "false").lower() in ("1", "true", "yes"))
 LLM_PATH = os.getenv("LLM_PATH", "/workspace/models/Qwen3-4B-AWQ")
@@ -62,18 +70,15 @@ LLM_ENGINE_KWARGS = json.loads(os.getenv("LLM_ENGINE_KWARGS", "{}") or "{}")
 LLM_USE_RUNTIME_ENV = (os.getenv("LLM_USE_RUNTIME_ENV", "false").lower() in ("1", "true", "yes"))
 LLM_ENABLE = bool(LLM_ENABLE_ENV)
 
-# ---------- New per-model envs (flexible) ----------
-# EMBED per-model
-EMBED_REPLICA_MODE = os.getenv("EMBED_REPLICA_MODE", "fixed")  # "fixed" or "auto"
+EMBED_REPLICA_MODE = os.getenv("EMBED_REPLICA_MODE", "fixed")
 EMBED_REPLICAS_FIXED = int(os.getenv("EMBED_REPLICAS_FIXED", str(EMBED_REPLICAS)))
-EMBED_AUTOSCALING_CONFIG = os.getenv("EMBED_AUTOSCALING_CONFIG", "")  # JSON string
+EMBED_AUTOSCALING_CONFIG = os.getenv("EMBED_AUTOSCALING_CONFIG", "")
 EMBED_AUTOSCALING_CONFIG_OVERRIDE = os.getenv("EMBED_AUTOSCALING_CONFIG_OVERRIDE", "")
 EMBED_NUM_GPUS_PER_REPLICA = float(os.getenv("EMBED_NUM_GPUS_PER_REPLICA", str(EMBED_GPU)))
 EMBED_NUM_CPUS_PER_REPLICA = float(os.getenv("EMBED_NUM_CPUS_PER_REPLICA", "0.5"))
 EMBED_MAX_QUEUED_REQUESTS = int(os.getenv("EMBED_MAX_QUEUED_REQUESTS", "-1"))
 EMBED_MAX_REPLICAS_PER_NODE = int(os.getenv("EMBED_MAX_REPLICAS_PER_NODE", "1"))
 
-# RERANK per-model
 RERANK_REPLICA_MODE = os.getenv("RERANK_REPLICA_MODE", "fixed")
 RERANK_REPLICAS_FIXED = int(os.getenv("RERANK_REPLICAS_FIXED", str(RERANK_REPLICAS)))
 RERANK_AUTOSCALING_CONFIG = os.getenv("RERANK_AUTOSCALING_CONFIG", "")
@@ -83,7 +88,6 @@ RERANK_NUM_CPUS_PER_REPLICA = float(os.getenv("RERANK_NUM_CPUS_PER_REPLICA", "1.
 RERANK_MAX_QUEUED_REQUESTS = int(os.getenv("RERANK_MAX_QUEUED_REQUESTS", "-1"))
 RERANK_MAX_REPLICAS_PER_NODE = int(os.getenv("RERANKER_MAX_REPLICAS_PER_NODE", "1"))
 
-# LLM per-model
 LLM_REPLICA_MODE = os.getenv("LLM_REPLICA_MODE", "auto")
 LLM_REPLICAS_FIXED = int(os.getenv("LLM_REPLICAS_FIXED", str(LLM_REPLICAS)))
 LLM_AUTOSCALING_CONFIG = os.getenv("LLM_AUTOSCALING_CONFIG", "")
@@ -92,7 +96,6 @@ LLM_NUM_GPUS_PER_REPLICA = float(os.getenv("LLM_NUM_GPUS_PER_REPLICA", str(LLM_G
 LLM_NUM_CPUS_PER_REPLICA = float(os.getenv("LLM_NUM_CPUS_PER_REPLICA", "4.0"))
 LLM_MAX_QUEUED_REQUESTS = int(os.getenv("LLM_MAX_QUEUED_REQUESTS", "200"))
 
-# Batch/queue knobs (optional)
 EMBED_BATCH_MAX_SIZE = int(os.getenv("EMBED_BATCH_MAX_SIZE", "32"))
 EMBED_BATCH_WAIT_S = float(os.getenv("EMBED_BATCH_WAIT_S", "0.02"))
 RERANK_BATCH_MAX_SIZE = int(os.getenv("RERANK_BATCH_MAX_SIZE", "8"))
@@ -100,7 +103,6 @@ RERANK_BATCH_WAIT_S = float(os.getenv("RERANK_BATCH_WAIT_S", "0.01"))
 LLM_BATCH_MAX_SIZE = int(os.getenv("LLM_BATCH_MAX_SIZE", "16"))
 LLM_BATCH_WAIT_S = float(os.getenv("LLM_BATCH_WAIT_S", "0.02"))
 
-# Fallback/legacy autoscaling support
 def _parse_json_env(env_str: str) -> Optional[dict]:
     if not env_str:
         return None
@@ -112,7 +114,6 @@ def _parse_json_env(env_str: str) -> Optional[dict]:
         log.exception("Invalid autoscaling JSON: %s", env_str)
     return None
 
-# ---------- onnxruntime import and checks ----------
 try:
     import onnxruntime as ort
 except Exception as e:
@@ -164,9 +165,6 @@ def _effective_max_length(tokenizer: PreTrainedTokenizerFast, requested: Optiona
     eff = int(min(candidates)) if candidates else int(env_default)
     return max(1, eff)
 
-# -------------------------
-# ONNX Embed deployment (same class body as you had)
-# -------------------------
 @serve.deployment(name=EMBED_DEPLOYMENT, num_replicas=EMBED_REPLICAS, ray_actor_options={"num_gpus": EMBED_GPU})
 class ONNXEmbed:
     def __init__(self, onnx_path: str = ONNX_EMBED_PATH, tokenizer_path: str = ONNX_EMBED_TOKENIZER_PATH):
@@ -289,9 +287,6 @@ class ONNXEmbed:
             log.exception("embed call error: %s", e)
             raise
 
-# -------------------------
-# ONNX Rerank deployment (unchanged body)
-# -------------------------
 @serve.deployment(name=RERANK_HANDLE_NAME, num_replicas=RERANK_REPLICAS, ray_actor_options={"num_gpus": RERANK_GPU})
 class ONNXRerank:
     def __init__(self, onnx_path: str = ONNX_RERANK_PATH, tokenizer_path: str = ONNX_RERANK_TOKENIZER_PATH):
@@ -403,35 +398,22 @@ class ONNXRerank:
             log.exception("rerank call error: %s", e)
             raise
 
-# -------------------------
-# Main: start Ray + Serve and deploy
-# -------------------------
 def _build_deploy_options(prefix: str, fixed_replicas_env: int, default_num_gpus: float, default_num_cpus: float, max_replicas_per_node_env: int):
-    """
-    Build a dict of options() kwargs for a deployment based on env naming convention.
-    prefix: uppercase prefix e.g. "EMBED", "RERANK", "LLM"
-    """
     mode = os.getenv(f"{prefix}_REPLICA_MODE", "fixed").lower()
     options: Dict[str, Any] = {}
-    # ray_actor_options
     num_gpus = float(os.getenv(f"{prefix}_NUM_GPUS_PER_REPLICA", str(default_num_gpus)))
     num_cpus = float(os.getenv(f"{prefix}_NUM_CPUS_PER_REPLICA", str(default_num_cpus)))
     options["ray_actor_options"] = {"num_gpus": num_gpus, "num_cpus": num_cpus}
-    # max_replicas_per_node
     options["max_replicas_per_node"] = int(os.getenv(f"{prefix}_MAX_REPLICAS_PER_NODE", str(max_replicas_per_node_env)))
-    # autoscale vs fixed
     if mode == "auto":
-        # prefer OVERRIDE if set
         override = os.getenv(f"{prefix}_AUTOSCALING_CONFIG_OVERRIDE", "")
         cfg_str = override or os.getenv(f"{prefix}_AUTOSCALING_CONFIG", "")
         cfg = _parse_json_env(cfg_str)
         if cfg is None:
-            # fallback safe default
             cfg = {"min_replicas": 1, "max_replicas": max(1, fixed_replicas_env), "target_num_ongoing_requests": 8}
         options["num_replicas"] = "auto"
         options["autoscaling_config"] = cfg
     else:
-        # fixed replicas
         fixed = int(os.getenv(f"{prefix}_REPLICAS_FIXED", str(fixed_replicas_env)))
         options["num_replicas"] = fixed
     return options
@@ -440,18 +422,15 @@ def main():
     ray.init(address=RAY_ADDRESS, namespace=RAY_NAMESPACE, ignore_reinit_error=True)
 
     http_opts = HTTPOptions(host=SERVE_HTTP_HOST, port=SERVE_HTTP_PORT)
-    # preserve prior behaviour
     serve.start(detached=True, http_options=http_opts)
 
     binds = []
 
-    # build embed options and bind
     embed_opts = _build_deploy_options("EMBED", EMBED_REPLICAS, EMBED_NUM_GPUS_PER_REPLICA, EMBED_NUM_CPUS_PER_REPLICA, EMBED_MAX_REPLICAS_PER_NODE)
     log.info("Embed deployment options: %s", embed_opts)
     embed_bind = ONNXEmbed.options(**embed_opts).bind(ONNX_EMBED_PATH, ONNX_EMBED_TOKENIZER_PATH)
     binds.append(embed_bind)
 
-    # build rerank options (if enabled)
     if ENABLE_CROSS_ENCODER:
         rerank_opts = _build_deploy_options("RERANK", RERANK_REPLICAS, RERANK_NUM_GPUS_PER_REPLICA, RERANK_NUM_CPUS_PER_REPLICA, RERANK_MAX_REPLICAS_PER_NODE)
         log.info("Rerank deployment options: %s", rerank_opts)
@@ -461,7 +440,6 @@ def main():
     else:
         log.info("ENABLE_CROSS_ENCODER=false -> deploying only embed (reranker skipped)")
 
-    # Optional LLM support: create server + ingress with options derived from envs
     if LLM_ENABLE:
         try:
             from ray.serve.llm import LLMConfig
@@ -471,21 +449,17 @@ def main():
             log.exception("LLM APIs import failed; disabling LLM. Error: %s", e)
             raise SystemExit(1)
 
-        # build LLMConfig
         model_loading = {"model_id": LLM_MODEL_ID, "model_source": LLM_PATH}
-        # if replica mode auto, parse autoscaling config; else use fixed LLM_REPLICAS_FIXED
         if LLM_REPLICA_MODE.lower() == "auto":
             autoscale = _parse_json_env(LLM_AUTOSCALING_CONFIG_OVERRIDE or LLM_AUTOSCALING_CONFIG) or {"min_replicas": 1, "max_replicas": max(1, LLM_REPLICAS_FIXED), "target_num_ongoing_requests": 10}
             deployment_cfg = {"autoscaling_config": autoscale}
         else:
-            # fixed
             deployment_cfg = {"autoscaling_config": {"min_replicas": max(1, LLM_REPLICAS_FIXED), "max_replicas": max(1, LLM_REPLICAS_FIXED)}}
 
         llm_runtime_env = {"pip": ["vllm==0.11.0"]} if LLM_USE_RUNTIME_ENV else None
         llm_config = LLMConfig(model_loading_config=model_loading, deployment_config=deployment_cfg, engine_kwargs=LLM_ENGINE_KWARGS or None, runtime_env=llm_runtime_env)
 
         server_options = LLMServer.get_deployment_options(llm_config) or {}
-        # merge our actor resource suggestions
         ray_actor_opts = server_options.get("ray_actor_options", {})
         ray_actor_opts.setdefault("num_gpus", float(LLM_NUM_GPUS_PER_REPLICA))
         ray_actor_opts.setdefault("num_cpus", float(LLM_NUM_CPUS_PER_REPLICA))
@@ -494,17 +468,13 @@ def main():
         server_options["ray_actor_options"] = ray_actor_opts
         server_options.setdefault("max_replicas_per_node", LLM_MAX_REPLICAS_PER_NODE)
 
-        # if LLM mode is auto, ensure num_replicas="auto" and autoscaling_config present
         if LLM_REPLICA_MODE.lower() == "auto":
-            # server_options may already have autoscaling - prefer our parsed config
             server_options["num_replicas"] = "auto"
             server_options["autoscaling_config"] = deployment_cfg.get("autoscaling_config")
 
-        # bind server
         server_deployment = serve.deployment(LLMServer).options(**server_options).bind(llm_config)
         binds.append(server_deployment)
 
-        # ingress
         ingress_options = OpenAiIngress.get_deployment_options(llm_configs=[llm_config]) or {}
         ingress_cls = make_fastapi_ingress(OpenAiIngress)
         ingress_deployment = serve.deployment(ingress_cls).options(**ingress_options).bind([llm_config])
@@ -512,7 +482,6 @@ def main():
 
         log.info("LLM enabled -> added server + ingress deployments")
 
-    # Run all binds
     serve.run(*binds)
 
     names: List[str] = [EMBED_DEPLOYMENT] + ([RERANK_HANDLE_NAME] if ENABLE_CROSS_ENCODER else [])

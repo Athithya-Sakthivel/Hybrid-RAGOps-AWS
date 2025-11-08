@@ -22,3 +22,4 @@ infra/pulumi-aws/pulumi-outputs.json
 infra/pulumi-aws/Pulumi.ragops.yaml
 infra/pulumi-aws/Pulumi.prod.yaml
 infra/pulumi-aws/pulumi-exports.sh
+llama.cpp
