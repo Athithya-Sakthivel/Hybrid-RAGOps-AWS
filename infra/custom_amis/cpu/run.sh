@@ -12,7 +12,6 @@ if [[ ! "$BUILD_ARCH" =~ ^(x86_64|arm64)$ ]]; then
   exit 1
 fi
 
-# Set instance types based on architecture (keep consistent with packer defaults)
 if [ "$BUILD_ARCH" = "arm64" ]; then
   INSTANCE_TYPE="${INSTANCE_TYPE:-c7g.xlarge}"
   AMI_NAME_PREFIX="cpu-ml-ami-arm64"
