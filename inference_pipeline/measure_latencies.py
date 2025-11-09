@@ -1,26 +1,3 @@
-#!/usr/bin/env python3
-# measure_latencies.py
-"""
-Measure and summarize latencies for:
- - DNS/TCP/TLS/TTFB/TOTAL (via curl if present, else httpx approximations)
- - Qdrant: get_collection and a small vector search/query_points
- - Neo4j: verify_connectivity and a simple fulltext query
- - Embed HTTP endpoint (health-check)
- - Ray Serve handle lookup (best-effort)
-Outputs a JSON summary and a small human-readable table.
-
-Environment variables used (defaults shown):
-  QDRANT_URL (http://127.0.0.1:6333)
-  QDRANT_API_KEY
-  COLLECTION (my_collection)
-  VECTOR_DIM (768)
-  NEO4J_URI (bolt://localhost:7687)
-  NEO4J_USER (neo4j)
-  NEO4J_PASSWORD ("")
-  EMBED_HTTP_URL (http://127.0.0.1:8003/embed_onxx)
-  RERANK_HTTP_URL (http://127.0.0.1:8003/rerank_onxx)
-  REPEAT (1)
-"""
 from __future__ import annotations
 import os
 import time
