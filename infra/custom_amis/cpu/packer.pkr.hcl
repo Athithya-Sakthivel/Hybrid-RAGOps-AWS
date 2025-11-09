@@ -6,10 +6,12 @@ packer {
     }
   }
 }
+
 variable "region" {
   type    = string
   default = "ap-south-1"
 }
+
 variable "architecture" {
   type    = string
   default = "x86_64"
@@ -18,33 +20,41 @@ variable "architecture" {
     error_message = "Architecture must be 'x86_64' or 'arm64'."
   }
 }
+
 variable "instance_type" {
   type    = string
   default = "c6i.xlarge"
 }
+
 variable "arm_instance_type" {
   type    = string
   default = "c7g.xlarge"
 }
+
 variable "volume_size_gb" {
   type    = number
   default = 50
 }
+
 variable "ami_name" {
   type    = string
   default = ""
 }
+
 variable "ami_description" {
   type    = string
   default = "Ubuntu 22.04 CPU AMI with Python 3.11, OCR dependencies, and MLOps toolchain."
 }
+
 variable "source_ami" {
   type    = string
   default = ""
 }
+
 locals {
   actual_instance_type = var.architecture == "arm64" ? var.arm_instance_type : var.instance_type
 }
+
 source "amazon-ebs" "ubuntu2204_cpu" {
   region                      = var.region
   instance_type               = local.actual_instance_type
@@ -52,7 +62,10 @@ source "amazon-ebs" "ubuntu2204_cpu" {
   ssh_username                = "ubuntu"
   ssh_pty                     = true
   associate_public_ip_address = true
+
+  # If a specific source_ami is passed as a var (from run.sh), it will be used.
   source_ami = var.source_ami
+
   source_ami_filter {
     filters = {
       name                = var.architecture == "arm64" ? "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-arm64-server-*" : "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"
@@ -63,6 +76,7 @@ source "amazon-ebs" "ubuntu2204_cpu" {
     owners      = ["099720109477"]
     most_recent = true
   }
+
   launch_block_device_mappings {
     device_name = "/dev/xvda"
     volume_size = var.volume_size_gb
@@ -72,9 +86,11 @@ source "amazon-ebs" "ubuntu2204_cpu" {
     delete_on_termination = true
   }
 }
+
 build {
   name    = "cpu-ml-ami-${var.architecture}"
   sources = ["source.amazon-ebs.ubuntu2204_cpu"]
+
   provisioner "shell" {
     script = "provision.sh"
     environment_vars = [
