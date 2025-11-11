@@ -84,7 +84,6 @@ export RAY_CPU_AMI="ami-0abcdef1234567890"
 export RAY_CPU_INSTANCE="m5.xlarge"
 export RAY_CPU_INSTANCE_PROFILE="ray-worker-instance-profile-prod"
 
-# Key pair
 export KEY_NAME="my-prod-keypair"
 
 # SSM parameter name for redis password (already created by a_prereqs)
