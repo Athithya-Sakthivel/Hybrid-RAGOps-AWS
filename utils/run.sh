@@ -1,4 +1,4 @@
-ray stop --force || true && sudo rm -rf /tmp/ray/ && ray start --head && python3 infra/rayserve_models_cpu.py
+source .venv/bin/activate && ray stop --force || true && sudo rm -rf /tmp/ray/ && export GATEWAY_BIND_AUTO=1 && ray start --head && python3 infra/rayserve_deployments.py
 
 
 curl -sS -X POST "http://127.0.0.1:8003/" \

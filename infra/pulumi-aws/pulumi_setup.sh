@@ -23,11 +23,13 @@ export DDB_TABLE="${DDB_TABLE:-pulumi-state-locks}"
 export PULUMI_STACK="${PULUMI_STACK:-prod}"
 export STACK="${STACK:-${PULUMI_STACK}}"
 export PULUMI_CONFIG_PASSPHRASE="${PULUMI_CONFIG_PASSPHRASE:-"password"}"
+export FORCE_DELETE="${FORCE_DELETE:-true}"
+
 export PULUMI_ORG="${PULUMI_ORG:-}"
 export PULUMI_IAM_USER="${PULUMI_IAM_USER:-}"
 export PULUMI_CREDS_FILE="${PULUMI_CREDS_FILE:-/tmp/pulumi-ci-credentials.json}"
 export POLICY_NAME="${POLICY_NAME:-PulumiStateAccessPolicy}"
-export FORCE_DELETE="${FORCE_DELETE:-true}"
+
 export MULTI_AZ_DEPLOYMENT=true
 export PUBLIC_SUBNET_CIDRS="10.0.1.0/24,10.0.2.0/24"
 export PRIVATE_SUBNET_CIDRS="10.0.11.0/24,10.0.12.0/24"
@@ -45,6 +47,61 @@ export AUTOSCALER_BUCKET_NAME="${AUTOSCALER_BUCKET_NAME:-${PULUMI_S3_BUCKET}}"
 export REDIS_SSM_PARAM="${REDIS_SSM_PARAM:-/ray/prod/redis_password}"
 export REDIS_PASSWORD="${REDIS_PASSWORD:-defaultRedisPassword123!}"
 export KMS_ALIAS="${KMS_ALIAS:-alias/ray-ssm-key}"
+
+
+#!/usr/bin/env bash
+# export.sh — production environment variables (edit values before sourcing)
+
+export AWS_REGION="ap-south-1"
+export STACK_NAME="prod"
+export ENABLE_FILE_A=true
+export ENABLE_FILE_B=true
+export ENABLE_FILE_C=true
+export ENABLE_FILE_D=true
+
+# Networking / VPC
+export MULTI_AZ_DEPLOYMENT=true
+export CREATE_VPC_ENDPOINTS=true
+export NO_NAT=false
+export VPC_CIDR="10.0.0.0/16"
+export PUBLIC_SUBNET_CIDRS="10.0.1.0/24,10.0.2.0/24"
+export PRIVATE_SUBNET_CIDRS="10.0.11.0/24,10.0.12.0/24"
+
+# Secrets (use pulumi config secret for redisPassword)
+# pulumi config set --secret redisPassword "<REDIS_PASSWORD>"
+
+# ALB / Domain
+export DOMAIN="app.example.com"
+export HOSTED_ZONE_ID="ZXXXXXXXXXXXX"
+export PRIVATE_HOSTED_ZONE_NAME="prod.internal"
+export PRIVATE_HOSTED_ZONE_ID="ZYYYYYYYYYYYY"
+
+# Head / Worker AMIs and profiles
+export HEAD_AMI="ami-0abcdef1234567890"
+export HEAD_INSTANCE_TYPE="m5.large"
+export RAY_HEAD_INSTANCE_PROFILE="ray-head-instance-profile-prod"
+export RAY_CPU_AMI="ami-0abcdef1234567890"
+export RAY_CPU_INSTANCE="m5.xlarge"
+export RAY_CPU_INSTANCE_PROFILE="ray-worker-instance-profile-prod"
+
+# Key pair
+export KEY_NAME="my-prod-keypair"
+
+# SSM parameter name for redis password (already created by a_prereqs)
+export REDIS_SSM_PARAM="/ray/prod/redis_password"
+
+# Optional: KMS alias to reuse
+export KMS_ALIAS="alias/ray-ssm-key-prod"
+
+# ALB app port
+export APP_PORT=8003
+export ALB_IDLE_TIMEOUT=300
+
+# Misc
+export ENABLE_COGNITO=true
+export ENABLE_RATE_LIMITER=true
+
+
 
 # ---------------------------
 # Helpers
