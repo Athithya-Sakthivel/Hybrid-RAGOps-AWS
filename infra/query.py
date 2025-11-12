@@ -621,12 +621,21 @@ async def call_llm_stream(llm_handle, prompt_json: str, params: Optional[Dict[st
         raise RuntimeError("LLM handle missing")
     params = params or {}
     try:
-        if hasattr(llm_handle, "stream"):
-            resp = llm_handle.stream.remote(prompt_json, params or {}, True)
-        elif hasattr(llm_handle, "generate"):
-            resp = llm_handle.generate.remote(prompt_json, params or {}, True)
+        if hasattr(llm_handle, "stream") and hasattr(llm_handle.stream, "remote"):
+            try:
+                resp = llm_handle.stream.remote(prompt_json, params)
+            except Exception:
+                resp = llm_handle.stream.remote(prompt_json)
+        elif hasattr(llm_handle, "generate") and hasattr(llm_handle.generate, "remote"):
+            try:
+                resp = llm_handle.generate.remote(prompt_json, params)
+            except Exception:
+                resp = llm_handle.generate.remote(prompt_json)
         else:
-            resp = llm_handle.remote({"prompt": prompt_json, "params": params, "stream": True})
+            try:
+                resp = llm_handle.remote({"prompt": prompt_json, "params": params, "stream": True})
+            except Exception:
+                resp = llm_handle.remote(prompt_json)
     except Exception:
         txt = call_llm_blocking(llm_handle, prompt_json, params=params)
         yield txt

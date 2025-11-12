@@ -10,9 +10,17 @@ import pulumi_aws as aws
 STACK = pulumi.get_stack()
 cfg = pulumi.Config()
 
-PRIVATE_SUBNET_IDS = (os.getenv("PRIVATE_SUBNET_IDS") or cfg.get("privateSubnetIds") or "")
-PRIVATE_SUBNET_IDS = [s.strip() for s in PRIVATE_SUBNET_IDS.split(",") if s.strip()]
-WORKER_SG_ID = os.getenv("WORKER_SECURITY_GROUP_ID") or cfg.get("workerSecurityGroupId") or ""
+# try to reuse a_prereqs_networking outputs in-process
+try:
+    import a_prereqs_networking as netmod
+    pulumi.log.info("Using a_prereqs_networking outputs in workers module")
+    PRIVATE_SUBNET_IDS = getattr(netmod, "private_subnet_ids_out", []) or []
+    WORKER_SG_ID = getattr(netmod, "worker_security_group_id_out", None)
+except Exception:
+    PRIVATE_SUBNET_IDS = (os.getenv("PRIVATE_SUBNET_IDS") or cfg.get("privateSubnetIds") or "")
+    PRIVATE_SUBNET_IDS = [s.strip() for s in PRIVATE_SUBNET_IDS.split(",") if s.strip()]
+    WORKER_SG_ID = os.getenv("WORKER_SECURITY_GROUP_ID") or cfg.get("workerSecurityGroupId") or ""
+
 RAY_HEAD_FQDN = os.getenv("RAY_HEAD_FQDN") or cfg.get("rayHeadFqdn") or f"ray-head.{STACK}.{os.getenv('PRIVATE_HOSTED_ZONE_NAME') or cfg.get('privateHostedZoneName') or 'internal'}"
 REDIS_SSM_PARAM = os.getenv("REDIS_SSM_PARAM") or cfg.get("redisSsmParam") or "/ray/prod/redis_password"
 CPU_AMI = os.getenv("RAY_CPU_AMI") or cfg.get("rayCpuAmi") or ""
@@ -30,29 +38,29 @@ def ensure_worker_instance_profile(profile_name: Optional[str]) -> str:
             return ip.name
         except Exception:
             pulumi.log.warn(f"Worker instance profile {profile_name} not found; creating new")
-    role = aws.iam.Role(f"ray-worker-role-{STACK}", assume_role_policy=json.dumps({"Version":"2012-10-17","Statement":[{"Action":"sts:AssumeRole","Principal":{"Service":"lambda.amazonaws.com" if False else "ec2.amazonaws.com"},"Effect":"Allow"}]}))
-    aws.iam.RolePolicyAttachment(f"worker-ssm-attach-{STACK}", role=role.name, policy_arn="arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore")
-    aws.iam.RolePolicyAttachment(f"worker-cw-attach-{STACK}", role=role.name, policy_arn="arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy")
-    # minimal SSM access for redis parameter
+    role = aws.iam.Role("ray-worker-role", assume_role_policy=json.dumps({"Version":"2012-10-17","Statement":[{"Action":"sts:AssumeRole","Principal":{"Service":"ec2.amazonaws.com"},"Effect":"Allow"}]}))
+    aws.iam.RolePolicyAttachment("worker-ssm-attach", role=role.name, policy_arn="arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore")
+    aws.iam.RolePolicyAttachment("worker-cw-attach", role=role.name, policy_arn="arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy")
+    # minimal SSM access to the specific redis param
     statements = []
     if REDIS_SSM_PARAM:
         ssm_arn = f"arn:aws:ssm:{aws.get_region().name}:{aws.get_caller_identity().account_id}:parameter{REDIS_SSM_PARAM}"
-        statements.append({"Effect":"Allow","Action":["ssm:GetParameter","ssm:GetParameters"],"Resource":ssm_arn})
+        statements.append({"Effect":"Allow","Action":["ssm:GetParameter","ssm:GetParameters"],"Resource":[ssm_arn]})
     if statements:
-        pol = aws.iam.Policy(f"ray-worker-inline-policy-{STACK}", policy=json.dumps({"Version":"2012-10-17","Statement":statements}))
-        aws.iam.PolicyAttachment(f"ray-worker-inline-attach-{STACK}", policy_arn=pol.arn, roles=[role.name])
-    ip = aws.iam.InstanceProfile(f"ray-worker-ip-{STACK}", role=role.name)
+        pol = aws.iam.Policy("ray-worker-inline-policy", policy=json.dumps({"Version":"2012-10-17","Statement":statements}))
+        aws.iam.PolicyAttachment("ray-worker-inline-attach", policy_arn=pol.arn, roles=[role.name])
+    ip = aws.iam.InstanceProfile("ray-worker-ip", role=role.name)
     return ip.name
 
 worker_instance_profile = ensure_worker_instance_profile(CPU_INSTANCE_PROFILE)
 
-# Worker user-data template, safe substitution via replace to avoid f-string brace issues
+# worker user-data (joins head, with exponential backoff and drain script)
 worker_user_data_t = r"""#!/bin/bash
 set -euo pipefail
 apt-get update -y
 apt-get install -y python3-pip awscli jq curl ca-certificates
 python3 -m pip install --upgrade pip
-python3 -m pip install "ray[default]==2.5.0" httpx transformers
+python3 -m pip install "ray[default]==2.5.0" httpx
 
 SSM_PARAM="{{REDIS_SSM_PARAM}}"
 RAY_HEAD_FQDN="{{RAY_HEAD_FQDN}}"
@@ -83,14 +91,13 @@ cat > /usr/local/bin/ray_worker_join.sh <<'JOIN'
 #!/bin/bash
 set -euo pipefail
 LOG_TAG="ray-worker-join"
-SSM_PARAM="{{REDIS_SSM_PARAM}}"
+SSM_PARAM="{{SSM_PARAM}}"
 RAY_HEAD_FQDN="{{RAY_HEAD_FQDN}}"
 RAY_REDIS_PORT={{RAY_REDIS_PORT}}
 REGION="{{REGION}}"
 BASE_DELAY=5
 BACKOFF_FACTOR=2
 MAX_DELAY=300
-JITTER=0.25
 
 get_imds_token() {
   curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds:21600" || true
@@ -201,50 +208,44 @@ UNIT
 systemctl daemon-reload
 systemctl enable --now ray-worker.service
 
-INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id || true)
-if command -v aws >/dev/null 2>&1 && [ -n "$INSTANCE_ID" ]; then
-  aws ec2 create-tags --resources "$INSTANCE_ID" --tags Key=ray-cluster,Value="{{STACK}}" Key=ray-node-type,Value=worker --region "{{REGION}}" || true
-fi
-"""
+# substitute template variables
+worker_user_data = worker_user_data_t.replace("{{REDIS_SSM_PARAM}}", REDIS_SSM_PARAM).replace("{{RAY_HEAD_FQDN}}", RAY_HEAD_FQDN).replace("{{RAY_REDIS_PORT}}", str(RAY_REDIS_PORT)).replace("{{REGION}}", aws.get_region().name).replace("{{SSM_PARAM}}", REDIS_SSM_PARAM)
 
-worker_user_data = worker_user_data_t.replace("{{REDIS_SSM_PARAM}}", REDIS_SSM_PARAM).replace("{{RAY_HEAD_FQDN}}", RAY_HEAD_FQDN).replace("{{RAY_REDIS_PORT}}", str(RAY_REDIS_PORT)).replace("{{REGION}}", aws.get_region().name).replace("{{STACK}}", STACK)
-
-# Create Launch Template with network interface only if we have private subnet and SG
+# Launch template and ASG
 network_interfaces = None
 if PRIVATE_SUBNET_IDS:
     network_interfaces = [aws.ec2.LaunchTemplateNetworkInterfaceArgs(subnet_id=PRIVATE_SUBNET_IDS[0], security_groups=[WORKER_SG_ID] if WORKER_SG_ID else None)]
 
-lt = aws.ec2.LaunchTemplate(f"ray-worker-lt-{STACK}", name_prefix=f"ray-worker-lt-{STACK}", image_id=CPU_AMI, instance_type=CPU_INSTANCE_TYPE, iam_instance_profile=aws.ec2.LaunchTemplateIamInstanceProfileArgs(name=worker_instance_profile), key_name=KEY_NAME if KEY_NAME else None, network_interfaces=network_interfaces or None, user_data=worker_user_data)
+lt = aws.ec2.LaunchTemplate("ray-worker-lt", name_prefix=f"ray-worker-lt-{STACK}", image_id=CPU_AMI, instance_type=CPU_INSTANCE_TYPE, iam_instance_profile=aws.ec2.LaunchTemplateIamInstanceProfileArgs(name=worker_instance_profile), key_name=KEY_NAME if KEY_NAME else None, network_interfaces=network_interfaces or None, user_data=worker_user_data)
 
-asg = aws.autoscaling.Group(f"ray-worker-asg-{STACK}", desired_capacity=MIN_WORKERS, min_size=MIN_WORKERS, max_size=MAX_WORKERS, vpc_zone_identifiers=PRIVATE_SUBNET_IDS, launch_template=aws.autoscaling.GroupLaunchTemplateArgs(id=lt.id, version="$Latest"), tags=[aws.autoscaling.GroupTagArgs(key="Name", value=f"ray-worker-{STACK}", propagate_at_launch=True)])
+asg = aws.autoscaling.Group("ray-worker-asg", desired_capacity=MIN_WORKERS, min_size=MIN_WORKERS, max_size=MAX_WORKERS, vpc_zone_identifiers=PRIVATE_SUBNET_IDS, launch_template=aws.autoscaling.GroupLaunchTemplateArgs(id=lt.id, version="$Latest"), tags=[aws.autoscaling.GroupTagArgs(key="Name", value=f"ray-worker-{STACK}", propagate_at_launch=True)])
 
 # SNS topic + lifecycle hook
-topic = aws.sns.Topic(f"ray-worker-life-topic-{STACK}")
-lifecycle = aws.autoscaling.LifecycleHook(f"ray-worker-terminate-hook-{STACK}", autoscaling_group_name=asg.name, lifecycle_transition="autoscaling:EC2_INSTANCE_TERMINATING", default_result="ABANDON", heartbeat_timeout=600, notification_target_arn=topic.arn)
+topic = aws.sns.Topic("ray-worker-life-topic")
+lifecycle = aws.autoscaling.LifecycleHook("ray-worker-terminate-hook", autoscaling_group_name=asg.name, lifecycle_transition="autoscaling:EC2_INSTANCE_TERMINATING", default_result="ABANDON", heartbeat_timeout=600, notification_target_arn=topic.arn)
 
-# Lambda to handle lifecycle messages: run SSM command to execute drain script and CompleteLifecycleAction
-lambda_role = aws.iam.Role(f"ray-drain-lambda-role-{STACK}", assume_role_policy=json.dumps({"Version":"2012-10-17","Statement":[{"Action":"sts:AssumeRole","Principal":{"Service":"lambda.amazonaws.com"},"Effect":"Allow"}]}))
-aws.iam.RolePolicyAttachment(f"lambda-basic-{STACK}", role=lambda_role.name, policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole")
+# Lambda to handle lifecycle: package using AssetArchive
+lambda_role = aws.iam.Role("ray-drain-lambda-role", assume_role_policy=json.dumps({"Version":"2012-10-17","Statement":[{"Action":"sts:AssumeRole","Principal":{"Service":"lambda.amazonaws.com"},"Effect":"Allow"}]}))
+aws.iam.RolePolicyAttachment("lambda-basic", role=lambda_role.name, policy_arn="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole")
+# minimal permissions for SSM SendCommand and ASG CompleteLifecycleAction (resource scoping can be tightened)
 lambda_policy = {
-    "Version":"2012-10-17",
-    "Statement":[
-        {"Effect":"Allow","Action":["ssm:SendCommand","ssm:GetCommandInvocation","ssm:ListCommands","ssm:ListCommandInvocations"], "Resource":"*"},
+    "Version": "2012-10-17",
+    "Statement": [
+        {"Effect":"Allow","Action":["ssm:SendCommand","ssm:GetCommandInvocation","ssm:ListCommandInvocations","ssm:ListCommands"], "Resource":"*"},
         {"Effect":"Allow","Action":["autoscaling:CompleteLifecycleAction"], "Resource":"*"},
         {"Effect":"Allow","Action":["ec2:DescribeInstances"], "Resource":"*"},
         {"Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"], "Resource":"arn:aws:logs:*:*:*"}
     ]
 }
-lambda_pol = aws.iam.Policy(f"ray-drain-lambda-inline-{STACK}", policy=json.dumps(lambda_policy))
-aws.iam.PolicyAttachment(f"ray-drain-lambda-attach-{STACK}", policy_arn=lambda_pol.arn, roles=[lambda_role.name])
+lambda_pol = aws.iam.Policy("ray-drain-lambda-inline", policy=json.dumps(lambda_policy))
+aws.iam.PolicyAttachment("ray-drain-lambda-attach", policy_arn=lambda_pol.arn, roles=[lambda_role.name])
 
-# Lambda function code (small handler)
 lambda_code = r"""
 import json, boto3, time
 ssm = boto3.client('ssm')
 asg = boto3.client('autoscaling')
 
 def handler(event, context):
-    # event is SNS message wrapper
     try:
         records = event.get('Records', [])
         for r in records:
@@ -252,25 +253,16 @@ def handler(event, context):
             if not msg:
                 continue
             payload = json.loads(msg)
-            # try to find instance id and lifecycle hook details
-            # For simplicity we expect AutoScaling lifecycle hook notification structure
-            detail = payload.get('LifecycleHookName') and payload or payload
-            instance_id = payload.get('EC2InstanceId') or payload.get('instance_id') or payload.get('detail',{}).get('EC2InstanceId')
+            # attempt parse fields
+            instance_id = payload.get('EC2InstanceId') or payload.get('detail',{}).get('EC2InstanceId') or payload.get('InstanceId')
             hook_name = payload.get('LifecycleHookName') or payload.get('detail',{}).get('LifecycleHookName')
             asg_name = payload.get('AutoScalingGroupName') or payload.get('detail',{}).get('AutoScalingGroupName')
             if not instance_id or not hook_name or not asg_name:
-                # try parse other common fields
-                instance_id = payload.get('detail',{}).get('EC2InstanceId')
-                hook_name = payload.get('detail',{}).get('LifecycleHookName')
-                asg_name = payload.get('detail',{}).get('AutoScalingGroupName')
-            if not instance_id or not hook_name or not asg_name:
-                print("Missing lifecycle notification fields; ignoring")
+                print("Missing lifecycle notification fields; ignoring", payload)
                 continue
             print(f"Draining instance {instance_id} in ASG {asg_name} hook {hook_name}")
-            # send SSM command to run drain script
             resp = ssm.send_command(InstanceIds=[instance_id], DocumentName="AWS-RunShellScript", Parameters={"commands":["/usr/local/bin/ray_node_drain.sh 300"]}, TimeoutSeconds=600)
             cmd_id = resp['Command']['CommandId']
-            # poll for invocation success
             ok = False
             for _ in range(60):
                 try:
@@ -283,7 +275,6 @@ def handler(event, context):
                 except Exception as e:
                     print("get_command_invocation error", e)
                 time.sleep(5)
-            # Complete lifecycle action
             result = 'CONTINUE' if ok else 'ABANDON'
             print("Completing lifecycle with", result)
             asg.complete_lifecycle_action(AutoScalingGroupName=asg_name, LifecycleHookName=hook_name, InstanceId=instance_id, LifecycleActionResult=result)
@@ -292,11 +283,14 @@ def handler(event, context):
         raise
 """
 
-z = aws.lambda_.Function(f"ray-drain-lambda-{STACK}", runtime="python3.10", role=lambda_role.arn, handler="index.handler", code=aws.lambda_.FunctionCodeArgs(zip_file=lambda_code), timeout=900)
+lambda_asset = pulumi.AssetArchive({
+    "index.py": pulumi.StringAsset(lambda_code)
+})
 
-# Permission for SNS to invoke Lambda
-perm = aws.lambda_.Permission(f"allow-sns-invoke-{STACK}", action="lambda:InvokeFunction", function=z.name, principal="sns.amazonaws.com", source_arn=topic.arn)
-sub = aws.sns.TopicSubscription(f"topic-sub-{STACK}", topic=topic.arn, protocol="lambda", endpoint=z.arn)
+z = aws.lambda_.Function("ray-drain-lambda", runtime="python3.10", role=lambda_role.arn, handler="index.handler", code=lambda_asset, timeout=900)
+
+perm = aws.lambda_.Permission("allow-sns-invoke", action="lambda:InvokeFunction", function=z.arn, principal="sns.amazonaws.com", source_arn=topic.arn)
+sub = aws.sns.TopicSubscription("topic-sub", topic=topic.arn, protocol="lambda", endpoint=z.arn)
 
 pulumi.export("ray_worker_launch_template_id", lt.id)
 pulumi.export("ray_worker_asg_name", asg.name)

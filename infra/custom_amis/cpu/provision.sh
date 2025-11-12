@@ -26,6 +26,14 @@ read -ra VENV_FILTERED <<< "$(filter_available_pkgs "${PYTHON_VENV_PKG_CANDIDATE
 [ "${#VENV_FILTERED[@]}" -gt 0 ] && apt_install_retry 2 "${VENV_FILTERED[@]}" || true
 if ! python3 -m venv "$VENV_PATH"; then TMPPY="$(mktemp -d)"; curl -fsSL "https://bootstrap.pypa.io/get-pip.py" -o "${TMPPY}/get-pip.py" || true; python3 "${TMPPY}/get-pip.py" --disable-pip-version-check || true; python3 -m pip install --upgrade pip setuptools wheel || true; python3 -m venv "$VENV_PATH" || { echo "Failed to create venv after fallback"; exit 1; }; fi
 "$VENV_PATH/bin/python" -m pip install --no-cache-dir --upgrade pip setuptools wheel
+if ! command -v aws >/dev/null 2>&1; then
+  printf '%s %s\n' "$(date --iso-8601=seconds)" "Installing aws CLI v2"
+  TMP_AWS_ZIP="$(mktemp --suffix=.zip)"
+  curl -fSL --retry 3 -o "${TMP_AWS_ZIP}" "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
+  unzip -q "${TMP_AWS_ZIP}" -d /tmp || true
+  sudo /tmp/aws/install --update || true
+  rm -rf /tmp/aws "${TMP_AWS_ZIP}"
+fi
 export PIP_NO_CACHE_DIR=1
 export PATH="$VENV_PATH/bin:$PATH"
 "$VENV_PATH/bin/pip" install --no-cache-dir poetry>=1.8.0 poetry-plugin-export huggingface-hub || true
