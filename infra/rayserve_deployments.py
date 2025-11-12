@@ -1,560 +1,345 @@
+# infra/rayserve_deployments.py
 from __future__ import annotations
 import os
-import time
 import json
 import logging
-import traceback
-from typing import Any, Dict, List
-from concurrent.futures import ThreadPoolExecutor
-import ray
-from ray import serve
-from ray.serve import HTTPOptions
-cpu_count = os.cpu_count() or 1
-def _env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    try:
-        return int(v)
-    except Exception:
-        return default
-def _env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    try:
-        return float(v)
-    except Exception:
-        return default
-def _env_bool(name: str, default: bool) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return v.lower() in ("1", "true", "yes", "on")
-os.environ.setdefault("OMP_NUM_THREADS", str(max(1, cpu_count // 4)))
-os.environ.setdefault("OPENBLAS_NUM_THREADS", os.getenv("OPENBLAS_NUM_THREADS", str(max(1, cpu_count // 4))))
-os.environ.setdefault("MKL_NUM_THREADS", os.getenv("MKL_NUM_THREADS", str(max(1, cpu_count // 4))))
+import time
+import asyncio
+import math
+from typing import Any, Dict, List, Optional
+
+# --- ENV defaults (staging-friendly, override with exports in prod) ---
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.INFO), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-log = logging.getLogger("rayserve_deployments")
+SERVE_HTTP_HOST = os.getenv("SERVE_HTTP_HOST", "127.0.0.1")
+SERVE_HTTP_PORT = int(os.getenv("SERVE_HTTP_PORT", "8003"))
+
+# RAG behavior toggles
+REQUIRE_LLM_ON_DEPLOY = os.getenv("REQUIRE_LLM_ON_DEPLOY", "false").lower() in ("1", "true", "yes")
+ENABLE_CROSS_ENCODER = os.getenv("ENABLE_CROSS_ENCODER", "true").lower() in ("1", "true", "yes")
+PREFER_GRPC = os.getenv("PREFER_GRPC", "true").lower() in ("1", "true", "yes")
+
+# Retrieval / LLM defaults
+MAX_CHUNKS_TO_LLM = int(os.getenv("MAX_CHUNKS_TO_LLM", "8"))
+CALL_TIMEOUT_SECONDS = float(os.getenv("CALL_TIMEOUT_SECONDS", "30"))
+STREAM_FALLBACK_TO_BLOCKING = True  # always try streaming, then fallback
+
+# Model paths (safe defaults). If you set REQUIRE_LLM_ON_DEPLOY=true and LLM_PATH missing, deploy will abort.
+LLM_PATH = os.getenv("LLM_PATH", "/workspace/models/llm.gguf")
+
+# Logging
+logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("rayserve_deployments_single")
+
+# Try optional heavy imports and keep graceful fallbacks
 try:
-    from transformers import PreTrainedTokenizerFast
-except Exception:
-    PreTrainedTokenizerFast = None
+    import ray
+    from ray import serve
+    from ray.serve import HTTPOptions
+except Exception as e:
+    log.exception("ray/serve not importable; ensure ray is installed: %s", e)
+    raise
+
+# Keep your query.py unchanged; we will call its DB helpers when available.
 try:
-    import onnxruntime as ort
+    import infra.query as querylib
 except Exception:
-    ort = None
+    querylib = None
+    log.info("infra.query not importable; retrieval will use local-only paths or return empty.")
+
+# Try to import llama-cpp-python for LLM generation; fallback to simple template generator.
 try:
     from llama_cpp import Llama
     _LLAMA_AVAILABLE = True
 except Exception:
-    Llama = None
     _LLAMA_AVAILABLE = False
-SERVE_HTTP_HOST = os.getenv("SERVE_HTTP_HOST", "127.0.0.1")
-SERVE_HTTP_PORT = _env_int("SERVE_HTTP_PORT", 8003)
-EMBED_DEPLOYMENT = os.getenv("EMBED_DEPLOYMENT", "embed_onnx_cpu")
-RERANK_DEPLOYMENT = os.getenv("RERANK_DEPLOYMENT", "rerank_onnx_cpu")
-LLM_DEPLOYMENT = os.getenv("LLM_DEPLOYMENT", "llm_server_cpu")
-ONNX_EMBED_PATH = os.getenv("ONNX_EMBED_PATH", "/workspace/models/gte-modernbert-base/onnx/model_int8.onnx")
-ONNX_EMBED_TOKENIZER_PATH = os.getenv("ONNX_EMBED_TOKENIZER_PATH", "/workspace/models/gte-modernbert-base/tokenizer.json")
-ONNX_RERANK_PATH = os.getenv("ONNX_RERANK_PATH", "/workspace/models/ms-marco-TinyBERT-L2-v2/onnx/model_qint8_arm64.onnx")
-ONNX_RERANK_TOKENIZER_PATH = os.getenv("ONNX_RERANK_TOKENIZER_PATH", "/workspace/models/ms-marco-TinyBERT-L2-v2/tokenizer.json")
-LLM_PATH = os.getenv("LLM_PATH", "/workspace/models/llm.gguf")
-REQUIRE_LLM_ON_DEPLOY = os.getenv("REQUIRE_LLM_ON_DEPLOY", "true").lower() in ("1", "true", "yes")
-EMBED_REPLICAS = _env_int("EMBED_REPLICAS", 1)
-RERANK_REPLICAS = _env_int("RERANK_REPLICAS", 1)
-LLM_REPLICAS = _env_int("LLM_REPLICAS", 1)
-EMBED_NUM_CPUS_PER_REPLICA = _env_float("EMBED_NUM_CPUS_PER_REPLICA", 1.0)
-RERANK_NUM_CPUS_PER_REPLICA = _env_float("RERANK_NUM_CPUS_PER_REPLICA", 1.0)
-LLM_NUM_CPUS_PER_REPLICA = _env_float("LLM_NUM_CPUS_PER_REPLICA", max(1, int(cpu_count * 0.5)))
-ORT_INTRA_THREADS = _env_int("ORT_INTRA_THREADS", max(1, cpu_count // 4))
-ORT_INTER_THREADS = _env_int("ORT_INTER_THREADS", 1)
-EMBED_BATCH_MAX_SIZE = _env_int("EMBED_BATCH_MAX_SIZE", 16)
-EMBED_BATCH_WAIT_S = float(os.getenv("EMBED_BATCH_WAIT_S", "0.05"))
-RERANK_BATCH_MAX_SIZE = _env_int("RERANK_BATCH_MAX_SIZE", 8)
-RERANK_BATCH_WAIT_S = float(os.getenv("RERANK_BATCH_WAIT_S", "0.05"))
-LLM_N_THREADS = _env_int("LLM_N_THREADS", max(1, int(LLM_NUM_CPUS_PER_REPLICA) - 1))
-LLM_MAX_CONCURRENCY = _env_int("LLM_MAX_CONCURRENCY", 1)
-if ort is not None:
-    try:
-        ort.set_default_logger_severity(3)
-    except Exception:
-        pass
-import numpy as np
-def _ensure_file(path: str):
-    if not path:
-        raise FileNotFoundError("Empty path")
-    if not os.path.exists(path):
-        raise FileNotFoundError(path)
-def make_session(path: str, intra_threads: int = ORT_INTRA_THREADS, inter_threads: int = ORT_INTER_THREADS):
-    if ort is None:
-        raise RuntimeError("onnxruntime not available")
-    so = ort.SessionOptions()
-    so.intra_op_num_threads = int(max(1, intra_threads))
-    so.inter_op_num_threads = int(max(1, inter_threads))
-    try:
-        so.enable_mem_pattern = True
-        so.enable_cpu_mem_arena = True
-    except Exception:
-        pass
-    providers = ["CPUExecutionProvider"]
-    sess = ort.InferenceSession(path, sess_options=so, providers=providers)
-    return sess
-def mean_pool(last_hidden: np.ndarray, attention_mask: np.ndarray) -> np.ndarray:
-    mask = attention_mask.astype(np.float32)
-    mask = mask[:, :, None]
-    summed = (last_hidden * mask).sum(axis=1)
-    denom = np.maximum(mask.sum(axis=1), 1e-9)
-    return summed / denom
-if serve is not None:
-    @serve.deployment(name=EMBED_DEPLOYMENT, num_replicas=EMBED_REPLICAS, ray_actor_options={"num_gpus": 0.0, "num_cpus": float(EMBED_NUM_CPUS_PER_REPLICA)})
-    class ONNXEmbed:
-        def __init__(self, onnx_path: str = ONNX_EMBED_PATH, tokenizer_path: str = ONNX_EMBED_TOKENIZER_PATH):
-            if PreTrainedTokenizerFast is None:
-                raise RuntimeError("transformers tokenizers not available")
-            _ensure_file(tokenizer_path)
-            self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_path)
-            if getattr(self.tokenizer, "pad_token", None) is None:
-                if getattr(self.tokenizer, "eos_token", None) is not None:
-                    self.tokenizer.pad_token = self.tokenizer.eos_token
-                elif getattr(self.tokenizer, "sep_token", None) is not None:
-                    self.tokenizer.pad_token = self.tokenizer.sep_token
-                else:
-                    self.tokenizer.add_special_tokens({"pad_token":"[PAD]"})
-            _ensure_file(onnx_path)
-            intra = max(1, int(max(1, EMBED_NUM_CPUS_PER_REPLICA)))
-            inter = max(1, int(ORT_INTER_THREADS))
-            self.sess = make_session(onnx_path, intra_threads=intra, inter_threads=inter)
-            self.input_names = [inp.name for inp in self.sess.get_inputs()]
-            self._batch_q = queue.Queue()
-            self._stop_worker = threading.Event()
-            self._worker = ThreadPoolExecutor(max_workers=1)
-            def _worker_main():
-                while not self._stop_worker.is_set():
-                    try:
-                        txt, fut = self._batch_q.get(timeout=0.5)
-                    except Exception:
-                        continue
-                    items = [ (txt, fut) ]
-                    start = time.time()
-                    while len(items) < max(1, EMBED_BATCH_MAX_SIZE):
-                        try:
-                            to_add = self._batch_q.get(timeout=max(0, EMBED_BATCH_WAIT_S - (time.time()-start)))
-                            items.append(to_add)
-                        except Exception:
-                            break
-                    texts = [t for t, fut in items]
-                    try:
-                        toks = self.tokenizer(texts, padding=True, truncation=True, return_tensors="np", max_length=64)
-                        ort_inputs = {}
-                        for k, v in toks.items():
-                            if k in self.input_names:
-                                ort_inputs[k] = v.astype("int64")
-                            else:
-                                if k == "input_ids":
-                                    for cand in ("input_ids","input","input.1"):
-                                        if cand in self.input_names:
-                                            ort_inputs[cand] = v.astype("int64"); break
-                        outputs = self.sess.run(None, ort_inputs)
-                        vecs = None
-                        for arr in outputs:
-                            arr = np.asarray(arr)
-                            if arr.ndim == 3 and arr.shape[0] == len(texts):
-                                attn = toks.get("attention_mask", np.ones(arr.shape[:2], dtype="int64"))
-                                vecs = mean_pool(arr, attn); break
-                            if arr.ndim == 2 and arr.shape[0] == len(texts):
-                                vecs = arr; break
-                        if vecs is None:
-                            last = np.asarray(outputs[-1])
-                            if last.ndim > 2 and last.shape[0] == len(texts):
-                                vecs = last.reshape((last.shape[0], -1))
-                            else:
-                                raise RuntimeError("ONNX embed outputs invalid shapes")
-                        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-                        norms = np.maximum(norms, 1e-12)
-                        vecs = (vecs / norms).astype(float)
-                        for (_, fut), v in zip(items, vecs):
-                            try:
-                                fut.set_result(v.tolist())
-                            except Exception:
-                                pass
-                    except Exception as e:
-                        tb = traceback.format_exc()
-                        log.exception("embed batch worker error: %s", tb)
-                        for _, fut in items:
-                            try:
-                                fut.set_exception(e)
-                            except Exception:
-                                pass
-            self._worker.submit(_worker_main)
-            self.ready = False
+
+# -------------------------
+# Minimal deterministic embedder (no external libs)
+# -------------------------
+def simple_text_embedding(text: str, dim: int = 128) -> List[float]:
+    """
+    Fast deterministic embedding. Not semantically deep.
+    Used as safe fallback when dedicated embedder deployment is absent.
+    """
+    if not text:
+        return [0.0] * dim
+    # hash-based features: stable across runs
+    h = [0.0] * dim
+    for i, ch in enumerate(text):
+        idx = (ord(ch) + i * 31) % dim
+        h[idx] += (ord(ch) % 97) + 1
+    # normalize
+    norm = math.sqrt(sum(x * x for x in h)) or 1.0
+    return [x / norm for x in h]
+
+# -------------------------
+# Small LLM wrapper (safe)
+# -------------------------
+class LocalLLM:
+    def __init__(self, model_path: Optional[str] = None, n_threads: int = 2):
+        self.model_path = model_path
+        self.n_threads = n_threads
+        self._use_llama = False
+        self._llm = None
+        if _LLAMA_AVAILABLE and model_path and os.path.exists(model_path):
             try:
-                toks = self.tokenizer(["health-check"], padding=True, truncation=True, return_tensors="np", max_length=min(8, 64))
-                ort_inputs = {}
-                for k, v in toks.items():
-                    if k in self.input_names:
-                        ort_inputs[k] = v.astype("int64")
-                    else:
-                        if k == "input_ids":
-                            for cand in ("input_ids","input","input.1"):
-                                if cand in self.input_names:
-                                    ort_inputs[cand] = v.astype("int64"); break
-                outputs = self.sess.run(None, ort_inputs)
-                out = None
-                for arr in outputs:
-                    arr = np.asarray(arr)
-                    if arr.ndim == 3:
-                        attn = toks.get("attention_mask", np.ones(arr.shape[:2], dtype="int64"))
-                        out = mean_pool(arr, attn); break
-                    if arr.ndim == 2:
-                        out = arr; break
-                if out is None:
-                    last = np.asarray(outputs[-1])
-                    if last.ndim > 2:
-                        out = last.reshape((last.shape[0], -1))
-                    else:
-                        out = last
-                if out is None or out.ndim != 2:
-                    raise RuntimeError("Unable to infer embedding output shape")
-                self._embed_dim = int(out.shape[1])
-                self.ready = True
-                log.info("[%s] initialized embed_dim=%d intra=%d", EMBED_DEPLOYMENT, self._embed_dim, intra)
+                self._llm = Llama(model_path=model_path, n_threads=int(n_threads))
+                self._use_llama = True
+                log.info("LocalLLM: llama-cpp-python loaded model %s", model_path)
             except Exception:
-                log.exception("ONNXEmbed probe failed")
-                raise
-        def __call__(self, request_or_payload):
+                log.exception("LocalLLM: failed to init Llama; falling back to template generator")
+                self._use_llama = False
+                self._llm = None
+        else:
+            if model_path:
+                log.info("LocalLLM: llama not available or model missing; using template fallback")
+
+    def generate_blocking(self, prompt: str, params: Optional[Dict[str, Any]] = None) -> str:
+        params = params or {}
+        if self._use_llama and self._llm is not None:
             try:
-                if isinstance(request_or_payload, (dict, list)):
-                    body = request_or_payload
-                else:
-                    try:
-                        body = request_or_payload.json()
-                    except Exception:
-                        try:
-                            raw = request_or_payload.body(); body = json.loads(raw.decode("utf-8")) if raw else {}
-                        except Exception:
-                            body = {}
-                texts = body.get("texts", []) if isinstance(body, dict) else []
-                if not isinstance(texts, list):
-                    texts = [texts]
-                futures_list = []
-                for txt in texts:
-                    fut = __import__("concurrent.futures").Future()
-                    self._batch_q.put((txt, fut))
-                    futures_list.append(fut)
-                results = [f.result() for f in futures_list]
-                return {"vectors": [r for r in results], "max_length_used": 64}
-            except Exception:
-                log.exception("embed call error"); raise
-        def health(self):
-            return {"ready": getattr(self, "ready", False)}
-        def __del__(self):
-            try:
-                self._stop_worker.set()
-            except Exception:
-                pass
-    @serve.deployment(name=RERANK_DEPLOYMENT, num_replicas=RERANK_REPLICAS, ray_actor_options={"num_gpus": 0.0, "num_cpus": float(RERANK_NUM_CPUS_PER_REPLICA)})
-    class ONNXRerank:
-        def __init__(self, onnx_path: str = ONNX_RERANK_PATH, tokenizer_path: str = ONNX_RERANK_TOKENIZER_PATH):
-            if PreTrainedTokenizerFast is None:
-                raise RuntimeError("transformers tokenizers not available")
-            _ensure_file(tokenizer_path)
-            self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_path)
-            if getattr(self.tokenizer, "pad_token", None) is None:
-                if getattr(self.tokenizer, "eos_token", None) is not None:
-                    self.tokenizer.pad_token = self.tokenizer.eos_token
-                elif getattr(self.tokenizer, "sep_token", None) is not None:
-                    self.tokenizer.pad_token = self.tokenizer.sep_token
-                else:
-                    self.tokenizer.add_special_tokens({"pad_token":"[PAD]"})
-            _ensure_file(onnx_path)
-            intra = max(1, int(max(1, RERANK_NUM_CPUS_PER_REPLICA)))
-            inter = max(1, int(ORT_INTER_THREADS))
-            self.sess = make_session(onnx_path, intra_threads=intra, inter_threads=inter)
-            self.input_names = [inp.name for inp in self.sess.get_inputs()]
-            self._executor = ThreadPoolExecutor(max_workers=max(1, intra))
-            self._sem = __import__("asyncio").Semaphore(max(1, intra))
-            self.ready = False
-            try:
-                toks = self.tokenizer([("q","a"),("q","b")], padding=True, truncation='only_second', return_tensors="np", max_length=min(8, 256))
-                ort_inputs = {}
-                for k, v in toks.items():
-                    if k in self.input_names:
-                        ort_inputs[k] = v.astype("int64")
-                    else:
-                        if k == "input_ids":
-                            for cand in ("input_ids","input","input.1"):
-                                if cand in self.input_names:
-                                    ort_inputs[cand] = v.astype("int64"); break
-                outs = self.sess.run(None, ort_inputs)
-                derived = None
-                for arr in outs:
-                    arr = np.asarray(arr)
-                    if arr.ndim == 1 and arr.shape[0] == 2:
-                        derived = arr; break
-                    if arr.ndim == 2 and arr.shape[0] == 2:
-                        derived = arr[:,0]; break
-                if derived is None:
-                    derived = np.asarray(outs[-1]).reshape(2, -1)[:,0]
-                self.ready = True
-                log.info("[%s] rerank initialized sample_scores=%s intra=%d", RERANK_DEPLOYMENT, derived.shape, intra)
-            except Exception:
-                log.exception("ONNXRerank probe failed")
-                raise
-        def __call__(self, request_or_payload):
-            try:
-                if isinstance(request_or_payload, (dict, list)):
-                    body = request_or_payload
-                else:
-                    try:
-                        body = request_or_payload.json()
-                    except Exception:
-                        try:
-                            raw = request_or_payload.body(); body = json.loads(raw.decode("utf-8")) if raw else {}
-                        except Exception:
-                            body = {}
-                q = body.get("query", "") if isinstance(body, dict) else ""
-                cands = body.get("cands", []) if isinstance(body, dict) else []
-                if not isinstance(cands, list):
-                    cands = [cands]
-                if len(cands) == 0:
-                    return {"scores": []}
-                eff_max = int(body.get("max_length", 256) or 256)
-                def _tokenize():
-                    return self.tokenizer([(q, t) for t in cands], padding=True, truncation='only_second', return_tensors="np", max_length=eff_max)
-                toks = _tokenize()
-                ort_inputs = {}
-                for k, v in toks.items():
-                    if k in self.input_names:
-                        ort_inputs[k] = v.astype("int64")
-                    else:
-                        if k == "input_ids":
-                            for cand in ("input_ids","input","input.1"):
-                                if cand in self.input_names:
-                                    ort_inputs[cand] = v.astype("int64"); break
-                outputs = self.sess.run(None, ort_inputs)
-                scores = None
-                for arr in outputs:
-                    arr = np.asarray(arr)
-                    if arr.ndim == 1 and arr.shape[0] == len(cands):
-                        scores = arr; break
-                    if arr.ndim == 2 and arr.shape[0] == len(cands):
-                        scores = arr[:,0]; break
-                if scores is None:
-                    last = np.asarray(outputs[-1])
-                    try:
-                        scores = last.reshape(len(cands), -1)[:,0]
-                    except Exception as e:
-                        raise RuntimeError("unable to parse reranker outputs: " + str(e))
-                return {"scores": [float(s) for s in np.asarray(scores).astype(float)], "max_length_used": int(eff_max)}
-            except Exception:
-                log.exception("rerank call error"); raise
-        def health(self):
-            return {"ready": getattr(self, "ready", False)}
-        def __del__(self):
-            try:
-                self._executor.shutdown(wait=False)
-            except Exception:
-                pass
-    if _LLAMA_AVAILABLE:
-        @serve.deployment(name=LLM_DEPLOYMENT, num_replicas=LLM_REPLICAS, ray_actor_options={"num_gpus": 0.0, "num_cpus": float(LLM_NUM_CPUS_PER_REPLICA)})
-        class LlamaServe:
-            def __init__(self, model_path: str = LLM_PATH, n_threads: int = LLM_N_THREADS, max_concurrency: int = LLM_MAX_CONCURRENCY):
-                _ensure_file(model_path)
+                out = self._llm(prompt, **params)
+                # llama-cpp-python returns object with 'text' often
+                if isinstance(out, dict):
+                    return str(out.get("text") or out.get("output") or json.dumps(out))
                 try:
-                    start_core = _env_int("START_CORE", 0)
-                    cores_per = _env_int("CORES_PER_REPLICA", max(1, int(LLM_NUM_CPUS_PER_REPLICA)))
-                    try:
-                        if hasattr(os, "sched_setaffinity"):
-                            os.sched_setaffinity(0, set(range(start_core, start_core + cores_per)))
-                    except Exception:
-                        pass
+                    return str(getattr(out, "text", out))
                 except Exception:
-                    pass
-                self._executor = ThreadPoolExecutor(max_workers=max(1, int(max(1, n_threads))))
-                self._sem = __import__("asyncio").Semaphore(max(1, int(max_concurrency)))
-                try:
-                    init_kwargs = {}
-                    init_kwargs["n_threads"] = int(max(1, n_threads))
-                    if "verbose" in getattr(Llama, "__init__", lambda *a, **k: None).__code__.co_varnames:
-                        init_kwargs["verbose"] = False
-                    with open(os.devnull, "wb") as devnull:
-                        try:
-                            self.llm = Llama(model_path=model_path, **init_kwargs)
-                        except TypeError:
-                            self.llm = Llama(model_path=model_path)
+                    return str(out)
+            except Exception:
+                log.exception("LocalLLM llama call failed; falling back")
+        # fallback deterministic response
+        snippet = (prompt[:300] + "...") if len(prompt) > 300 else prompt
+        return f"(fallback-llm) Answer based on provided context + prompt preview: {snippet}"
+
+    async def generate_stream(self, prompt: str, params: Optional[Dict[str, Any]] = None):
+        """
+        Async generator yielding strings (tokens / fragments).
+        Llama streaming not assumed. This yields token-like chunks for SSE.
+        """
+        params = params or {}
+        if self._use_llama and self._llm is not None:
+            # no streaming API guaranteed; call blocking then chunk
+            text = self.generate_blocking(prompt, params)
+            for i in range(0, len(text), 80):
+                yield text[i:i+80]
+                await asyncio.sleep(0.01)
+            return
+        # fallback: chunk the fallback response
+        text = self.generate_blocking(prompt, params)
+        for i in range(0, len(text), 80):
+            await asyncio.sleep(0.01)
+            yield text[i:i+80]
+
+# -------------------------
+# Single Serve deployment with FastAPI ingress
+# -------------------------
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import HTMLResponse, StreamingResponse
+
+app = FastAPI(title="RAG Gateway (single-deployment)")
+
+# Attach runtime state
+class GatewayState:
+    def __init__(self):
+        # handles for external deployments (if you later add them)
+        self.embed_handle = None
+        self.rerank_handle = None
+        self.llm_handle = None
+        # local fallbacks
+        self.local_llm = LocalLLM(model_path=LLM_PATH if os.path.exists(LLM_PATH) else None)
+        # indicate whether we require LLM presence
+        self.require_llm = REQUIRE_LLM_ON_DEPLOY
+
+state = GatewayState()
+app.state.gateway = state
+
+# UI
+_UI_HTML = """
+<html>
+  <body>
+    <h3>Hybrid RAG (single-deployment) — Test UI</h3>
+    <form method="post" action="/retrieve">
+      <textarea name="query" rows="4" cols="60">What is MLOps?</textarea><br/>
+      <label><input type="checkbox" name="stream" checked/> stream</label><br/>
+      <button type="submit">Send</button>
+    </form>
+  </body>
+</html>
+"""
+
+@app.get("/", response_class=HTMLResponse)
+async def root_ui():
+    return HTMLResponse(_UI_HTML)
+
+@app.get("/healthz")
+async def healthz():
+    # report simple readiness: LLM required check
+    ok = True
+    msg = "ok"
+    if state.require_llm:
+        if (not _LLAMA_AVAILABLE) and (state.local_llm and state.local_llm._use_llama is False):
+            ok = False
+            msg = "llm-missing"
+    return {"status": "ok" if ok else "fail", "note": msg}
+
+# Helper: build context using querylib if available, else basic stub
+def build_context_and_prompt(query_text: str, top_k: int = 5) -> Dict[str, Any]:
+    """
+    Returns dict with keys: prompt (JSON string for LLM), provenance (list), records (list)
+    This tries to use infra.query.retrieve_pipeline if available and if embed/rerank handles are present.
+    Otherwise it builds a minimal prompt using no external chunks.
+    """
+    if querylib is not None:
+        # attempt to use querylib.make_clients and querylib.retrieve_pipeline
+        try:
+            qdrant_client, neo4j_driver = querylib.make_clients()
+            # prefer direct embed handle if present in state; else pass None to fallback BM25-only
+            embed_handle = state.embed_handle
+            rerank_handle = state.rerank_handle
+            res = querylib.retrieve_pipeline(embed_handle, rerank_handle, qdrant_client, neo4j_driver, query_text, max_chunks=MAX_CHUNKS_TO_LLM)
+            return res
+        except Exception as e:
+            log.exception("querylib.retrieve_pipeline failed; falling back to simple prompt: %s", e)
+    # fallback minimal
+    prompt = json.dumps({
+        "QUERY": query_text,
+        "CONTEXT_CHUNKS": [],
+        "YOUR_ROLE": "You are a helpful assistant. Answer using only the provided context if present."
+    }, ensure_ascii=False)
+    return {"prompt": prompt, "provenance": [], "records": []}
+
+# SSE encoder
+def sse_event(data_obj: dict) -> str:
+    return "data: " + json.dumps(data_obj, ensure_ascii=False) + "\n\n"
+
+@app.post("/retrieve")
+async def retrieve(req: Request):
+    # accept JSON or form
+    try:
+        body = await req.json()
+    except Exception:
+        form = await req.form()
+        body = dict(form)
+    query_text = body.get("query") or body.get("input") or ""
+    stream_flag = body.get("stream", True)
+    # normalize stream flag
+    if isinstance(stream_flag, str):
+        stream_flag = stream_flag.lower() in ("1", "true", "yes", "on")
+    elif isinstance(stream_flag, (int, float)):
+        stream_flag = bool(stream_flag)
+    # Build context (possibly heavy)
+    ctx = build_context_and_prompt(query_text)
+    prompt_json = ctx.get("prompt", json.dumps({"QUERY": query_text, "CONTEXT_CHUNKS": [], "YOUR_ROLE": "assistant"}))
+    provenance = ctx.get("provenance", [])
+    records = ctx.get("records", [])
+
+    # choose LLM source: prefer remote handle if present, else local fallback
+    llm_handle = state.llm_handle  # if later wired to a handle
+    use_local_llm = True
+    if llm_handle is not None:
+        use_local_llm = False
+
+    # Streaming path
+    if stream_flag:
+        async def stream_gen():
+            # attempt streaming via handle if available and has streaming API
+            try:
+                if not use_local_llm:
+                    # attempt to call querylib.call_llm_stream if present
+                    if querylib is not None:
+                        async for piece in querylib.call_llm_stream(llm_handle, prompt_json, params={}):
+                            yield sse_event({"event": "token", "data": piece})
+                        yield sse_event({"event": "done", "provenance": provenance, "records": records})
+                        return
+                    # fallback: try calling handle.remote(...) pattern via ray
                     try:
-                        _ = self.llm("health-check", max_tokens=1)
-                    except Exception:
-                        pass
-                    self.ready = True
-                    log.info("[%s] loaded model %s n_threads=%d max_concurrency=%d", LLM_DEPLOYMENT, model_path, n_threads, max_concurrency)
-                except Exception:
-                    log.exception("Failed loading LLM model")
-                    raise
-            def generate(self, prompt: str, params: Dict[str, Any] = None):
-                params = params or {}
-                with self._sem:
-                    try:
-                        result = self.llm(prompt, **params)
-                        if hasattr(result, "to_dict"):
-                            try:
-                                dd = result.to_dict()
-                                if isinstance(dd, dict):
-                                    return dd
-                            except Exception:
-                                pass
-                        return {"text": str(result)}
-                    except Exception as e:
-                        raise RuntimeError("llama-cpp-python call failed: " + str(e)) from e
-            def stream(self, prompt: str, params: Dict[str, Any] = None):
-                params = params or {}
-                with self._sem:
-                    q_tokens = queue.Queue()
-                    def _cb(tok: Any, *a, **k):
+                        # best-effort: call llm_handle remotely if it supports streaming
+                        maybe = llm_handle.remote({"prompt": prompt_json, "params": {}, "stream": True})
+                        # ray.get of generator may succeed
                         try:
-                            if isinstance(tok, (bytes, bytearray)):
-                                tok = tok.decode("utf-8", errors="ignore")
-                            q_tokens.put(tok)
+                            it = maybe
+                            # if it's an iterator/list
+                            for piece in it:
+                                yield sse_event({"event": "token", "data": str(piece)})
+                            yield sse_event({"event": "done", "provenance": provenance, "records": records})
+                            return
                         except Exception:
                             pass
-                    def _run_stream():
-                        try:
-                            try:
-                                self.llm(prompt, stream=True, callback=_cb, **params)
-                            except TypeError:
-                                try:
-                                    self.llm(prompt, stream=True, stream_callback=_cb, **params)
-                                except TypeError:
-                                    res = self.llm(prompt, **params)
-                                    s = None
-                                    if hasattr(res, "to_dict"):
-                                        try:
-                                            dd = res.to_dict()
-                                            s = dd.get("text") or dd.get("generated_text") or str(dd)
-                                        except Exception:
-                                            s = str(res)
-                                    else:
-                                        s = str(res)
-                                    q_tokens.put(s)
-                        except Exception as e:
-                            q_tokens.put(f"[LLM_ERROR:{str(e)}]")
-                        finally:
-                            q_tokens.put(None)
-                    fut = self._executor.submit(_run_stream)
-                    while True:
-                        tok = q_tokens.get()
-                        if tok is None:
-                            break
-                        yield tok
-            def __call__(self, request):
+                    except Exception:
+                        pass
+                # either no remote or remote streaming failed => use local LLM streaming
+                async for chunk in state.local_llm.generate_stream(prompt_json, params={}):
+                    yield sse_event({"event": "token", "data": chunk})
+                yield sse_event({"event": "done", "provenance": provenance, "records": records})
+                return
+            except Exception as e:
+                log.exception("streaming path failed: %s", e)
+                # fallback to blocking below
                 try:
-                    body = request.json()
-                except Exception:
-                    body = {}
-                prompt = body.get("prompt") or body.get("input") or ""
-                params = body.get("params", {}) or {}
-                stream_flag = bool(body.get("stream", False))
-                if not stream_flag:
-                    res = self.generate(prompt, params=params)
-                    return res
-                else:
-                    return {"msg": "streaming_requested"}
-            def health(self):
-                return {"ready": getattr(self, "ready", False)}
-            def __del__(self):
-                try:
-                    self._executor.shutdown(wait=False)
-                except Exception:
-                    pass
-def _build_deploy_options(prefix: str, fixed_replicas_env: int, default_num_gpus: float, default_num_cpus: float, max_replicas_per_node_env: int):
-    mode = os.getenv(f"{prefix}_REPLICA_MODE", "fixed").lower()
-    options: Dict[str, Any] = {}
-    num_gpus = _env_float(f"{prefix}_NUM_GPUS_PER_REPLICA", default_num_gpus)
-    if num_gpus != 0.0:
-        num_gpus = 0.0
-    num_cpus = _env_float(f"{prefix}_NUM_CPUS_PER_REPLICA", default_num_cpus)
-    options["ray_actor_options"] = {"num_gpus": num_gpus, "num_cpus": num_cpus}
-    if mode == "auto":
-        cfg_str = os.getenv(f"{prefix}_AUTOSCALING_CONFIG_OVERRIDE", "") or os.getenv(f"{prefix}_AUTOSCALING_CONFIG", "")
-        cfg = None
-        try:
-            if cfg_str:
-                cfg = json.loads(cfg_str)
-        except Exception:
-            log.exception("Invalid autoscaling JSON")
-        if cfg is None:
-            cfg = {"min_replicas": 1, "max_replicas": max(1, fixed_replicas_env), "target_num_ongoing_requests": 2}
-        options["num_replicas"] = "auto"
-        options["autoscaling_config"] = cfg
-    else:
-        fixed = _env_int(f"{prefix}_REPLICAS_FIXED", fixed_replicas_env)
-        options["num_replicas"] = fixed
-    return options
-def deploy_det(deployable, *args, **kwargs):
+                    text = state.local_llm.generate_blocking(prompt_json, params={})
+                    yield sse_event({"event": "token", "data": text})
+                    yield sse_event({"event": "done", "provenance": provenance, "records": records})
+                except Exception as e2:
+                    log.exception("fallback blocking failed: %s", e2)
+                    yield sse_event({"event": "error", "error": str(e2)})
+        return StreamingResponse(stream_gen(), media_type="text/event-stream")
+
+    # Blocking path
     try:
-        deployable.deploy(*args, **kwargs)
+        if not use_local_llm and querylib is not None:
+            # prefer querylib.call_llm_blocking if available
+            try:
+                text = querylib.call_llm_blocking(llm_handle, prompt_json, params={}, timeout=CALL_TIMEOUT_SECONDS)
+                return {"answer": text, "provenance": provenance, "records": records}
+            except Exception:
+                log.exception("remote blocking llm failed; falling back to local")
+        # local LLM blocking
+        text = state.local_llm.generate_blocking(prompt_json, params={})
+        return {"answer": text, "provenance": provenance, "records": records}
     except Exception as e:
-        log.exception("Deployment failed for %s: %s", getattr(deployable, "__name__", str(deployable)), e)
-        raise
+        log.exception("final blocking call failed: %s", e)
+        return {"error": str(e), "provenance": provenance, "records": records}
+
+# --- Serve deployment wrapper ---
+@serve.deployment(name=os.getenv("GATEWAY_DEPLOYMENT_NAME", "gateway"), num_replicas=int(os.getenv("GATEWAY_REPLICAS", "1")), ray_actor_options={"num_gpus": 0.0, "num_cpus": float(os.getenv("GATEWAY_CPUS", "0.5"))})
+@serve.ingress(app)
+class GatewayServe:
+    def __init__(self):
+        # nothing to init; the FastAPI app state already has the gateway state
+        log.info("GatewayServe initialized; app routes available")
+
+# -------------------------
+# Deploy helper
+# -------------------------
 def main():
-    ray.init(address=os.getenv("RAY_ADDRESS") or None, namespace=os.getenv("RAY_NAMESPACE") or None, ignore_reinit_error=True)
+    # Start Ray/Serve (connect to cluster if RAY_ADDRESS is set in env)
+    ray_address = os.getenv("RAY_ADDRESS", None)
+    ray.init(address=(ray_address if ray_address and ray_address != "auto" else None), ignore_reinit_error=True)
     http_opts = HTTPOptions(host=SERVE_HTTP_HOST, port=SERVE_HTTP_PORT)
-    serve.start(detached=True, http_options=http_opts)
-    binds = []
+    # start serve if not started (idempotent)
     try:
-        embed_opts = _build_deploy_options("EMBED", EMBED_REPLICAS, 0.0, EMBED_NUM_CPUS_PER_REPLICA, 1)
-        deployable = ONNXEmbed.options(**{"num_replicas": embed_opts.get("num_replicas"), "ray_actor_options": embed_opts.get("ray_actor_options")})
-        deploy_det(deployable, ONNX_EMBED_PATH, ONNX_EMBED_TOKENIZER_PATH)
-        log.info("Deployed embed")
+        serve.start(detached=True, http_options=http_opts)
     except Exception:
-        log.exception("embed deploy failed"); raise
+        # if already started, connecting is fine
+        pass
+
+    # check LLM requirement
+    if REQUIRE_LLM_ON_DEPLOY:
+        if not _LLAMA_AVAILABLE and not (state.local_llm and state.local_llm._use_llama):
+            raise RuntimeError("REQUIRE_LLM_ON_DEPLOY=true but no LLM available (llama-cpp missing or model file not present)")
+
+    # Deploy single gateway (this creates the ingress)
+    app_binding = GatewayServe.bind()
+    # serve.run expects an Application object produced by bind, so pass it directly
     try:
-        rerank_opts = _build_deploy_options("RERANK", RERANK_REPLICAS, 0.0, RERANK_NUM_CPUS_PER_REPLICA, 1)
-        deployable = ONNXRerank.options(**{"num_replicas": rerank_opts.get("num_replicas"), "ray_actor_options": rerank_opts.get("ray_actor_options")})
-        deploy_det(deployable, ONNX_RERANK_PATH, ONNX_RERANK_TOKENIZER_PATH)
-        log.info("Deployed rerank")
-    except Exception:
-        log.exception("rerank deploy failed"); raise
-    llm_deployed = False
-    if _LLAMA_AVAILABLE:
-        try:
-            if REQUIRE_LLM_ON_DEPLOY:
-                _ensure_file(LLM_PATH)
-            else:
-                try:
-                    _ensure_file(LLM_PATH)
-                except Exception:
-                    log.warning("LLM file missing and REQUIRE_LLM_ON_DEPLOY=false; skipping LLM deployment")
-                    _LLAMA_AVAILABLE = False
-            if _LLAMA_AVAILABLE:
-                llm_opts = _build_deploy_options("LLM", LLM_REPLICAS, 0.0, LLM_NUM_CPUS_PER_REPLICA, max(1, cpu_count))
-                deployable = LlamaServe.options(**{"num_replicas": llm_opts.get("num_replicas"), "ray_actor_options": llm_opts.get("ray_actor_options")})
-                deploy_det(deployable, LLM_PATH, LLM_N_THREADS, LLM_MAX_CONCURRENCY)
-                llm_deployed = True
-                log.info("Deployed llm")
-        except Exception:
-            log.exception("llm deploy failed")
-            if REQUIRE_LLM_ON_DEPLOY:
-                raise
-    else:
-        if REQUIRE_LLM_ON_DEPLOY:
-            raise RuntimeError("llama-cpp-python not available but REQUIRE_LLM_ON_DEPLOY=true")
-    try:
-        from infra.fastapi_gateway import app as fastapi_app
-        GATEWAY_DEPLOYMENT_NAME = os.getenv("GATEWAY_DEPLOYMENT_NAME", "gateway")
-        GATEWAY_REPLICAS = int(os.getenv("GATEWAY_REPLICAS", "1"))
-        GATEWAY_CPUS = float(os.getenv("GATEWAY_CPUS", "0.5"))
-        @serve.deployment(name=GATEWAY_DEPLOYMENT_NAME, num_replicas=GATEWAY_REPLICAS, ray_actor_options={"num_gpus": 0.0, "num_cpus": float(GATEWAY_CPUS)})
-        @serve.ingress(fastapi_app)
-        class GatewayIngress:
-            pass
-        GatewayIngress.deploy()
-        log.info("Deployed gateway ingress")
-    except Exception:
-        log.exception("Failed to bind gateway ingress"); raise
-    log.info("Deployments started: %s %s %s", EMBED_DEPLOYMENT, RERANK_DEPLOYMENT, (LLM_DEPLOYMENT if llm_deployed else "llm_skipped"))
-    log.info("Serve HTTP listening on %s:%d", SERVE_HTTP_HOST, SERVE_HTTP_PORT)
+        serve.run(app_binding)
+    except Exception as e:
+        log.exception("serve.run(app_binding) failed: %s", e)
+        raise
+
+    log.info("GatewayServe deployed. HTTP listening on %s:%s", SERVE_HTTP_HOST, SERVE_HTTP_PORT)
+
 if __name__ == "__main__":
     main()

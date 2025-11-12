@@ -8,10 +8,10 @@ if [ "${BASH_SOURCE[0]}" != "$0" ]; then
   return 1 2>/dev/null || exit 1
 fi
 
-
 # ---------------------------
 # 0 — Pulumi / setup / backend environment (login, stack, venv, passphrase)
 # ---------------------------
+
 export PROJECT_DIR="${PROJECT_DIR:-infra/pulumi-aws}"
 export VENV_DIR="${VENV_DIR:-${PROJECT_DIR}/venv}"
 export REQ_FILE="${REQ_FILE:-${PROJECT_DIR}/requirements.txt}"
@@ -73,7 +73,7 @@ export MULTI_AZ_DEPLOYMENT="${MULTI_AZ_DEPLOYMENT:-true}"
 export VPC_CIDR="${VPC_CIDR:-10.0.0.0/16}"
 export PUBLIC_SUBNET_CIDRS="${PUBLIC_SUBNET_CIDRS:-10.0.1.0/24,10.0.2.0/24}"
 export PRIVATE_SUBNET_CIDRS="${PRIVATE_SUBNET_CIDRS:-10.0.11.0/24,10.0.12.0/24}"
-export NO_NAT="${NO_NAT:-false}"                           # true -> no NAT gateways
+export NO_NAT="${NO_NAT:-true}"                           # true -> no NAT gateways
 export CREATE_VPC_ENDPOINTS="${CREATE_VPC_ENDPOINTS:-true}" # interface/gateway endpoints
 export VPC_ID="${VPC_ID:-}"                                # reuse existing VPC if set
 export PUBLIC_SUBNET_IDS="${PUBLIC_SUBNET_IDS:-}"          # comma list to reuse existing

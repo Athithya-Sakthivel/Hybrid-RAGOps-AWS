@@ -8,6 +8,8 @@ import random
 import functools
 import queue
 import threading
+import concurrent.futures
+import asyncio
 from typing import Any, Dict, List, Optional, Tuple
 try:
     import ray
@@ -26,17 +28,17 @@ except Exception:
     GraphDatabase = None
     Neo4jError = Exception
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.INFO), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("query")
 RAY_ADDRESS = os.getenv("RAY_ADDRESS", "auto")
 RAY_NAMESPACE = os.getenv("RAY_NAMESPACE", None)
 EMBED_DEPLOYMENT = os.getenv("EMBED_DEPLOYMENT", "embed_onnx_cpu")
-RERANK_DEPLOYMENT = os.getenv("RERANK_DEPLOYMENT", "rerank_onnx_cpu")
-LLM_DEPLOYMENT = os.getenv("LLM_DEPLOYMENT", "llm_server_cpu")
+RERANK_DEPLOYMENT = os.getenv("RERANK_HANDLE_NAME", "rerank_onnx_cpu")
+LLM_DEPLOYMENT = os.getenv("LLM_DEPLOYMENT_NAME", "llm_server_cpu")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", None)
 PREFER_GRPC = os.getenv("PREFER_GRPC", "true").lower() in ("1", "true", "yes")
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "my_collection")
+QDRANT_COLLECTION = os.getenv("COLLECTION", "my_collection")
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
@@ -48,7 +50,7 @@ INFERENCE_EMBEDDER_MAX_TOKENS = int(os.getenv("INFERENCE_EMBEDDER_MAX_TOKENS", "
 CROSS_ENCODER_MAX_TOKENS = int(os.getenv("CROSS_ENCODER_MAX_TOKENS", "600"))
 MAX_PROMPT_TOKENS = int(os.getenv("MAX_PROMPT_TOKENS", "3000"))
 EMBED_TIMEOUT = float(os.getenv("EMBED_TIMEOUT", "10"))
-CALL_TIMEOUT_SECONDS = float(os.getenv("CALL_TIMEOUT_SECONDS", "10"))
+CALL_TIMEOUT_SECONDS = float(os.getenv("CALL_TIMEOUT_SECONDS", "15"))
 RETRY_ATTEMPTS = max(1, int(os.getenv("RETRY_ATTEMPTS", "3")))
 RETRY_BASE_SECONDS = float(os.getenv("RETRY_BASE_SECONDS", "0.5"))
 RETRY_JITTER = float(os.getenv("RETRY_JITTER", "0.3"))
@@ -56,6 +58,7 @@ ENABLE_CROSS_ENCODER = os.getenv("ENABLE_CROSS_ENCODER", "true").lower() in ("1"
 MAX_CHUNKS_TO_LLM = int(os.getenv("MAX_CHUNKS_TO_LLM", "8"))
 MODE = os.getenv("MODE", "hybrid").lower()
 ENABLE_METADATA_CHUNKS = os.getenv("ENABLE_METADATA_CHUNKS", "false").lower() in ("1", "true", "yes")
+REQUIRE_LLM_ON_DEPLOY = os.getenv("REQUIRE_LLM_ON_DEPLOY", "true").lower() in ("1", "true", "yes")
 def retry(attempts: int = RETRY_ATTEMPTS, base: float = RETRY_BASE_SECONDS, jitter: float = RETRY_JITTER):
     def deco(fn):
         @functools.wraps(fn)
@@ -166,10 +169,7 @@ def get_strict_handle(name: str, timeout: float = 30.0, poll: float = 0.5, app_n
                 try:
                     handle = serve.get_deployment_handle(name, app_name=app_name, _check_exists=False)
                 except TypeError:
-                    try:
-                        handle = serve.get_deployment_handle(name, _check_exists=False)
-                    except Exception:
-                        handle = None
+                    handle = serve.get_deployment_handle(name, _check_exists=False)
                 except Exception:
                     handle = None
             if handle is None and hasattr(serve, "get_handle"):
@@ -186,8 +186,8 @@ def get_strict_handle(name: str, timeout: float = 30.0, poll: float = 0.5, app_n
             if handle is None:
                 raise RuntimeError("no serve handle API available")
             try:
-                ref = handle.remote({"texts": ["__health_check__"], "max_length": INFERENCE_EMBEDDER_MAX_TOKENS})
-                _ = _resolve_ray_response(ref, timeout=10.0)
+                probe_payload = {"texts": ["__health_check__"], "max_length": int(min(8, INFERENCE_EMBEDDER_MAX_TOKENS))}
+                _ = call_handle(handle, probe_payload, timeout=10.0)
                 return handle
             except Exception as e:
                 last_exc = e
@@ -267,13 +267,7 @@ def make_clients() -> Tuple[Any, Any]:
     neo = None
     if QdrantClient is not None:
         try:
-            if PREFER_GRPC:
-                try:
-                    q = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=True)
-                except Exception:
-                    q = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=False)
-            else:
-                q = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=False)
+            q = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=PREFER_GRPC)
         except Exception as e:
             log.warning("qdrant client creation failed: %s", e)
             q = None
@@ -283,7 +277,7 @@ def make_clients() -> Tuple[Any, Any]:
             try:
                 neo.verify_connectivity()
             except Exception:
-                log.debug("neo4j verify_connectivity failed")
+                log.debug("neo4j verify_connectivity failed (continuing without raising)")
     except Exception:
         neo = None
     return q, neo
@@ -406,7 +400,7 @@ def neo4j_fetch_texts(driver, chunk_ids: List[str]):
         res = s.run(cy, ids=list(chunk_ids))
         for r in res:
             try:
-                out[r["cid"]] = {"text": r.get("text") or "", "token_count": int(r.get("token_count") or 0), "document_id": r.get("document_id"), "source_url": r.get("source_url"), "file_name": r.get("file_name"), "page_number": r.get("page_number"), "row_range": r.get("row_range"), "token_range": r.get("token_range"), "audio_range": r.get("audio_range"), "headings": r.get("headings"), "headings_path": r.get("headings_path")}
+                out[r["cid"]] = {"text": r.get("text") or "", "token_count": int(r.get("token_count") or 0) or 0, "document_id": r.get("document_id"), "source_url": r.get("source_url"), "file_name": r.get("file_name"), "page_number": r.get("page_number"), "row_range": r.get("row_range"), "token_range": r.get("token_range"), "audio_range": r.get("audio_range"), "headings": r.get("headings"), "headings_path": r.get("headings_path")}
             except Exception:
                 continue
     return out
@@ -631,27 +625,53 @@ async def call_llm_stream(llm_handle, prompt_json: str, params: Optional[Dict[st
     params = params or {}
     try:
         if hasattr(llm_handle, "stream"):
-            resp = llm_handle.stream.remote(prompt_json, params or {}, True)
+            try:
+                resp = llm_handle.stream.remote(prompt_json, params or {}, True)
+            except Exception:
+                try:
+                    resp = llm_handle.stream(prompt_json, params or {}, True)
+                except Exception:
+                    resp = None
         elif hasattr(llm_handle, "generate"):
-            resp = llm_handle.generate.remote(prompt_json, params or {}, True)
+            try:
+                resp = llm_handle.generate.remote(prompt_json, params or {}, True)
+            except Exception:
+                try:
+                    resp = llm_handle.generate(prompt_json, params or {}, True)
+                except Exception:
+                    resp = None
         else:
-            resp = llm_handle.remote({"prompt": prompt_json, "params": params, "stream": True})
+            try:
+                resp = llm_handle.remote({"prompt": prompt_json, "params": params, "stream": True})
+            except Exception:
+                resp = None
     except Exception:
-        txt = call_llm_blocking(llm_handle, prompt_json, params=params)
-        yield txt
-        return
+        resp = None
+    if resp is None:
+        try:
+            txt = call_llm_blocking(llm_handle, prompt_json, params=params, timeout=CALL_TIMEOUT_SECONDS)
+            yield txt
+            return
+        except Exception as e:
+            raise RuntimeError("llm blocking fallback failed: " + str(e))
     iterable = None
     try:
         if hasattr(resp, "result") and callable(resp.result):
             try:
                 iterable = resp.result(timeout=CALL_TIMEOUT_SECONDS)
             except Exception:
-                iterable = resp.result()
+                try:
+                    iterable = resp.result()
+                except Exception:
+                    iterable = None
         elif hasattr(resp, "get") and callable(resp.get):
             try:
                 iterable = resp.get(timeout=CALL_TIMEOUT_SECONDS)
             except Exception:
-                iterable = resp.get()
+                try:
+                    iterable = resp.get()
+                except Exception:
+                    iterable = None
         else:
             try:
                 iterable = ray.get(resp, timeout=CALL_TIMEOUT_SECONDS)

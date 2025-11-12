@@ -4,11 +4,11 @@ import os
 import pulumi
 
 # toggles (staging defaults)
-ENABLE_FILE_A = os.getenv("ENABLE_FILE_A", "true").lower() in ("1","true","yes")
-ENABLE_FILE_B = os.getenv("ENABLE_FILE_B", "true").lower() in ("1","true","yes")
-ENABLE_FILE_C = os.getenv("ENABLE_FILE_C", "true").lower() in ("1","true","yes")
-ENABLE_FILE_D = os.getenv("ENABLE_FILE_D", "true").lower() in ("1","true","yes")
-ENABLE_FILE_E = os.getenv("ENABLE_FILE_E", "true").lower() in ("1","true","yes")
+ENABLE_FILE_A = os.getenv("ENABLE_A", "true").lower() in ("1","true","yes")
+ENABLE_FILE_B = os.getenv("ENABLE_B", "true").lower() in ("1","true","yes")
+ENABLE_FILE_C = os.getenv("ENABLE_C", "true").lower() in ("1","true","yes")
+ENABLE_FILE_D = os.getenv("ENABLE_D", "true").lower() in ("1","true","yes")
+ENABLE_FILE_E = os.getenv("ENABLE_E", "true").lower() in ("1","true","yes")
 
 pulumi.log.info(f"ENABLE_FILE_A={ENABLE_FILE_A} ENABLE_FILE_B={ENABLE_FILE_B} ENABLE_FILE_C={ENABLE_FILE_C} ENABLE_FILE_D={ENABLE_FILE_D} ENABLE_FILE_E={ENABLE_FILE_E}")
 
