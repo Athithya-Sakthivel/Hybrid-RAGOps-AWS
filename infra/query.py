@@ -1,3 +1,4 @@
+# infra/query.py
 from __future__ import annotations
 import os
 import time
@@ -11,54 +12,78 @@ import threading
 import concurrent.futures
 import asyncio
 from typing import Any, Dict, List, Optional, Tuple
+
+# Ray/Serve imports are optional at module import but required at runtime
 try:
     import ray
     from ray import serve
 except Exception:
     ray = None
     serve = None
+
 try:
     from qdrant_client import QdrantClient
 except Exception:
     QdrantClient = None
+
 try:
     from neo4j import GraphDatabase
     from neo4j.exceptions import Neo4jError
 except Exception:
     GraphDatabase = None
     Neo4jError = Exception
+
+# Safe import of ThreadPoolExecutor in case of stdlib shadowing
+try:
+    from concurrent.futures import ThreadPoolExecutor
+except Exception:
+    ThreadPoolExecutor = None
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.INFO), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("query")
+
+# Environment defaults (override via exports)
 RAY_ADDRESS = os.getenv("RAY_ADDRESS", "auto")
 RAY_NAMESPACE = os.getenv("RAY_NAMESPACE", None)
+
 EMBED_DEPLOYMENT = os.getenv("EMBED_DEPLOYMENT", "embed_onnx_cpu")
 RERANK_DEPLOYMENT = os.getenv("RERANK_HANDLE_NAME", "rerank_onnx_cpu")
 LLM_DEPLOYMENT = os.getenv("LLM_DEPLOYMENT_NAME", "llm_server_cpu")
+
 QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", None)
 PREFER_GRPC = os.getenv("PREFER_GRPC", "true").lower() in ("1", "true", "yes")
 QDRANT_COLLECTION = os.getenv("COLLECTION", "my_collection")
+
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
+
 VECTOR_DIM = int(os.getenv("VECTOR_DIM", "768"))
 TOP_K = int(os.getenv("TOP_K", "5"))
 TOP_VECTOR_CHUNKS = int(os.getenv("TOP_VECTOR_CHUNKS", "200"))
 TOP_BM25_CHUNKS = int(os.getenv("TOP_BM25_CHUNKS", "100"))
+
 INFERENCE_EMBEDDER_MAX_TOKENS = int(os.getenv("INFERENCE_EMBEDDER_MAX_TOKENS", "64"))
 CROSS_ENCODER_MAX_TOKENS = int(os.getenv("CROSS_ENCODER_MAX_TOKENS", "600"))
 MAX_PROMPT_TOKENS = int(os.getenv("MAX_PROMPT_TOKENS", "3000"))
+
 EMBED_TIMEOUT = float(os.getenv("EMBED_TIMEOUT", "10"))
 CALL_TIMEOUT_SECONDS = float(os.getenv("CALL_TIMEOUT_SECONDS", "15"))
+
 RETRY_ATTEMPTS = max(1, int(os.getenv("RETRY_ATTEMPTS", "3")))
 RETRY_BASE_SECONDS = float(os.getenv("RETRY_BASE_SECONDS", "0.5"))
 RETRY_JITTER = float(os.getenv("RETRY_JITTER", "0.3"))
+
 ENABLE_CROSS_ENCODER = os.getenv("ENABLE_CROSS_ENCODER", "true").lower() in ("1", "true", "yes")
 MAX_CHUNKS_TO_LLM = int(os.getenv("MAX_CHUNKS_TO_LLM", "8"))
 MODE = os.getenv("MODE", "hybrid").lower()
 ENABLE_METADATA_CHUNKS = os.getenv("ENABLE_METADATA_CHUNKS", "false").lower() in ("1", "true", "yes")
 REQUIRE_LLM_ON_DEPLOY = os.getenv("REQUIRE_LLM_ON_DEPLOY", "true").lower() in ("1", "true", "yes")
+
+# Small retry decorator with backoff + jitter
 def retry(attempts: int = RETRY_ATTEMPTS, base: float = RETRY_BASE_SECONDS, jitter: float = RETRY_JITTER):
     def deco(fn):
         @functools.wraps(fn)
@@ -76,6 +101,8 @@ def retry(attempts: int = RETRY_ATTEMPTS, base: float = RETRY_BASE_SECONDS, jitt
             raise last
         return wrapper
     return deco
+
+# Run blocking function in a thread with timeout (thread + queue approach)
 def run_with_timeout(fn, args=(), kwargs=None, timeout: float = CALL_TIMEOUT_SECONDS):
     if kwargs is None:
         kwargs = {}
@@ -95,16 +122,23 @@ def run_with_timeout(fn, args=(), kwargs=None, timeout: float = CALL_TIMEOUT_SEC
     if status == "err":
         raise payload
     return payload
+
+# Ray helper: ensure connected
 def _ensure_ray_connected():
     if ray is None:
         raise RuntimeError("ray not importable")
     if not ray.is_initialized():
-        ray.init(address=(RAY_ADDRESS if RAY_ADDRESS and RAY_ADDRESS != "auto" else None), namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+        ray.init(address=(RAY_ADDRESS if RAY_ADDRESS and RAY_ADDRESS != "auto" else None),
+                 namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+
+# Robustly resolve a ray/serve response to a python object
 def _resolve_ray_response(obj, timeout: float):
     try:
         return ray.get(obj, timeout=timeout)
     except Exception:
         return obj
+
+# Generic handle caller with multiple compatibility heuristics
 def call_handle(handle, payload, timeout: float = EMBED_TIMEOUT):
     if handle is None:
         raise RuntimeError("handle is None")
@@ -115,6 +149,8 @@ def call_handle(handle, payload, timeout: float = EMBED_TIMEOUT):
             resp = handle(payload)
     except Exception as e:
         raise RuntimeError(f"serve invocation failed: {e}") from e
+
+    # many shapes: DeploymentResponse wrapper, object refs, result()/get(), etc.
     try:
         klass = getattr(resp, "__class__", None)
         if klass is not None:
@@ -133,6 +169,8 @@ def call_handle(handle, payload, timeout: float = EMBED_TIMEOUT):
                     pass
     except Exception:
         pass
+
+    # object_refs attribute (Serve may return structured ref)
     try:
         if hasattr(resp, "object_refs"):
             ors = getattr(resp, "object_refs")
@@ -157,6 +195,8 @@ def call_handle(handle, payload, timeout: float = EMBED_TIMEOUT):
     except Exception:
         pass
     return resp
+
+# Robust handle resolver used by gateway
 def get_strict_handle(name: str, timeout: float = 30.0, poll: float = 0.5, app_name: Optional[str] = None):
     _ensure_ray_connected()
     start = time.time()
@@ -165,19 +205,22 @@ def get_strict_handle(name: str, timeout: float = 30.0, poll: float = 0.5, app_n
     while time.time() - start < timeout:
         try:
             handle = None
-            if hasattr(serve, "get_deployment_handle"):
+            # Try new API first
+            if serve is not None and hasattr(serve, "get_deployment_handle"):
                 try:
                     handle = serve.get_deployment_handle(name, app_name=app_name, _check_exists=False)
                 except TypeError:
                     handle = serve.get_deployment_handle(name, _check_exists=False)
                 except Exception:
                     handle = None
-            if handle is None and hasattr(serve, "get_handle"):
+            # Legacy get_handle
+            if handle is None and serve is not None and hasattr(serve, "get_handle"):
                 try:
                     handle = serve.get_handle(name, sync=False)
                 except Exception:
                     handle = None
-            if handle is None and hasattr(serve, "get_deployment"):
+            # get_deployment().get_handle()
+            if handle is None and serve is not None and hasattr(serve, "get_deployment"):
                 try:
                     dep = serve.get_deployment(name)
                     handle = dep.get_handle(sync=False)
@@ -185,6 +228,7 @@ def get_strict_handle(name: str, timeout: float = 30.0, poll: float = 0.5, app_n
                     handle = None
             if handle is None:
                 raise RuntimeError("no serve handle API available")
+            # Probe call to ensure readiness
             try:
                 probe_payload = {"texts": ["__health_check__"], "max_length": int(min(8, INFERENCE_EMBEDDER_MAX_TOKENS))}
                 _ = call_handle(handle, probe_payload, timeout=10.0)
@@ -195,6 +239,8 @@ def get_strict_handle(name: str, timeout: float = 30.0, poll: float = 0.5, app_n
             last_exc = e
         time.sleep(poll)
     raise RuntimeError(f"timed out resolving serve handle {name}: {last_exc}")
+
+# Embedding helper (robustly parse many return shapes)
 @retry()
 def embed_text(embed_handle, text: str, max_length: int = INFERENCE_EMBEDDER_MAX_TOKENS) -> Optional[List[float]]:
     if embed_handle is None:
@@ -225,6 +271,7 @@ def embed_text(embed_handle, text: str, max_length: int = INFERENCE_EMBEDDER_MAX
             vecs = list(vecs.values())
         except Exception:
             pass
+    # normalize shapes
     if isinstance(vecs, list) and len(vecs) >= 1 and isinstance(vecs[0], list):
         v = vecs[0]
     elif isinstance(vecs, list) and len(vecs) == 1 and not isinstance(vecs[0], (int, float)):
@@ -241,6 +288,8 @@ def embed_text(embed_handle, text: str, max_length: int = INFERENCE_EMBEDDER_MAX
     if VECTOR_DIM and len(v) != VECTOR_DIM:
         log.warning("embed dim mismatch %d != %d (continuing)", len(v), VECTOR_DIM)
     return [float(x) for x in v]
+
+# Cross-encoder reranker wrapper
 @retry()
 def cross_rerank(rerank_handle, query: str, texts: List[str], max_length: int = CROSS_ENCODER_MAX_TOKENS) -> List[float]:
     if rerank_handle is None:
@@ -261,6 +310,8 @@ def cross_rerank(rerank_handle, query: str, texts: List[str], max_length: int = 
     if not isinstance(scores, list) or len(scores) != len(texts):
         raise RuntimeError("rerank returned bad payload")
     return [float(s) for s in scores]
+
+# Create Qdrant and Neo4j clients (best-effort)
 @retry()
 def make_clients() -> Tuple[Any, Any]:
     q = None
@@ -281,6 +332,8 @@ def make_clients() -> Tuple[Any, Any]:
     except Exception:
         neo = None
     return q, neo
+
+# Reciprocal rank fusion helper
 def _rrf_fuse(ranked_lists: List[List[str]], k: int = 60) -> Dict[str, float]:
     scores = {}
     for lst in ranked_lists:
@@ -290,8 +343,11 @@ def _rrf_fuse(ranked_lists: List[List[str]], k: int = 60) -> Dict[str, float]:
                 continue
             scores[it] = scores.get(it, 0.0) + 1.0 / (k + rank)
     return scores
+
 def stable_dedupe(ids: List[str]) -> List[str]:
     return list(dict.fromkeys([str(i) for i in ids if i is not None]))
+
+# Token-budget selector for prompt
 def token_budget_select(candidates: List[Dict[str, Any]], max_chunks: int = MAX_CHUNKS_TO_LLM, max_tokens: int = MAX_PROMPT_TOKENS) -> List[Dict[str, Any]]:
     selected = []
     total = 0
@@ -306,6 +362,8 @@ def token_budget_select(candidates: List[Dict[str, Any]], max_chunks: int = MAX_
         total += t
         selected.append(c)
     return selected
+
+# Cosine similarity
 def cosine(a: List[float], b: List[float]) -> float:
     if not a or not b:
         return 0.0
@@ -315,6 +373,8 @@ def cosine(a: List[float], b: List[float]) -> float:
         return 0.0
     dot = sum(x*y for x, y in zip(a, b))
     return float(dot / (math.sqrt(sa) * math.sqrt(sb)))
+
+# Qdrant search wrapper (many client shapes)
 @retry()
 def qdrant_vector_search(client, q_vec: List[float], top_k: int, with_payload: bool = True, with_vectors: bool = True):
     if client is None:
@@ -365,6 +425,8 @@ def qdrant_vector_search(client, q_vec: List[float], top_k: int, with_payload: b
         except Exception:
             pass
     return out
+
+# Neo4j fulltext + fetch helpers
 @retry()
 def neo4j_fulltext_search(driver, query: str, index_name: str = "chunkFulltextIndex", top_k: int = TOP_BM25_CHUNKS):
     if not query or driver is None:
@@ -390,6 +452,7 @@ def neo4j_fulltext_search(driver, query: str, index_name: str = "chunkFulltextIn
     except Exception as e:
         log.warning("neo4j_fulltext_search unexpected: %s", e)
         return []
+
 @retry()
 def neo4j_fetch_texts(driver, chunk_ids: List[str]):
     if not chunk_ids or driver is None:
@@ -404,6 +467,7 @@ def neo4j_fetch_texts(driver, chunk_ids: List[str]):
             except Exception:
                 continue
     return out
+
 @retry()
 def neo4j_find_chunk_ids_by_qdrant_ids(driver, qdrant_ids: List[str]):
     out = {}
@@ -418,8 +482,12 @@ def neo4j_find_chunk_ids_by_qdrant_ids(driver, qdrant_ids: List[str]):
             except Exception:
                 continue
     return out
+
+# prepare record for LLM payload
 def prepare_record_for_llm(entry: Dict[str, Any]) -> Dict[str, Any]:
     return {"chunk_id": entry.get("chunk_id"), "text": entry.get("text", ""), "source_url": entry.get("source_url"), "file_name": entry.get("file_name"), "page_number": entry.get("page_number"), "row_range": entry.get("row_range"), "token_range": entry.get("token_range"), "audio_range": entry.get("audio_range"), "headings": entry.get("headings"), "headings_path": entry.get("headings_path")}
+
+# Main retrieval pipeline (robust, hybrid vector + BM25 + optional cross encoder)
 def retrieve_pipeline(embed_handle, rerank_handle, qdrant_client, neo4j_driver, query_text: str, max_chunks: int = MAX_CHUNKS_TO_LLM):
     t0 = time.time()
     vec = None
@@ -428,6 +496,7 @@ def retrieve_pipeline(embed_handle, rerank_handle, qdrant_client, neo4j_driver, 
     except Exception as e:
         log.warning("embed failed, falling back to BM25-only retrieval: %s", e)
         vec = None
+
     ann_hits = []
     if vec is not None:
         try:
@@ -435,6 +504,7 @@ def retrieve_pipeline(embed_handle, rerank_handle, qdrant_client, neo4j_driver, 
         except Exception as e:
             log.warning("qdrant_vector_search failed: %s", e)
             ann_hits = []
+
     vec_rank = []
     id_to_vec = {}
     qdrant_ids_seen = []
@@ -450,6 +520,7 @@ def retrieve_pipeline(embed_handle, rerank_handle, qdrant_client, neo4j_driver, 
         else:
             if rid is not None:
                 qdrant_ids_seen.append(str(rid))
+
     if qdrant_ids_seen and neo4j_driver is not None:
         try:
             qid_map = neo4j_find_chunk_ids_by_qdrant_ids(neo4j_driver, qdrant_ids_seen)
@@ -467,6 +538,7 @@ def retrieve_pipeline(embed_handle, rerank_handle, qdrant_client, neo4j_driver, 
                     vec_rank.append(mapped)
                     if h.get("vector"):
                         id_to_vec[mapped] = h.get("vector")
+
     bm25_list = []
     bm25_map = {}
     if MODE == "hybrid" and neo4j_driver is not None:
@@ -477,6 +549,7 @@ def retrieve_pipeline(embed_handle, rerank_handle, qdrant_client, neo4j_driver, 
         except Exception:
             bm25_list = []
             bm25_map = {}
+
     metadata_list = []
     if ENABLE_METADATA_CHUNKS:
         try:
@@ -494,6 +567,7 @@ def retrieve_pipeline(embed_handle, rerank_handle, qdrant_client, neo4j_driver, 
                 metadata_list = []
         except Exception:
             metadata_list = []
+
     ranked_lists = []
     if vec_rank:
         ranked_lists.append(vec_rank)
@@ -501,18 +575,22 @@ def retrieve_pipeline(embed_handle, rerank_handle, qdrant_client, neo4j_driver, 
         ranked_lists.append(bm25_list)
     if metadata_list:
         ranked_lists.append(metadata_list)
+
     fused_scores = _rrf_fuse(ranked_lists, k=60)
     fused_order = sorted(fused_scores.items(), key=lambda x: -x[1])
     fused_list = [cid for cid, _ in fused_order]
     deduped_fused = stable_dedupe(fused_list)
     seeds = deduped_fused[:20]
+
     expanded = []
     if MODE == "hybrid" and seeds and neo4j_driver is not None:
         try:
             expanded = []
         except Exception:
             expanded = []
+
     combined_unique_candidates = stable_dedupe(deduped_fused + expanded + vec_rank + bm25_list + metadata_list)
+
     texts_map = {}
     try:
         if MODE == "vector_only":
@@ -536,6 +614,7 @@ def retrieve_pipeline(embed_handle, rerank_handle, qdrant_client, neo4j_driver, 
             texts_map = neo4j_fetch_texts(neo4j_driver, combined_unique_candidates)
     except Exception:
         texts_map = {}
+
     candidates = []
     vec_map = {}
     for h in ann_hits:
@@ -553,11 +632,13 @@ def retrieve_pipeline(embed_handle, rerank_handle, qdrant_client, neo4j_driver, 
         if cid:
             cid = str(cid)
             vec_map[cid] = float(h.get("score", 0.0) or 0.0)
+
     for cid in combined_unique_candidates:
         text_entry = texts_map.get(cid, {})
         token_count = int(text_entry.get("token_count", 0) or 0)
         rec = {"chunk_id": cid, "text": text_entry.get("text", ""), "token_count": token_count, "document_id": text_entry.get("document_id"), "vector_score": vec_map.get(cid, 0.0), "bm25_score": float(bm25_map.get(cid, 0.0) or 0.0), "source_url": text_entry.get("source_url"), "file_name": text_entry.get("file_name"), "page_number": text_entry.get("page_number"), "row_range": text_entry.get("row_range"), "token_range": text_entry.get("token_range"), "audio_range": text_entry.get("audio_range"), "headings": text_entry.get("headings"), "headings_path": text_entry.get("headings_path")}
         candidates.append(rec)
+
     for c in candidates:
         v = c.get("vector")
         if v and vec is not None and isinstance(vec, list):
@@ -570,16 +651,21 @@ def retrieve_pipeline(embed_handle, rerank_handle, qdrant_client, neo4j_driver, 
                 c["vec_sim"] = c.get("vector_score", 0.0)
         else:
             c["vec_sim"] = c.get("vector_score", 0.0)
+
     vec_rank2 = [c["chunk_id"] for c in sorted(candidates, key=lambda x: -x.get("vec_sim", 0.0))]
     bm25_rank2 = [c["chunk_id"] for c in sorted(candidates, key=lambda x: -x.get("bm25_score", 0.0))]
+
     ranked2 = []
     if vec_rank2:
         ranked2.append(vec_rank2)
     if bm25_rank2:
         ranked2.append(bm25_rank2)
+
     fused2_scores = _rrf_fuse(ranked2, k=60)
     final_fused_order = sorted(fused2_scores.items(), key=lambda x: -x[1])
     final_order = stable_dedupe([cid for cid, _ in final_fused_order])
+
+    # optional cross-encoder re-rank
     if ENABLE_CROSS_ENCODER and rerank_handle is not None and final_order:
         top_for_x = final_order[:min(len(final_order), 64)]
         texts_for_x = [next((c["text"] for c in candidates if c["chunk_id"] == cid), "") for cid in top_for_x]
@@ -597,16 +683,21 @@ def retrieve_pipeline(embed_handle, rerank_handle, qdrant_client, neo4j_driver, 
                 final_order = ordered + remaining
         except Exception as e:
             log.warning("cross-rerank failed: %s", e)
+
     final_ids = final_order[: max_chunks * 4]
     final_records = [next((c for c in candidates if c["chunk_id"] == cid), None) for cid in final_ids]
     selected = token_budget_select([c for c in final_records if c], max_chunks=max_chunks, max_tokens=MAX_PROMPT_TOKENS)
     llm_records = [prepare_record_for_llm(r) for r in selected]
+
     provenance = []
     for r in selected:
         provenance.append({"document_id": r.get("document_id"), "chunk_id": r.get("chunk_id"), "score": fused2_scores.get(r.get("chunk_id"), r.get("vec_sim", 0.0))})
+
     prompt = json.dumps({"QUERY": query_text, "CONTEXT_CHUNKS": llm_records, "YOUR_ROLE": "You are a helpful knowledge assistant who answers user queries with provenance using only the provided context chunks below."}, ensure_ascii=False)
     elapsed = time.time() - t0
     return {"prompt": prompt, "provenance": provenance, "records": llm_records, "llm": None, "elapsed": elapsed}
+
+# Blocking LLM call
 def call_llm_blocking(llm_handle, prompt_json: str, params: Optional[Dict[str, Any]] = None, timeout: float = 60.0):
     if llm_handle is None:
         raise RuntimeError("LLM handle missing")
@@ -619,27 +710,33 @@ def call_llm_blocking(llm_handle, prompt_json: str, params: Optional[Dict[str, A
             return str(resp.get("output"))
         return json.dumps(resp, default=str)
     return str(resp)
+
+# Async generator for LLM streaming
 async def call_llm_stream(llm_handle, prompt_json: str, params: Optional[Dict[str, Any]] = None):
     if llm_handle is None:
         raise RuntimeError("LLM handle missing")
     params = params or {}
     try:
+        # Try common patterns for streaming
         if hasattr(llm_handle, "stream"):
             try:
-                resp = llm_handle.stream.remote(prompt_json, params or {}, True)
-            except Exception:
+                # try remote streaming first
+                resp = None
                 try:
-                    resp = llm_handle.stream(prompt_json, params or {}, True)
+                    resp = llm_handle.stream.remote(prompt_json, params or {}, True)
                 except Exception:
-                    resp = None
+                    resp = llm_handle.stream(prompt_json, params or {}, True)
+            except Exception:
+                resp = None
         elif hasattr(llm_handle, "generate"):
             try:
-                resp = llm_handle.generate.remote(prompt_json, params or {}, True)
-            except Exception:
+                resp = None
                 try:
-                    resp = llm_handle.generate(prompt_json, params or {}, True)
+                    resp = llm_handle.generate.remote(prompt_json, params or {}, True)
                 except Exception:
-                    resp = None
+                    resp = llm_handle.generate(prompt_json, params or {}, True)
+            except Exception:
+                resp = None
         else:
             try:
                 resp = llm_handle.remote({"prompt": prompt_json, "params": params, "stream": True})
@@ -647,6 +744,8 @@ async def call_llm_stream(llm_handle, prompt_json: str, params: Optional[Dict[st
                 resp = None
     except Exception:
         resp = None
+
+    # If no streaming mechanism found, fallback to blocking and yield single result
     if resp is None:
         try:
             txt = call_llm_blocking(llm_handle, prompt_json, params=params, timeout=CALL_TIMEOUT_SECONDS)
@@ -654,6 +753,7 @@ async def call_llm_stream(llm_handle, prompt_json: str, params: Optional[Dict[st
             return
         except Exception as e:
             raise RuntimeError("llm blocking fallback failed: " + str(e))
+
     iterable = None
     try:
         if hasattr(resp, "result") and callable(resp.result):
@@ -679,10 +779,13 @@ async def call_llm_stream(llm_handle, prompt_json: str, params: Optional[Dict[st
                 iterable = resp
     except Exception:
         iterable = resp
+
     if isinstance(iterable, list):
         for piece in iterable:
             yield str(piece)
         return
+
+    # try iterate
     try:
         iterator = iter(iterable)
         for piece in iterator:
@@ -690,6 +793,15 @@ async def call_llm_stream(llm_handle, prompt_json: str, params: Optional[Dict[st
         return
     except Exception:
         try:
+            # if it's an async iterator
+            if hasattr(iterable, "__aiter__"):
+                async for piece in iterable:
+                    yield str(piece)
+                return
+        except Exception:
+            pass
+        try:
             yield str(iterable)
         except Exception:
             yield ""
+    return

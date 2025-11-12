@@ -94,7 +94,7 @@ export TAGS="${TAGS:-owner=${USER:-dev},environment=${STACK}}"
 # ---------------------------
 # B — b_identity_alb_iam (ALB, ACM, Cognito, IAM helpers)
 # ---------------------------
-export ENABLE_B="${ENABLE_B:-false}"                      # enable b_identity_alb_iam
+export ENABLE_B="${ENABLE_B:-true}"                      # enable b_identity_alb_iam
 export ENABLE_COGNITO="${ENABLE_COGNITO:-true}"
 export DOMAIN="${DOMAIN:-app.example.com}"
 export HOSTED_ZONE_ID="${HOSTED_ZONE_ID:-}"                # public hosted zone id for ACM DNS validation

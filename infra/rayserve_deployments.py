@@ -3,343 +3,517 @@ from __future__ import annotations
 import os
 import json
 import logging
-import time
 import asyncio
-import math
+import traceback
 from typing import Any, Dict, List, Optional
 
-# --- ENV defaults (staging-friendly, override with exports in prod) ---
+# --- env / defaults (staging-friendly) ---
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+RAY_ADDRESS = os.getenv("RAY_ADDRESS", None)
+RAY_NAMESPACE = os.getenv("RAY_NAMESPACE", None)
+
 SERVE_HTTP_HOST = os.getenv("SERVE_HTTP_HOST", "127.0.0.1")
 SERVE_HTTP_PORT = int(os.getenv("SERVE_HTTP_PORT", "8003"))
 
-# RAG behavior toggles
-REQUIRE_LLM_ON_DEPLOY = os.getenv("REQUIRE_LLM_ON_DEPLOY", "false").lower() in ("1", "true", "yes")
+EMBED_DEPLOYMENT = os.getenv("EMBED_DEPLOYMENT", "embed_onnx_cpu")
+RERANK_DEPLOYMENT = os.getenv("RERANK_HANDLE_NAME", "rerank_onnx_cpu")
+LLM_DEPLOYMENT = os.getenv("LLM_DEPLOYMENT_NAME", "llm_server_cpu")
+
+ONNX_EMBED_PATH = os.getenv("ONNX_EMBED_PATH", "/workspace/models/gte-modernbert-base/onnx/model_int8.onnx")
+ONNX_EMBED_TOKENIZER = os.getenv("ONNX_EMBED_TOKENIZER", "/workspace/models/gte-modernbert-base/tokenizer.json")
+ONNX_RERANK_PATH = os.getenv("ONNX_RERANK_PATH", "/workspace/models/ms-marco-TinyBERT-L2-v2/onnx/model_quint8_avx2.onnx")
+ONNX_RERANK_TOKENIZER = os.getenv("ONNX_RERANK_TOKENIZER", "/workspace/models/ms-marco-TinyBERT-L2-v2/tokenizer.json")
+LLM_MODEL_PATH = os.getenv("LLM_MODEL_PATH", "/workspace/models/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_K_M.gguf")
+
+EMBED_REPLICAS = int(os.getenv("EMBED_REPLICAS", "1"))
+RERANK_REPLICAS = int(os.getenv("RERANK_REPLICAS", "1"))
+LLM_REPLICAS = int(os.getenv("LLM_REPLICAS", "1"))
+
+EMBED_CPUS = float(os.getenv("EMBED_NUM_CPUS_PER_REPLICA", "1.0"))
+RERANK_CPUS = float(os.getenv("RERANK_NUM_CPUS_PER_REPLICA", "1.0"))
+LLM_CPUS = float(os.getenv("LLM_NUM_CPUS_PER_REPLICA", "4.0"))
+
 ENABLE_CROSS_ENCODER = os.getenv("ENABLE_CROSS_ENCODER", "true").lower() in ("1", "true", "yes")
-PREFER_GRPC = os.getenv("PREFER_GRPC", "true").lower() in ("1", "true", "yes")
+REQUIRE_LLM_ON_DEPLOY = os.getenv("REQUIRE_LLM_ON_DEPLOY", "true").lower() in ("1", "true", "yes")
+REQUIRE_EMBED_ON_DEPLOY = os.getenv("REQUIRE_EMBED_ON_DEPLOY", "true").lower() in ("1", "true", "yes")
+REQUIRE_RERANK_ON_DEPLOY = os.getenv("REQUIRE_RERANK_ON_DEPLOY", "false").lower() in ("1", "true", "yes")
 
-# Retrieval / LLM defaults
-MAX_CHUNKS_TO_LLM = int(os.getenv("MAX_CHUNKS_TO_LLM", "8"))
-CALL_TIMEOUT_SECONDS = float(os.getenv("CALL_TIMEOUT_SECONDS", "30"))
-STREAM_FALLBACK_TO_BLOCKING = True  # always try streaming, then fallback
+HANDLE_RESOLVE_TIMEOUT = float(os.getenv("HANDLE_RESOLVE_TIMEOUT", "30.0"))
 
-# Model paths (safe defaults). If you set REQUIRE_LLM_ON_DEPLOY=true and LLM_PATH missing, deploy will abort.
-LLM_PATH = os.getenv("LLM_PATH", "/workspace/models/llm.gguf")
-
-# Logging
 logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-log = logging.getLogger("rayserve_deployments_single")
+log = logging.getLogger("rayserve_deployments_final")
 
-# Try optional heavy imports and keep graceful fallbacks
+# --- ray / serve ---
+import ray
+from ray import serve
+from ray.serve import HTTPOptions
+
+# import infra/query (must be present)
 try:
-    import ray
-    from ray import serve
-    from ray.serve import HTTPOptions
-except Exception as e:
-    log.exception("ray/serve not importable; ensure ray is installed: %s", e)
+    from infra import query as querylib
+except Exception:
+    log.exception("Failed to import infra.query. Ensure infra/query.py exists.")
     raise
 
-# Keep your query.py unchanged; we will call its DB helpers when available.
-try:
-    import infra.query as querylib
-except Exception:
-    querylib = None
-    log.info("infra.query not importable; retrieval will use local-only paths or return empty.")
+def _ensure_file(path: str):
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
 
-# Try to import llama-cpp-python for LLM generation; fallback to simple template generator.
-try:
-    from llama_cpp import Llama
-    _LLAMA_AVAILABLE = True
-except Exception:
-    _LLAMA_AVAILABLE = False
+# ----------------------------
+# ONNXEmbed deployment
+# ----------------------------
+@serve.deployment(name=EMBED_DEPLOYMENT, num_replicas=EMBED_REPLICAS,
+                  ray_actor_options={"num_cpus": EMBED_CPUS, "num_gpus": 0.0})
+class ONNXEmbed:
+    def __init__(self, onnx_path: str = ONNX_EMBED_PATH, tokenizer_path: str = ONNX_EMBED_TOKENIZER):
+        try:
+            from transformers import PreTrainedTokenizerFast
+            import onnxruntime as ort
+            import numpy as np
+        except Exception as e:
+            log.exception("ONNXEmbed imports failed: %s", e)
+            raise
+        _ensure_file(tokenizer_path)
+        _ensure_file(onnx_path)
+        self.np = np
+        self.ort = ort
+        self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_path)
+        if getattr(self.tokenizer, "pad_token", None) is None:
+            if getattr(self.tokenizer, "eos_token", None) is not None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            elif getattr(self.tokenizer, "sep_token", None) is not None:
+                self.tokenizer.pad_token = self.tokenizer.sep_token
+            else:
+                self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+        so = self.ort.SessionOptions()
+        try:
+            so.intra_op_num_threads = max(1, int(os.getenv("ORT_INTRA_THREADS", "2")))
+            so.inter_op_num_threads = max(1, int(os.getenv("ORT_INTER_THREADS", "1")))
+        except Exception:
+            pass
+        providers = ["CPUExecutionProvider"]
+        self.sess = self.ort.InferenceSession(onnx_path, sess_options=so, providers=providers)
+        self.input_names = [inp.name for inp in self.sess.get_inputs()]
+        log.info("[%s] initialized", EMBED_DEPLOYMENT)
 
-# -------------------------
-# Minimal deterministic embedder (no external libs)
-# -------------------------
-def simple_text_embedding(text: str, dim: int = 128) -> List[float]:
-    """
-    Fast deterministic embedding. Not semantically deep.
-    Used as safe fallback when dedicated embedder deployment is absent.
-    """
-    if not text:
-        return [0.0] * dim
-    # hash-based features: stable across runs
-    h = [0.0] * dim
-    for i, ch in enumerate(text):
-        idx = (ord(ch) + i * 31) % dim
-        h[idx] += (ord(ch) % 97) + 1
-    # normalize
-    norm = math.sqrt(sum(x * x for x in h)) or 1.0
-    return [x / norm for x in h]
-
-# -------------------------
-# Small LLM wrapper (safe)
-# -------------------------
-class LocalLLM:
-    def __init__(self, model_path: Optional[str] = None, n_threads: int = 2):
-        self.model_path = model_path
-        self.n_threads = n_threads
-        self._use_llama = False
-        self._llm = None
-        if _LLAMA_AVAILABLE and model_path and os.path.exists(model_path):
-            try:
-                self._llm = Llama(model_path=model_path, n_threads=int(n_threads))
-                self._use_llama = True
-                log.info("LocalLLM: llama-cpp-python loaded model %s", model_path)
-            except Exception:
-                log.exception("LocalLLM: failed to init Llama; falling back to template generator")
-                self._use_llama = False
-                self._llm = None
-        else:
-            if model_path:
-                log.info("LocalLLM: llama not available or model missing; using template fallback")
-
-    def generate_blocking(self, prompt: str, params: Optional[Dict[str, Any]] = None) -> str:
-        params = params or {}
-        if self._use_llama and self._llm is not None:
-            try:
-                out = self._llm(prompt, **params)
-                # llama-cpp-python returns object with 'text' often
-                if isinstance(out, dict):
-                    return str(out.get("text") or out.get("output") or json.dumps(out))
+    async def __call__(self, request_or_payload):
+        try:
+            if isinstance(request_or_payload, (dict, list)):
+                body = request_or_payload
+            else:
                 try:
-                    return str(getattr(out, "text", out))
+                    body = await request_or_payload.json()
                 except Exception:
-                    return str(out)
-            except Exception:
-                log.exception("LocalLLM llama call failed; falling back")
-        # fallback deterministic response
-        snippet = (prompt[:300] + "...") if len(prompt) > 300 else prompt
-        return f"(fallback-llm) Answer based on provided context + prompt preview: {snippet}"
+                    raw = await request_or_payload.body()
+                    body = json.loads(raw.decode("utf-8")) if raw else {}
+            texts = body.get("texts", []) if isinstance(body, dict) else []
+            if not isinstance(texts, list):
+                texts = [texts]
+            requested_max = body.get("max_length", None) if isinstance(body, dict) else None
+            max_length = int(requested_max) if requested_max else int(os.getenv("INFERENCE_EMBEDDER_MAX_TOKENS", "64"))
+            loop = asyncio.get_running_loop()
+            def tokenize():
+                return self.tokenizer(texts, padding=True, truncation=True, return_tensors="np", max_length=max_length)
+            toks = await loop.run_in_executor(None, tokenize)
+            ort_inputs = {}
+            for k, v in toks.items():
+                if k in self.input_names:
+                    ort_inputs[k] = v.astype("int64")
+                else:
+                    if k == "input_ids":
+                        for cand in ("input_ids", "input", "input.1"):
+                            if cand in self.input_names:
+                                ort_inputs[cand] = v.astype("int64")
+                                break
+            outputs = await loop.run_in_executor(None, lambda: self.sess.run(None, ort_inputs))
+            vecs = None
+            for arr in outputs:
+                arr = self.np.asarray(arr)
+                if arr.ndim == 2 and arr.shape[0] == toks["input_ids"].shape[0]:
+                    vecs = arr
+                    break
+                if arr.ndim == 3 and arr.shape[0] == toks["input_ids"].shape[0]:
+                    attn = toks.get("attention_mask", self.np.ones(arr.shape[:2], dtype="int64"))
+                    mask = attn.astype(self.np.float32)[:,:,None]
+                    summed = (arr * mask).sum(axis=1)
+                    denom = self.np.maximum(mask.sum(axis=1), 1e-9)
+                    vecs = summed / denom
+                    break
+            if vecs is None:
+                vecs = self.np.asarray(outputs[-1])
+                if vecs.ndim > 2:
+                    vecs = vecs.reshape((vecs.shape[0], -1))
+            norms = self.np.linalg.norm(vecs, axis=1, keepdims=True)
+            norms = self.np.maximum(norms, 1e-12)
+            vecs = (vecs / norms).astype(float)
+            return {"vectors": [v.tolist() for v in vecs], "max_length_used": int(max_length)}
+        except Exception:
+            log.exception("ONNXEmbed call error")
+            raise
 
-    async def generate_stream(self, prompt: str, params: Optional[Dict[str, Any]] = None):
-        """
-        Async generator yielding strings (tokens / fragments).
-        Llama streaming not assumed. This yields token-like chunks for SSE.
-        """
+# ----------------------------
+# ONNXRerank deployment (optional)
+# ----------------------------
+@serve.deployment(name=RERANK_DEPLOYMENT, num_replicas=RERANK_REPLICAS,
+                  ray_actor_options={"num_cpus": RERANK_CPUS, "num_gpus": 0.0})
+class ONNXRerank:
+    def __init__(self, onnx_path: str = ONNX_RERANK_PATH, tokenizer_path: str = ONNX_RERANK_TOKENIZER):
+        try:
+            from transformers import PreTrainedTokenizerFast
+            import onnxruntime as ort
+            import numpy as np
+        except Exception as e:
+            log.exception("ONNXRerank imports failed: %s", e)
+            raise
+        _ensure_file(tokenizer_path)
+        _ensure_file(onnx_path)
+        self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_path)
+        if getattr(self.tokenizer, "pad_token", None) is None:
+            if getattr(self.tokenizer, "eos_token", None) is not None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            elif getattr(self.tokenizer, "sep_token", None) is not None:
+                self.tokenizer.pad_token = self.tokenizer.sep_token
+            else:
+                self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+        so = ort.SessionOptions()
+        try:
+            so.intra_op_num_threads = max(1, int(os.getenv("ORT_INTRA_THREADS", "2")))
+            so.inter_op_num_threads = max(1, int(os.getenv("ORT_INTER_THREADS", "1")))
+        except Exception:
+            pass
+        providers = ["CPUExecutionProvider"]
+        self.sess = ort.InferenceSession(onnx_path, sess_options=so, providers=providers)
+        self.input_names = [inp.name for inp in self.sess.get_inputs()]
+        import numpy as np
+        self.np = np
+        log.info("[%s] initialized", RERANK_DEPLOYMENT)
+
+    async def __call__(self, request_or_payload):
+        try:
+            if isinstance(request_or_payload, (dict, list)):
+                body = request_or_payload
+            else:
+                try:
+                    body = await request_or_payload.json()
+                except Exception:
+                    raw = await request_or_payload.body()
+                    body = json.loads(raw.decode("utf-8")) if raw else {}
+            q = body.get("query", "") if isinstance(body, dict) else ""
+            cands = body.get("cands", []) if isinstance(body, dict) else []
+            if not isinstance(cands, list):
+                cands = [cands]
+            MAX_RERANK = int(os.getenv("MAX_RERANK", "256"))
+            cands = cands[:MAX_RERANK]
+            if len(cands) == 0:
+                return {"scores": []}
+            requested_max = body.get("max_length", None) if isinstance(body, dict) else None
+            eff_max = int(requested_max) if requested_max else int(os.getenv("CROSS_ENCODER_MAX_TOKENS", "600"))
+            loop = asyncio.get_running_loop()
+            def tokenize():
+                return self.tokenizer([(q, t) for t in cands], padding=True, truncation='only_second', return_tensors="np", max_length=eff_max)
+            toks = await loop.run_in_executor(None, tokenize)
+            ort_inputs = {}
+            for k, v in toks.items():
+                if k in self.input_names:
+                    ort_inputs[k] = v.astype("int64")
+                else:
+                    if k == "input_ids":
+                        for cand in ("input_ids", "input", "input.1"):
+                            if cand in self.input_names:
+                                ort_inputs[cand] = v.astype("int64")
+                                break
+            outputs = await loop.run_in_executor(None, lambda: self.sess.run(None, ort_inputs))
+            scores = None
+            for arr in outputs:
+                arr = self.np.asarray(arr)
+                if arr.ndim == 1 and arr.shape[0] == len(cands):
+                    scores = arr
+                    break
+                if arr.ndim == 2 and arr.shape[0] == len(cands):
+                    scores = arr[:, 0]
+                    break
+            if scores is None:
+                last = self.np.asarray(outputs[-1])
+                try:
+                    scores = last.reshape(len(cands), -1)[:, 0]
+                except Exception as e:
+                    raise RuntimeError("unable to parse reranker outputs: " + str(e))
+            return {"scores": [float(s) for s in self.np.asarray(scores).astype(float)], "max_length_used": int(eff_max)}
+        except Exception:
+            log.exception("ONNXRerank call error")
+            raise
+
+# ----------------------------
+# LLM deployment (llama-cpp-python wrapper)
+# ----------------------------
+@serve.deployment(name=LLM_DEPLOYMENT, num_replicas=LLM_REPLICAS,
+                  ray_actor_options={"num_cpus": LLM_CPUS, "num_gpus": 0.0})
+class LlamaServe:
+    def __init__(self, model_path: str = LLM_MODEL_PATH):
+        try:
+            from llama_cpp import Llama
+        except Exception as e:
+            log.exception("llama-cpp-python import failed: %s", e)
+            raise RuntimeError("llama-cpp-python required for LLM deployment") from e
+        _ensure_file(model_path)
+        try:
+            n_ctx = int(os.getenv("LLM_N_CTX", "2048"))
+            n_threads = max(1, int(os.getenv("LLM_N_THREADS", str(max(1, int(LLM_CPUS))))))
+            llm_kwargs = {"n_ctx": n_ctx, "n_threads": n_threads}
+            self.llm = Llama(model_path=model_path, **llm_kwargs)
+        except TypeError:
+            self.llm = Llama(model_path=model_path)
+        self._lock = asyncio.Lock()
+        log.info("[%s] LLM loaded %s", LLM_DEPLOYMENT, model_path)
+
+    async def generate(self, prompt: str, params: Optional[Dict[str, Any]] = None) -> Any:
         params = params or {}
-        if self._use_llama and self._llm is not None:
-            # no streaming API guaranteed; call blocking then chunk
-            text = self.generate_blocking(prompt, params)
-            for i in range(0, len(text), 80):
-                yield text[i:i+80]
-                await asyncio.sleep(0.01)
-            return
-        # fallback: chunk the fallback response
-        text = self.generate_blocking(prompt, params)
-        for i in range(0, len(text), 80):
-            await asyncio.sleep(0.01)
-            yield text[i:i+80]
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            try:
+                out = await loop.run_in_executor(None, lambda: self.llm(prompt, **(params or {})))
+                return out
+            except Exception as e:
+                log.exception("LLM generate error: %s", e)
+                raise
 
-# -------------------------
-# Single Serve deployment with FastAPI ingress
-# -------------------------
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import HTMLResponse, StreamingResponse
+    async def __call__(self, request_or_payload):
+        try:
+            if isinstance(request_or_payload, (dict, list)):
+                body = request_or_payload
+            else:
+                try:
+                    body = await request_or_payload.json()
+                except Exception:
+                    raw = await request_or_payload.body()
+                    body = json.loads(raw.decode("utf-8")) if raw else {}
+            prompt = body.get("prompt", "") or body.get("input", "") or ""
+            params = body.get("params", {}) or {}
+            res = await self.generate(prompt, params)
+            try:
+                if hasattr(res, "to_dict"):
+                    return res.to_dict()
+            except Exception:
+                pass
+            return res
+        except Exception:
+            log.exception("LLM call error")
+            raise
 
-app = FastAPI(title="RAG Gateway (single-deployment)")
-
-# Attach runtime state
-class GatewayState:
+# ----------------------------
+# Gateway deployment (ingress + orchestrator)
+# ----------------------------
+@serve.deployment(name="gateway", num_replicas=1,
+                  ray_actor_options={"num_cpus": float(os.getenv("GATEWAY_CPUS", "0.5")), "num_gpus": 0.0})
+class Gateway:
     def __init__(self):
-        # handles for external deployments (if you later add them)
         self.embed_handle = None
         self.rerank_handle = None
         self.llm_handle = None
-        # local fallbacks
-        self.local_llm = LocalLLM(model_path=LLM_PATH if os.path.exists(LLM_PATH) else None)
-        # indicate whether we require LLM presence
-        self.require_llm = REQUIRE_LLM_ON_DEPLOY
-
-state = GatewayState()
-app.state.gateway = state
-
-# UI
-_UI_HTML = """
-<html>
-  <body>
-    <h3>Hybrid RAG (single-deployment) — Test UI</h3>
-    <form method="post" action="/retrieve">
-      <textarea name="query" rows="4" cols="60">What is MLOps?</textarea><br/>
-      <label><input type="checkbox" name="stream" checked/> stream</label><br/>
-      <button type="submit">Send</button>
-    </form>
-  </body>
-</html>
-"""
-
-@app.get("/", response_class=HTMLResponse)
-async def root_ui():
-    return HTMLResponse(_UI_HTML)
-
-@app.get("/healthz")
-async def healthz():
-    # report simple readiness: LLM required check
-    ok = True
-    msg = "ok"
-    if state.require_llm:
-        if (not _LLAMA_AVAILABLE) and (state.local_llm and state.local_llm._use_llama is False):
-            ok = False
-            msg = "llm-missing"
-    return {"status": "ok" if ok else "fail", "note": msg}
-
-# Helper: build context using querylib if available, else basic stub
-def build_context_and_prompt(query_text: str, top_k: int = 5) -> Dict[str, Any]:
-    """
-    Returns dict with keys: prompt (JSON string for LLM), provenance (list), records (list)
-    This tries to use infra.query.retrieve_pipeline if available and if embed/rerank handles are present.
-    Otherwise it builds a minimal prompt using no external chunks.
-    """
-    if querylib is not None:
-        # attempt to use querylib.make_clients and querylib.retrieve_pipeline
+        self.qdrant_client = None
+        self.neo4j_driver = None
+        self.streaming_default = True
         try:
-            qdrant_client, neo4j_driver = querylib.make_clients()
-            # prefer direct embed handle if present in state; else pass None to fallback BM25-only
-            embed_handle = state.embed_handle
-            rerank_handle = state.rerank_handle
-            res = querylib.retrieve_pipeline(embed_handle, rerank_handle, qdrant_client, neo4j_driver, query_text, max_chunks=MAX_CHUNKS_TO_LLM)
-            return res
-        except Exception as e:
-            log.exception("querylib.retrieve_pipeline failed; falling back to simple prompt: %s", e)
-    # fallback minimal
-    prompt = json.dumps({
-        "QUERY": query_text,
-        "CONTEXT_CHUNKS": [],
-        "YOUR_ROLE": "You are a helpful assistant. Answer using only the provided context if present."
-    }, ensure_ascii=False)
-    return {"prompt": prompt, "provenance": [], "records": []}
-
-# SSE encoder
-def sse_event(data_obj: dict) -> str:
-    return "data: " + json.dumps(data_obj, ensure_ascii=False) + "\n\n"
-
-@app.post("/retrieve")
-async def retrieve(req: Request):
-    # accept JSON or form
-    try:
-        body = await req.json()
-    except Exception:
-        form = await req.form()
-        body = dict(form)
-    query_text = body.get("query") or body.get("input") or ""
-    stream_flag = body.get("stream", True)
-    # normalize stream flag
-    if isinstance(stream_flag, str):
-        stream_flag = stream_flag.lower() in ("1", "true", "yes", "on")
-    elif isinstance(stream_flag, (int, float)):
-        stream_flag = bool(stream_flag)
-    # Build context (possibly heavy)
-    ctx = build_context_and_prompt(query_text)
-    prompt_json = ctx.get("prompt", json.dumps({"QUERY": query_text, "CONTEXT_CHUNKS": [], "YOUR_ROLE": "assistant"}))
-    provenance = ctx.get("provenance", [])
-    records = ctx.get("records", [])
-
-    # choose LLM source: prefer remote handle if present, else local fallback
-    llm_handle = state.llm_handle  # if later wired to a handle
-    use_local_llm = True
-    if llm_handle is not None:
-        use_local_llm = False
-
-    # Streaming path
-    if stream_flag:
-        async def stream_gen():
-            # attempt streaming via handle if available and has streaming API
+            log.info("Gateway initializing; resolving model handles...")
             try:
-                if not use_local_llm:
-                    # attempt to call querylib.call_llm_stream if present
-                    if querylib is not None:
-                        async for piece in querylib.call_llm_stream(llm_handle, prompt_json, params={}):
-                            yield sse_event({"event": "token", "data": piece})
-                        yield sse_event({"event": "done", "provenance": provenance, "records": records})
-                        return
-                    # fallback: try calling handle.remote(...) pattern via ray
-                    try:
-                        # best-effort: call llm_handle remotely if it supports streaming
-                        maybe = llm_handle.remote({"prompt": prompt_json, "params": {}, "stream": True})
-                        # ray.get of generator may succeed
-                        try:
-                            it = maybe
-                            # if it's an iterator/list
-                            for piece in it:
-                                yield sse_event({"event": "token", "data": str(piece)})
-                            yield sse_event({"event": "done", "provenance": provenance, "records": records})
-                            return
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-                # either no remote or remote streaming failed => use local LLM streaming
-                async for chunk in state.local_llm.generate_stream(prompt_json, params={}):
-                    yield sse_event({"event": "token", "data": chunk})
-                yield sse_event({"event": "done", "provenance": provenance, "records": records})
-                return
-            except Exception as e:
-                log.exception("streaming path failed: %s", e)
-                # fallback to blocking below
-                try:
-                    text = state.local_llm.generate_blocking(prompt_json, params={})
-                    yield sse_event({"event": "token", "data": text})
-                    yield sse_event({"event": "done", "provenance": provenance, "records": records})
-                except Exception as e2:
-                    log.exception("fallback blocking failed: %s", e2)
-                    yield sse_event({"event": "error", "error": str(e2)})
-        return StreamingResponse(stream_gen(), media_type="text/event-stream")
-
-    # Blocking path
-    try:
-        if not use_local_llm and querylib is not None:
-            # prefer querylib.call_llm_blocking if available
-            try:
-                text = querylib.call_llm_blocking(llm_handle, prompt_json, params={}, timeout=CALL_TIMEOUT_SECONDS)
-                return {"answer": text, "provenance": provenance, "records": records}
+                ray.init(address=RAY_ADDRESS if RAY_ADDRESS else None, namespace=RAY_NAMESPACE, ignore_reinit_error=True)
             except Exception:
-                log.exception("remote blocking llm failed; falling back to local")
-        # local LLM blocking
-        text = state.local_llm.generate_blocking(prompt_json, params={})
-        return {"answer": text, "provenance": provenance, "records": records}
-    except Exception as e:
-        log.exception("final blocking call failed: %s", e)
-        return {"error": str(e), "provenance": provenance, "records": records}
+                pass
+            # resolve handles; querylib.get_strict_handle probes
+            try:
+                if REQUIRE_EMBED_ON_DEPLOY:
+                    self.embed_handle = querylib.get_strict_handle(EMBED_DEPLOYMENT, timeout=HANDLE_RESOLVE_TIMEOUT)
+                else:
+                    try:
+                        self.embed_handle = querylib.get_strict_handle(EMBED_DEPLOYMENT, timeout=5.0)
+                    except Exception:
+                        self.embed_handle = None
+            except Exception:
+                self.embed_handle = None
+            try:
+                if ENABLE_CROSS_ENCODER and REQUIRE_RERANK_ON_DEPLOY:
+                    self.rerank_handle = querylib.get_strict_handle(RERANK_DEPLOYMENT, timeout=HANDLE_RESOLVE_TIMEOUT)
+                else:
+                    try:
+                        self.rerank_handle = querylib.get_strict_handle(RERANK_DEPLOYMENT, timeout=5.0)
+                    except Exception:
+                        self.rerank_handle = None
+            except Exception:
+                self.rerank_handle = None
+            try:
+                if REQUIRE_LLM_ON_DEPLOY:
+                    self.llm_handle = querylib.get_strict_handle(LLM_DEPLOYMENT, timeout=HANDLE_RESOLVE_TIMEOUT)
+                else:
+                    try:
+                        self.llm_handle = querylib.get_strict_handle(LLM_DEPLOYMENT, timeout=5.0)
+                    except Exception:
+                        self.llm_handle = None
+            except Exception:
+                self.llm_handle = None
+            try:
+                self.qdrant_client, self.neo4j_driver = querylib.make_clients()
+            except Exception:
+                log.exception("make_clients failed; continuing")
+                self.qdrant_client, self.neo4j_driver = None, None
+            log.info("Gateway initialized; routes available")
+        except Exception:
+            log.exception("Gateway initialization error")
+            raise
 
-# --- Serve deployment wrapper ---
-@serve.deployment(name=os.getenv("GATEWAY_DEPLOYMENT_NAME", "gateway"), num_replicas=int(os.getenv("GATEWAY_REPLICAS", "1")), ray_actor_options={"num_gpus": 0.0, "num_cpus": float(os.getenv("GATEWAY_CPUS", "0.5"))})
-@serve.ingress(app)
-class GatewayServe:
-    def __init__(self):
-        # nothing to init; the FastAPI app state already has the gateway state
-        log.info("GatewayServe initialized; app routes available")
+    def _health(self) -> Dict[str, Any]:
+        ok = {"status": "ok", "note": "ok"}
+        ok["embed_handle"] = bool(self.embed_handle)
+        ok["rerank_handle"] = bool(self.rerank_handle)
+        ok["llm_handle"] = bool(self.llm_handle)
+        return ok
 
-# -------------------------
-# Deploy helper
-# -------------------------
+    async def _build_prompt_and_records(self, query_text: str, max_chunks: Optional[int] = None):
+        try:
+            res = querylib.retrieve_pipeline(self.embed_handle, self.rerank_handle, self.qdrant_client, self.neo4j_driver, query_text, max_chunks=max_chunks or int(os.getenv("MAX_CHUNKS_TO_LLM", "8")))
+            return res
+        except Exception:
+            log.exception("retrieve_pipeline failed")
+            prompt = json.dumps({"QUERY": query_text, "CONTEXT_CHUNKS": [], "YOUR_ROLE": "You are a helpful knowledge assistant who answers user queries with provenance using only the provided context chunks below."}, ensure_ascii=False)
+            return {"prompt": prompt, "provenance": [], "records": [], "llm": None, "elapsed": 0.0}
+
+    async def __call__(self, request):
+        try:
+            path = request.scope.get("path", "/")
+            if request.method == "GET" and path == "/healthz":
+                return {"status": "ok", "note": "ok", "embed": bool(self.embed_handle), "rerank": bool(self.rerank_handle), "llm": bool(self.llm_handle)}
+            if request.method == "GET" and path == "/":
+                html = """
+                <!doctype html><html><head><title>RAG Gateway</title></head><body>
+                <h3>RAG Gateway</h3>
+                <form id="qform">
+                  <input id="q" name="q" placeholder="Ask a question" size=60>
+                  <label><input type="checkbox" id="stream" checked> stream</label>
+                  <button type="submit">Send</button>
+                </form><pre id="out"></pre>
+                <script>
+                const f=document.getElementById('qform'); const out=document.getElementById('out');
+                f.onsubmit=function(e){ e.preventDefault(); out.textContent=''; const q=document.getElementById('q').value; const stream=document.getElementById('stream').checked;
+                  if(stream){
+                    const es=new EventSource('/_sse?q='+encodeURIComponent(q));
+                    es.onmessage=function(evt){ try{ const d=JSON.parse(evt.data); if(d.event==='token') out.textContent += d.data; if(d.event==='done'){ out.textContent += '\\n\\n[done] provenance=' + JSON.stringify(d.data.provenance || []) ; es.close(); } }catch(e){ out.textContent += evt.data; } };
+                    es.onerror=function(){ es.close(); }
+                  } else {
+                    fetch('/retrieve', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({query:q, stream:false})})
+                      .then(r=>r.json()).then(j=> out.textContent = (j.answer||JSON.stringify(j)));
+                  }
+                };
+                </script></body></html>
+                """
+                return (html, 200, [("content-type","text/html")])
+            if request.method == "GET" and path == "/_sse":
+                q = request.query_params.get("q", "")
+                if not q:
+                    return ("", 400, [("content-type","text/plain")])
+                pipe = await self._build_prompt_and_records(q)
+                prompt_json = pipe.get("prompt", "")
+                provenance = pipe.get("provenance", [])
+                records = pipe.get("records", [])
+                params = {}
+                try:
+                    async def sse_gen():
+                        try:
+                            async for chunk in querylib.call_llm_stream(self.llm_handle, prompt_json, params=params):
+                                payload = {"event":"token", "data": str(chunk)}
+                                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                            payload = {"event":"done", "data": {"provenance": provenance, "records": records}}
+                            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                        except Exception:
+                            payload = {"event":"done", "data": {"provenance": provenance, "records": records}}
+                            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    return serve.streaming_response(sse_gen(), media_type="text/event-stream")
+                except Exception:
+                    try:
+                        answer = querylib.call_llm_blocking(self.llm_handle, prompt_json, params=params, timeout=float(os.getenv("CALL_TIMEOUT_SECONDS","60")))
+                        final = {"answer": answer, "provenance": provenance, "records": records}
+                        return (json.dumps(final, ensure_ascii=False), 200, [("content-type","application/json")])
+                    except Exception:
+                        return (json.dumps({"error":"LLM call failed"}), 500, [("content-type","application/json")])
+            if request.method == "POST" and path == "/retrieve":
+                try:
+                    body = await request.json()
+                except Exception:
+                    raw = await request.body()
+                    body = json.loads(raw.decode("utf-8")) if raw else {}
+                query_text = body.get("query") or body.get("q") or ""
+                stream = body.get("stream", self.streaming_default)
+                pipeline = await self._build_prompt_and_records(query_text)
+                prompt_json = pipeline.get("prompt", "")
+                provenance = pipeline.get("provenance", [])
+                records = pipeline.get("records", [])
+                params = body.get("params", {}) or {}
+                if stream:
+                    try:
+                        collected = []
+                        async for piece in querylib.call_llm_stream(self.llm_handle, prompt_json, params=params):
+                            collected.append(str(piece))
+                        answer = "".join(collected)
+                        return {"answer": answer, "provenance": provenance, "records": records}
+                    except Exception:
+                        log.exception("Streaming failed; fallback to blocking")
+                        try:
+                            answer = querylib.call_llm_blocking(self.llm_handle, prompt_json, params=params, timeout=float(os.getenv("CALL_TIMEOUT_SECONDS","60")))
+                            return {"answer": answer, "provenance": provenance, "records": records}
+                        except Exception:
+                            log.exception("Blocking LLM failed")
+                            return {"answer": None, "provenance": provenance, "records": records}
+                else:
+                    try:
+                        answer = querylib.call_llm_blocking(self.llm_handle, prompt_json, params=params, timeout=float(os.getenv("CALL_TIMEOUT_SECONDS","60")))
+                        return {"answer": answer, "provenance": provenance, "records": records}
+                    except Exception:
+                        log.exception("Blocking LLM failed")
+                        return {"answer": None, "provenance": provenance, "records": records}
+            return ("Not Found", 404, [("content-type","text/plain")])
+        except Exception:
+            log.exception("Gateway handle error for request path=%s", request.scope.get("path"))
+            return (json.dumps({"error":"gateway error", "trace": traceback.format_exc()}), 500, [("content-type","application/json")])
+
 def main():
-    # Start Ray/Serve (connect to cluster if RAY_ADDRESS is set in env)
-    ray_address = os.getenv("RAY_ADDRESS", None)
-    ray.init(address=(ray_address if ray_address and ray_address != "auto" else None), ignore_reinit_error=True)
+    ray.init(address=RAY_ADDRESS or None, namespace=RAY_NAMESPACE, ignore_reinit_error=True)
     http_opts = HTTPOptions(host=SERVE_HTTP_HOST, port=SERVE_HTTP_PORT)
-    # start serve if not started (idempotent)
+    serve.start(detached=True, http_options=http_opts)
+
+    log.info("Deploying model deployments via classmethod .deploy()")
+
+    # Embed
     try:
-        serve.start(detached=True, http_options=http_opts)
+        ONNXEmbed.deploy(ONNX_EMBED_PATH, ONNX_EMBED_TOKENIZER)
+        log.info("Deployed %s", EMBED_DEPLOYMENT)
     except Exception:
-        # if already started, connecting is fine
-        pass
-
-    # check LLM requirement
-    if REQUIRE_LLM_ON_DEPLOY:
-        if not _LLAMA_AVAILABLE and not (state.local_llm and state.local_llm._use_llama):
-            raise RuntimeError("REQUIRE_LLM_ON_DEPLOY=true but no LLM available (llama-cpp missing or model file not present)")
-
-    # Deploy single gateway (this creates the ingress)
-    app_binding = GatewayServe.bind()
-    # serve.run expects an Application object produced by bind, so pass it directly
-    try:
-        serve.run(app_binding)
-    except Exception as e:
-        log.exception("serve.run(app_binding) failed: %s", e)
+        log.exception("Failed to deploy embed; rethrowing")
         raise
 
-    log.info("GatewayServe deployed. HTTP listening on %s:%s", SERVE_HTTP_HOST, SERVE_HTTP_PORT)
+    # Rerank (optional)
+    if ENABLE_CROSS_ENCODER:
+        try:
+            ONNXRerank.deploy(ONNX_RERANK_PATH, ONNX_RERANK_TOKENIZER)
+            log.info("Deployed %s", RERANK_DEPLOYMENT)
+        except Exception:
+            log.exception("Failed to deploy rerank (optional)")
+    else:
+        log.info("Cross encoder disabled; skipping rerank deployment")
 
-if __name__ == "__main__":
-    main()
+    # LLM
+    if REQUIRE_LLM_ON_DEPLOY:
+        _ensure_file(LLM_MODEL_PATH)
+    try:
+        LlamaServe.deploy(LLM_MODEL_PATH)
+        log.info("Deployed %s", LLM_DEPLOYMENT)
+    except Exception:
+        log.exception("Failed to deploy LLM; rethrowing")
+        raise
+
+    # Gateway app
+    try:
+        serve.run(Gateway.bind())
+    except Exception:
+        log.exception("serve.run failed for Gateway")
+        raise
+
+    log.info("Serve HTTP listening on %s:%s", SERVE_HTTP_HOST, SERVE_HTTP_PORT)
