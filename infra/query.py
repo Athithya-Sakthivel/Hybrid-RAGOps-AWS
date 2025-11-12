@@ -31,12 +31,12 @@ log = logging.getLogger("query")
 RAY_ADDRESS = os.getenv("RAY_ADDRESS", "auto")
 RAY_NAMESPACE = os.getenv("RAY_NAMESPACE", None)
 EMBED_DEPLOYMENT = os.getenv("EMBED_DEPLOYMENT", "embed_onnx_cpu")
-RERANK_DEPLOYMENT = os.getenv("RERANK_HANDLE_NAME", "rerank_onnx_cpu")
-LLM_DEPLOYMENT = os.getenv("LLM_DEPLOYMENT_NAME", "llm_server_cpu")
+RERANK_DEPLOYMENT = os.getenv("RERANK_DEPLOYMENT", "rerank_onnx_cpu")
+LLM_DEPLOYMENT = os.getenv("LLM_DEPLOYMENT", "llm_server_cpu")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", None)
 PREFER_GRPC = os.getenv("PREFER_GRPC", "true").lower() in ("1", "true", "yes")
-QDRANT_COLLECTION = os.getenv("COLLECTION", "my_collection")
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "my_collection")
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
@@ -166,7 +166,10 @@ def get_strict_handle(name: str, timeout: float = 30.0, poll: float = 0.5, app_n
                 try:
                     handle = serve.get_deployment_handle(name, app_name=app_name, _check_exists=False)
                 except TypeError:
-                    handle = serve.get_deployment_handle(name, _check_exists=False)
+                    try:
+                        handle = serve.get_deployment_handle(name, _check_exists=False)
+                    except Exception:
+                        handle = None
                 except Exception:
                     handle = None
             if handle is None and hasattr(serve, "get_handle"):
@@ -262,9 +265,15 @@ def cross_rerank(rerank_handle, query: str, texts: List[str], max_length: int = 
 def make_clients() -> Tuple[Any, Any]:
     q = None
     neo = None
-    if QDRANT_CLIENT_AVAILABLE := (QdrantClient is not None):
+    if QdrantClient is not None:
         try:
-            q = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=PREFER_GRPC)
+            if PREFER_GRPC:
+                try:
+                    q = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=True)
+                except Exception:
+                    q = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=False)
+            else:
+                q = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, prefer_grpc=False)
         except Exception as e:
             log.warning("qdrant client creation failed: %s", e)
             q = None
@@ -621,21 +630,12 @@ async def call_llm_stream(llm_handle, prompt_json: str, params: Optional[Dict[st
         raise RuntimeError("LLM handle missing")
     params = params or {}
     try:
-        if hasattr(llm_handle, "stream") and hasattr(llm_handle.stream, "remote"):
-            try:
-                resp = llm_handle.stream.remote(prompt_json, params)
-            except Exception:
-                resp = llm_handle.stream.remote(prompt_json)
-        elif hasattr(llm_handle, "generate") and hasattr(llm_handle.generate, "remote"):
-            try:
-                resp = llm_handle.generate.remote(prompt_json, params)
-            except Exception:
-                resp = llm_handle.generate.remote(prompt_json)
+        if hasattr(llm_handle, "stream"):
+            resp = llm_handle.stream.remote(prompt_json, params or {}, True)
+        elif hasattr(llm_handle, "generate"):
+            resp = llm_handle.generate.remote(prompt_json, params or {}, True)
         else:
-            try:
-                resp = llm_handle.remote({"prompt": prompt_json, "params": params, "stream": True})
-            except Exception:
-                resp = llm_handle.remote(prompt_json)
+            resp = llm_handle.remote({"prompt": prompt_json, "params": params, "stream": True})
     except Exception:
         txt = call_llm_blocking(llm_handle, prompt_json, params=params)
         yield txt

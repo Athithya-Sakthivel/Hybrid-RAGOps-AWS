@@ -8,64 +8,209 @@ if [ "${BASH_SOURCE[0]}" != "$0" ]; then
   return 1 2>/dev/null || exit 1
 fi
 
+
 # ---------------------------
-# Project Configuration (defaults)
+# 0 — Pulumi / setup / backend environment (login, stack, venv, passphrase)
 # ---------------------------
 export PROJECT_DIR="${PROJECT_DIR:-infra/pulumi-aws}"
 export VENV_DIR="${VENV_DIR:-${PROJECT_DIR}/venv}"
 export REQ_FILE="${REQ_FILE:-${PROJECT_DIR}/requirements.txt}"
 
+# AWS / region used by Pulumi config and resources
 export AWS_REGION="${AWS_REGION:-ap-south-1}"
+
+# Pulumi backend (S3 + optional prefix) and DynamoDB lock table
 export PULUMI_S3_BUCKET="${PULUMI_S3_BUCKET:-e2e-rag-42}"
 export S3_BUCKET="${S3_BUCKET:-${PULUMI_S3_BUCKET}}"
 export S3_PREFIX="${S3_PREFIX:-pulumi/}"
+export PULUMI_STATE_BUCKET="${PULUMI_STATE_BUCKET:-${PULUMI_S3_BUCKET}}"
+export PULUMI_STATE_PREFIX="${PULUMI_STATE_PREFIX:-${S3_PREFIX}}"
 export DDB_TABLE="${DDB_TABLE:-pulumi-state-locks}"
+
+# Stack selection / naming
 export PULUMI_STACK="${PULUMI_STACK:-prod}"
 export STACK="${STACK:-${PULUMI_STACK}}"
-export PULUMI_CONFIG_PASSPHRASE="${PULUMI_CONFIG_PASSPHRASE:-"password"}"
-export FORCE_DELETE="${FORCE_DELETE:-true}"
 
+# Pulumi config encryption passphrase (use a strong secret in prod)
+export PULUMI_CONFIG_PASSPHRASE="${PULUMI_CONFIG_PASSPHRASE:-password}"
+
+# Pulumi org (optional) and CLI/credentials helpers
 export PULUMI_ORG="${PULUMI_ORG:-}"
-export PULUMI_IAM_USER="${PULUMI_IAM_USER:-}"
+export PULUMI_BINARY_PATH="${PULUMI_BINARY_PATH:-}"        # if you installed pulumi in custom location
 export PULUMI_CREDS_FILE="${PULUMI_CREDS_FILE:-/tmp/pulumi-ci-credentials.json}"
+export PULUMI_AUTOINIT="${PULUMI_AUTOINIT:-true}"         # allow script to pulumi new/init when missing
+
+# Optional IAM user / policy to create access keys for CI (leave empty to skip)
+export PULUMI_IAM_USER="${PULUMI_IAM_USER:-}"
 export POLICY_NAME="${POLICY_NAME:-PulumiStateAccessPolicy}"
 
-# Optional infra-specific env defaults (override in environment or export.sh)
-export MULTI_AZ_DEPLOYMENT="${MULTI_AZ_DEPLOYMENT:-false}"
-export CREATE_VPC_ENDPOINTS="${CREATE_VPC_ENDPOINTS:-false}"
-export NO_NAT="${NO_NAT:-false}"
+# Cleanup / safety
+export FORCE_DELETE="${FORCE_DELETE:-true}"               # allow forced bucket deletion on destroy
+export ENABLE_PULUMI_AUTOINIT="${ENABLE_PULUMI_AUTOINIT:-true}"
+
+# Helpful toggles for local envs
+# If your system enforces PEP-668, allow venv pip installs by adding --break-system-packages to pip.
+# Set to "--break-system-packages" only if you understand the implications.
+export PIP_BREAK_SYSTEM_PACKAGES_FLAG="${PIP_BREAK_SYSTEM_PACKAGES_FLAG:---no-input}"
+
+# Derived defaults (do not usually need overriding)
+export PULUMI_LOGIN_URL="${PULUMI_LOGIN_URL:-s3://${S3_BUCKET}/${S3_PREFIX}}"
+export PULUMI_PYTHON_CMD="${PULUMI_PYTHON_CMD:-${VENV_DIR}/bin/python}"
+
+# Export any Pulumi config keys you want to seed into the stack via PULUMI_CONFIG_*
+# Example: export PULUMI_CONFIG_aws:region="${AWS_REGION}"
+# The setup script will copy these into pulumi config automatically.
+# export PULUMI_CONFIG_aws:region="${PULUMI_CONFIG_aws:region:-${AWS_REGION}}"
+
+
+# ---------------------------
+# A — a_prereqs_networking (VPC, KMS, SSM, SGs, VPC endpoints)
+# ---------------------------
+export ENABLE_A="${ENABLE_A:-true}"                        # enable a_prereqs_networking
+export STACK="${STACK:-dev}"
+export AWS_REGION="${AWS_REGION:-ap-south-1}"
+export MULTI_AZ_DEPLOYMENT="${MULTI_AZ_DEPLOYMENT:-true}"
+export VPC_CIDR="${VPC_CIDR:-10.0.0.0/16}"
 export PUBLIC_SUBNET_CIDRS="${PUBLIC_SUBNET_CIDRS:-10.0.1.0/24,10.0.2.0/24}"
 export PRIVATE_SUBNET_CIDRS="${PRIVATE_SUBNET_CIDRS:-10.0.11.0/24,10.0.12.0/24}"
+export NO_NAT="${NO_NAT:-false}"                           # true -> no NAT gateways
+export CREATE_VPC_ENDPOINTS="${CREATE_VPC_ENDPOINTS:-true}" # interface/gateway endpoints
+export VPC_ID="${VPC_ID:-}"                                # reuse existing VPC if set
+export PUBLIC_SUBNET_IDS="${PUBLIC_SUBNET_IDS:-}"          # comma list to reuse existing
+export PRIVATE_SUBNET_IDS="${PRIVATE_SUBNET_IDS:-}"
+export ENABLE_VPC_FLOW_LOGS="${ENABLE_VPC_FLOW_LOGS:-false}"
+export VPC_FLOW_LOG_BUCKET="${VPC_FLOW_LOG_BUCKET:-}"
+export KMS_ALIAS="${KMS_ALIAS:-alias/ray-ssm-key-${STACK}}"
+export KMS_KEY_ARN="${KMS_KEY_ARN:-}"                      # optional explicit key ARN
+export REDIS_SSM_PARAM="${REDIS_SSM_PARAM:-/ray/${STACK}/redis_password}"
+export CREATE_SSM_REDIS_PARAM="${CREATE_SSM_REDIS_PARAM:-true}" # create SSM param if value provided
+export REDIS_PASSWORD="${REDIS_PASSWORD:-}"                # only for staging/local fallback
+export S3_BACKEND_BUCKET="${PULUMI_S3_BUCKET:-e2e-rag-42}"
+export S3_PREFIX="${S3_PREFIX:-pulumi/}"
+export TAGS="${TAGS:-owner=${USER:-dev},environment=${STACK}}"
 
-# domain/DNS defaults
-export DOMAIN="${DOMAIN:-}"
-export HOSTED_ZONE_ID="${HOSTED_ZONE_ID:-}"
-export PRIVATE_HOSTED_ZONE_NAME="${PRIVATE_HOSTED_ZONE_NAME:-internal}"
-export PRIVATE_HOSTED_ZONE_ID="${PRIVATE_HOSTED_ZONE_ID:-}"
 
-# AMI / instance defaults (must be set to real values in prod)
-export HEAD_AMI="${HEAD_AMI:-}"
+
+# ---------------------------
+# B — b_identity_alb_iam (ALB, ACM, Cognito, IAM helpers)
+# ---------------------------
+export ENABLE_B="${ENABLE_B:-false}"                      # enable b_identity_alb_iam
+export ENABLE_COGNITO="${ENABLE_COGNITO:-true}"
+export DOMAIN="${DOMAIN:-app.example.com}"
+export HOSTED_ZONE_ID="${HOSTED_ZONE_ID:-}"                # public hosted zone id for ACM DNS validation
+export PRIVATE_HOSTED_ZONE_ID="${PRIVATE_HOSTED_ZONE_ID:-}" # private zone id for ray-head records
+export PRIVATE_HOSTED_ZONE_NAME="${PRIVATE_HOSTED_ZONE_NAME:-example.internal}"
+export PUBLIC_SUBNET_IDS="${PUBLIC_SUBNET_IDS:-}"          # comma list for ALB placement
+export ALB_SECURITY_GROUP_ID="${ALB_SECURITY_GROUP_ID:-}"  # reuse existing sg if provided
+export APP_PORT="${APP_PORT:-8003}"
+export APP_HEALTH_PATH="${APP_HEALTH_PATH:-/healthz}"
+export ALB_IDLE_TIMEOUT="${ALB_IDLE_TIMEOUT:-300}"
+export ENABLE_WAF="${ENABLE_WAF:-true}"
+export ACM_CERTIFICATE_ARN="${ACM_CERTIFICATE_ARN:-}"      # reuse existing ACM cert if set
+export ENABLE_ACM_DNS_VALIDATION="${ENABLE_ACM_DNS_VALIDATION:-true}"
+# Cognito / OIDC config
+export COGNITO_DOMAIN_PREFIX="${COGNITO_DOMAIN_PREFIX:-ray-${STACK}}"
+export COGNITO_CALLBACK_PATH="${COGNITO_CALLBACK_PATH:-/oauth2/idpresponse}"
+export COGNITO_LOGOUT_PATH="${COGNITO_LOGOUT_PATH:-/logout}"
+export COGNITO_ACCESS_TOKEN_HOURS="${COGNITO_ACCESS_TOKEN_HOURS:-1}"  # hours (valid range: 1-24)
+export COGNITO_ID_TOKEN_HOURS="${COGNITO_ID_TOKEN_HOURS:-1}"
+export COGNITO_REFRESH_TOKEN_DAYS="${COGNITO_REFRESH_TOKEN_DAYS:-30}" # days (valid range:1-87600)
+# JWT validation values (gateway uses these)
+export JWKS_URI="${JWKS_URI:-}"                            # required for prod JWT validation
+export JWT_ISSUER="${JWT_ISSUER:-}"
+export JWT_AUD="${JWT_AUD:-}"
+export JWKS_CACHE_TTL="${JWKS_CACHE_TTL:-3600}"
+# IAM helper overrides
+export CREATE_ELBV2_REGISTER_POLICY="${CREATE_ELBV2_REGISTER_POLICY:-true}"
+export ELBV2_REGISTER_ROLE_NAME="${ELBV2_REGISTER_ROLE_NAME:-ray-elbv2-register-role-${STACK}}"
+
+# ---------------------------
+# C — c_ray_head (ENI, dedicated head instance, NLB, autoscaler YAML on head)
+# ---------------------------
+export ENABLE_C="${ENABLE_C:-false}"                      # enable c_ray_head
+export HEAD_AMI="${HEAD_AMI:-ami-0abcdef1234567890}"      # must set in prod
 export HEAD_INSTANCE_TYPE="${HEAD_INSTANCE_TYPE:-m5.large}"
-export RAY_HEAD_INSTANCE_PROFILE="${RAY_HEAD_INSTANCE_PROFILE:-}"
-export RAY_CPU_AMI="${RAY_CPU_AMI:-}"
+export RAY_HEAD_INSTANCE_PROFILE="${RAY_HEAD_INSTANCE_PROFILE:-ray-head-instance-profile-${STACK}}"
+export RAY_HEAD_KEY_NAME="${RAY_HEAD_KEY_NAME:-}"
+export HEAD_SUBNET_ID="${HEAD_SUBNET_ID:-}"                # optional single subnet to place ENI
+export HEAD_ENI_ID="${HEAD_ENI_ID:-}"                      # reuse existing ENI if available
+export RAY_REDIS_PORT="${RAY_REDIS_PORT:-6379}"
+export RAY_METRICS_PORT="${RAY_METRICS_PORT:-8080}"
+export RAY_AUTOSCALER_S3_BUCKET="${AUTOSCALER_BUCKET_NAME:-ray-autoscaler-${STACK}-${AWS_REGION}}"
+export AUTOSCALER_YAML_INLINE="${AUTOSCALER_YAML_INLINE:-true}" # false => expect S3
+export AUTOSCALER_MIN_WORKERS="${AUTOSCALER_MIN_WORKERS:-0}"
+export AUTOSCALER_MAX_WORKERS="${AUTOSCALER_MAX_WORKERS:-4}"
+export INSTANCE_TAG_RAY_CLUSTER="${INSTANCE_TAG_RAY_CLUSTER:-ray-cluster=${STACK}}"
+export SSM_PARAMETERS_TO_FETCH="${SSM_PARAMETERS_TO_FETCH:-${REDIS_SSM_PARAM}}"
+# Boot/user-data control
+export ENABLE_HEAD_USER_DATA_DEBUG="${ENABLE_HEAD_USER_DATA_DEBUG:-false}"
+export HEAD_USER_DATA_SCRIPT="${HEAD_USER_DATA_SCRIPT:-/etc/ray/start-head.sh}"
+
+
+# ---------------------------
+# D — d_ray_workers (Launch Template, ASG, lifecycle hook, drain Lambda)
+# ---------------------------
+export ENABLE_D="${ENABLE_D:-false}"                      # enable d_ray_workers
+export RAY_CPU_AMI="${RAY_CPU_AMI:-ami-0abcdef1234567890}" # must set
 export RAY_CPU_INSTANCE="${RAY_CPU_INSTANCE:-m5.xlarge}"
-export RAY_CPU_INSTANCE_PROFILE="${RAY_CPU_INSTANCE_PROFILE:-}"
-export KEY_NAME="${KEY_NAME:-}"
+export RAY_CPU_INSTANCE_PROFILE="${RAY_CPU_INSTANCE_PROFILE:-ray-worker-instance-profile-${STACK}}"
+export KEY_NAME="${KEY_NAME:-${RAY_HEAD_KEY_NAME:-}}"
+export WORKER_PRIVATE_SUBNET_IDS="${WORKER_PRIVATE_SUBNET_IDS:-${PRIVATE_SUBNET_IDS}}"
+export WORKER_SECURITY_GROUP_ID="${WORKER_SECURITY_GROUP_ID:-}" # attach worker sg
+export RAY_WORKER_MIN="${RAY_WORKER_MIN:-1}"
+export RAY_WORKER_DESIRED="${RAY_WORKER_DESIRED:-1}"
+export RAY_WORKER_MAX="${RAY_WORKER_MAX:-4}"
+export WORKER_SPOT_ENABLED="${WORKER_SPOT_ENABLED:-false}"
+export WORKER_SPOT_MAX_PRICE="${WORKER_SPOT_MAX_PRICE:-}"
+export ASG_LIFECYCLE_HOOK_HEARTBEAT="${ASG_LIFECYCLE_HOOK_HEARTBEAT:-600}"
+export ASG_DRAIN_TIMEOUT_SECONDS="${ASG_DRAIN_TIMEOUT_SECONDS:-300}"
+export LIFECYCLE_SNS_TOPIC="${LIFECYCLE_SNS_TOPIC:-ray-worker-life-topic-${STACK}}"
+export DRAIN_LAMBDA_NAME="${DRAIN_LAMBDA_NAME:-ray-drain-lambda-${STACK}}"
+export DRAIN_LAMBDA_TIMEOUT="${DRAIN_LAMBDA_TIMEOUT:-900}"
+export SSM_RUN_COMMAND_DOCUMENT="${SSM_RUN_COMMAND_DOCUMENT:-AWS-RunShellScript}"
+export WORKER_USER_DATA_DEBUG="${WORKER_USER_DATA_DEBUG:-false}"
+# Tagging and lifecycle behavior
+export WORKER_TAG_KEY="${WORKER_TAG_KEY:-ray-node-type}"
+export WORKER_TAG_VALUE="${WORKER_TAG_VALUE:-worker}"
 
-# Secrets / ssm
-export REDIS_SSM_PARAM="${REDIS_SSM_PARAM:-/ray/prod/redis_password}"
+# ---------------------------
+# E — e_observability_misc (Prometheus, Grafana, OTEL, CloudWatch, Logs, Alerts)
+# ---------------------------
+export ENABLE_E="${ENABLE_E:-false}"                      # enable e_observability_misc
+export ENABLE_PROMETHEUS="${ENABLE_PROMETHEUS:-true}"
+export PROMETHEUS_WORKSPACE_ARN="${PROMETHEUS_WORKSPACE_ARN:-}"
+export PROM_OTEL_COLLECTOR_URL="${PROM_OTEL_COLLECTOR_URL:-http://otel-collector:4317}"
+export PROMETHEUS_SCRAPE_PORT="${PROMETHEUS_SCRAPE_PORT:-8080}"
+export RAY_METRICS_PATH="${RAY_METRICS_PATH:-/metrics}"
+export GRAFANA_ENABLED="${GRAFANA_ENABLED:-true}"
+export GRAFANA_WORKSPACE_ID="${GRAFANA_WORKSPACE_ID:-}"
+export CLOUDWATCH_LOG_GROUP="${CLOUDWATCH_LOG_GROUP:-/ray/gateway}"
+export ENABLE_OTLP="${ENABLE_OTLP:-true}"
+export OTEL_RESOURCE_ATTRIBUTES="${OTEL_RESOURCE_ATTRIBUTES:-service.name=hybrid-rag}"
+# Alerts thresholds
+export ALERT_GATEWAY_5XX_PCT_THRESHOLD="${ALERT_GATEWAY_5XX_PCT_THRESHOLD:-1.0}"
+export ALERT_VALKEY_P99_MS="${ALERT_VALKEY_P99_MS:-50}"
+# Observability extras
+export ENABLE_TRACING="${ENABLE_TRACING:-true}"
+export LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-30}"
+export OTEL_COLLECTOR_IMAGE="${OTEL_COLLECTOR_IMAGE:-otel/opentelemetry-collector:latest}"
 
-# Additional optional toggles
-export ENABLE_COGNITO="${ENABLE_COGNITO:-false}"
-export ENABLE_WAF="${ENABLE_WAF:-false}"
-export ENABLE_ELASTICACHE="${ENABLE_ELASTICACHE:-false}"
-export ENABLE_PROMETHEUS="${ENABLE_PROMETHEUS:-false}"
-export ENABLE_VPC_ENDPOINTS="${ENABLE_VPC_ENDPOINTS:-false}"
 
-# Additional buckets (defaults may be overridden)
-export PULUMI_STATE_BUCKET="${PULUMI_STATE_BUCKET:-pulumi-state-${STACK}-${AWS_REGION}}"
-export AUTOSCALER_BUCKET_NAME="${AUTOSCALER_BUCKET_NAME:-ray-autoscaler-${STACK}-${AWS_REGION}}"
-export MODELS_S3_BUCKET="${MODELS_S3_BUCKET:-ray-models-${STACK}-${AWS_REGION}}"
+
+# --- Python interpreter detection (choose best available python3) ---
+export PYTHON_BIN="${PYTHON_BIN:-}"
+if [ -z "$PYTHON_BIN" ]; then
+  for p in python3.12 python3.11 python3.10 python3; do
+    if command -v "$p" >/dev/null 2>&1; then
+      PYTHON_BIN="$p"
+      break
+    fi
+  done
+fi
+if [ -z "$PYTHON_BIN" ]; then
+  echo "ERROR: no python3 interpreter found (tried python3.12, python3.11, python3.10, python3)" >&2
+  exit 11
+fi
 
 # ---------------------------
 # Helpers
@@ -75,11 +220,12 @@ abs_path() {
   if command -v realpath >/dev/null 2>&1; then
     realpath -m "$p"
   elif command -v readlink >/dev/null 2>&1; then
-    readlink -f "$p" || python3 -c "import os,sys; print(os.path.abspath(sys.argv[1]))" "$p"
+    readlink -f "$p" || "$PYTHON_BIN" -c "import os,sys; print(os.path.abspath(sys.argv[1]))" "$p"
   else
-    python3 -c "import os,sys; print(os.path.abspath(sys.argv[1]))" "$p"
+    "$PYTHON_BIN" -c "import os,sys; print(os.path.abspath(sys.argv[1]))" "$p"
   fi
 }
+
 PROJECT_DIR="$(abs_path "$PROJECT_DIR")"
 VENV_DIR="$(abs_path "$VENV_DIR")"
 REQ_FILE="$(abs_path "$REQ_FILE")"
@@ -110,25 +256,16 @@ fi
 prog="$(basename "$0")"
 usage() {
   cat <<EOF
-Usage: $prog [--create|--delete] [--force] [--preview] [--preview-and-up] [--a] [--b] [--c] [--d] [--e] [-h|--help]
+Usage: $prog [--create|--delete] [--force] [--preview] [--preview-and-up] [-h|--help]
   --create            create backend + venv + pulumi up (or preview)
   --delete            destroy stack and remove backend artifacts
-  --a                 include module A (a_prereqs_networking)
-  --b                 include module B (b_identity_alb_iam)
-  --c                 include module C (c_ray_head)
-  --d                 include module D (d_ray_workers)
-  --e                 include extras (ElastiCache/Prometheus/WAF/etc) - optional/placeholder
   --force             with --delete also delete entire S3 bucket
   --preview           run pulumi preview only (no up)
   --preview-and-up    run preview and, if successful, pulumi up
-Notes:
-  - If no --a..--e flags are passed with --create, the script enables A..D by default.
 EOF
 }
 
 MODE="" FORCE_FLAG=false PREVIEW=false PREVIEW_AND_UP=false
-FLAG_A=false; FLAG_B=false; FLAG_C=false; FLAG_D=false; FLAG_E=false
-
 while [ $# -gt 0 ]; do
   case "$1" in
     --create) MODE="create"; shift;;
@@ -137,11 +274,6 @@ while [ $# -gt 0 ]; do
     --preview) PREVIEW=true; shift;;
     --preview-and-up) PREVIEW_AND_UP=true; shift;;
     -h|--help) usage; exit 0;;
-    --a) FLAG_A=true; shift;;
-    --b) FLAG_B=true; shift;;
-    --c) FLAG_C=true; shift;;
-    --d) FLAG_D=true; shift;;
-    --e) FLAG_E=true; shift;;
     *) echo "Unknown arg: $1" >&2; usage; exit 2;;
   esac
 done
@@ -156,8 +288,8 @@ cleanup() { for f in "${TMPS[@]:-}"; do [ -f "$f" ] && rm -f "$f"; done; }
 trap cleanup EXIT
 
 retry() {
-  local tries=${1:-5}; shift || true
-  local delay=${1:-1}; shift || true
+  local tries=${1:-5}; shift
+  local delay=${1:-1}; shift
   local i=0 rc=0
   while [ $i -lt $tries ]; do
     set +e
@@ -173,11 +305,7 @@ retry() {
 }
 
 require_cmd aws
-require_cmd python3
-# jq optional; used for JSON handling when present
-if ! command -v jq >/dev/null 2>&1; then
-  log "note: jq not found; script will fall back to python for JSON parsing"
-fi
+require_cmd curl
 
 if ! aws sts get-caller-identity >/dev/null 2>&1; then
   die "AWS credentials not configured or not working (aws sts get-caller-identity failed)" 20
@@ -215,10 +343,7 @@ delete_s3_objects() {
     else
       rv="$(aws s3api list-object-versions --bucket "$bucket" --output json 2>/dev/null || echo '{}')"
     fi
-    if command -v jq >/dev/null 2>&1; then
-      count=$(jq -r '[.Versions[], .DeleteMarkers[]] | length' <<<"$rv" 2>/dev/null || echo 0)
-    else
-      count=$(python3 - <<PY
+    count=$(command -v jq >/dev/null 2>&1 && jq -r '[.Versions[], .DeleteMarkers[]] | length' <<<"$rv" 2>/dev/null || "$PYTHON_BIN" - <<PY
 import sys,json
 try:
   r=json.load(sys.stdin)
@@ -227,13 +352,9 @@ try:
 except Exception:
   print(0)
 PY
-<<<"$rv")
-    fi
-    [ -z "$count" ] || [ "$count" = "0" ] && break
-    if command -v jq >/dev/null 2>&1; then
-      objs=$(jq -c '[.Versions[]?, .DeleteMarkers[]?] | map({Key:.Key,VersionId:.VersionId})' <<<"$rv")
-    else
-      objs=$(python3 - <<PY
+)
+    if [ -z "$count" ] || [ "$count" = "0" ]; then break; fi
+    objs=$(command -v jq >/dev/null 2>&1 && jq -c '[.Versions[]?, .DeleteMarkers[]?] | map({Key:.Key,VersionId:.VersionId})' <<<"$rv" || "$PYTHON_BIN" - <<PY
 import sys,json
 r=json.load(sys.stdin)
 arr=[]
@@ -242,8 +363,7 @@ for k in ("Versions","DeleteMarkers"):
     arr.append({"Key":it.get("Key"), "VersionId": it.get("VersionId")})
 print(json.dumps(arr))
 PY
-<<<"$rv")
-    fi
+)
     tmp="$(mktemp)"; TMPS+=("$tmp")
     printf '{"Objects":%s}' "$objs" >"$tmp"
     aws s3api delete-objects --bucket "$bucket" --delete "file://$tmp" >/dev/null 2>&1 || true
@@ -365,7 +485,7 @@ delete_policy_and_user_idempotent() {
   existing="$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='${policy_name}'].Arn" --output text || true)"
   if [ -n "$existing" ]; then
     for u in $(aws iam list-entities-for-policy --policy-arn "$existing" --query 'PolicyUsers[].UserName' --output text || true); do aws iam detach-user-policy --user-name "$u" --policy-arn "$existing" || true; done
-    for r in $(aws iam list-entities-for-policy --policy-arn "$existing" --query 'PolicyRoles[].RoleName' --output text || true); do aws iam.detach-role-policy --role-name "$r" --policy-arn "$existing" || true; done
+    for r in $(aws iam list-entities-for-policy --policy-arn "$existing" --query 'PolicyRoles[].RoleName' --output text || true); do aws iam detach-role-policy --role-name "$r" --policy-arn "$existing" || true; done
     for v in $(aws iam list-policy-versions --policy-arn "$existing" --query 'Versions[?IsDefaultVersion==`false`].VersionId' --output text || true); do aws iam delete-policy-version --policy-arn "$existing" --version-id "$v" || true; done
     aws iam delete-policy --policy-arn "$existing" || true
     log "iam-delete: policy delete attempted"
@@ -386,16 +506,14 @@ delete_policy_and_user_idempotent() {
 }
 
 # ---------------------------
-# Pulumi helpers + venv bootstrap
+# Pulumi helpers
 # ---------------------------
 ensure_pulumi_cli() {
   if command -v pulumi >/dev/null 2>&1; then return 0; fi
-  if [ -n "${PULUMI_BINARY_PATH:-}" ] && [ -x "${PULUMI_BINARY_PATH}" ]; then
-    export PATH="$(dirname "$PULUMI_BINARY_PATH"):$PATH"
-  fi
+  if [ -x "${PULUMI_BINARY_PATH:-}" ]; then export PATH="$(dirname "$PULUMI_BINARY_PATH"):$PATH"; fi
   if ! command -v pulumi >/dev/null 2>&1; then
     if command -v curl >/dev/null 2>&1; then
-      curl -fsSL https://get.pulumi.com | sh >/dev/null 2>&1 || true
+      curl -fsSL https://get.pulumi.com | sh
       export PATH="$HOME/.pulumi/bin:$PATH"
     else
       die "pulumi CLI not found and cannot auto-install (curl missing)" 11
@@ -411,69 +529,92 @@ ensure_pulumi_cli() {
   die "pulumi not responding after install" 11
 }
 
-# Ensure pip exists in given python binary by running ensurepip if needed
-ensure_pip_for_python() {
-  local py="$1"
-  # test pip module
+create_venv_and_install() {
+  enforce_venv() { :
+    local stray="${PROJECT_DIR}/.venv"
+    local want="${VENV_DIR}"
+    if [ -d "$stray" ]; then
+      log "venv-policy: removing legacy '${stray}' to avoid drift"
+      rm -rf "$stray" || true
+    fi
+    mkdir -p "$(dirname "$want")"
+  }
+  enforce_venv
+
+  # create venv with explicit interpreter
+  if [ ! -d "$VENV_DIR" ]; then
+    log "venv: creating venv at $VENV_DIR using $PYTHON_BIN"
+    "$PYTHON_BIN" -m venv "$VENV_DIR" || {
+      echo "ERROR: creating venv with $PYTHON_BIN failed. Ensure python-venv package is installed." >&2
+      echo "On Debian/Ubuntu: sudo apt install python3-venv python3-distutils" >&2
+      exit 12
+    }
+  fi
+
+  VENV_PY="${VENV_DIR}/bin/python"
+  VENV_PIP="${VENV_DIR}/bin/pip"
+
+  if [ ! -x "$VENV_PIP" ]; then
+    log "venv: bootstrapping pip via ensurepip"
+    "$VENV_PY" -m ensurepip --upgrade >/dev/null 2>&1 || true
+  fi
+
+  log "venv: upgrading pip setuptools wheel in venv"
   set +e
-  "$py" -m pip --version >/dev/null 2>&1
+  "$VENV_PY" -m pip install --upgrade pip setuptools wheel
   rc=$?
   set -e
   if [ $rc -ne 0 ]; then
-    log "pip not present for $py; attempting ensurepip bootstrap"
-    set +e
-    "$py" -m ensurepip --upgrade >/dev/null 2>&1 || true
-    "$py" -m pip install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
-    set -e
+    # detect PEP 668 style failure
+    if "$VENV_PY" -m pip --version 2>&1 | grep -qi "externally-managed-environment"; then
+      cat >&2 <<MSG
+
+ERROR: pip failed due to "externally-managed-environment" (PEP 668).
+Remediation:
+  1) Install system venv support:
+     sudo apt update
+     sudo apt install -y python3-venv python3-distutils python3-dev build-essential libssl-dev libffi-dev
+  2) Or set PYTHON_BIN to an unmanaged python (pyenv or distro package) and re-run.
+
+Do not use --break-system-packages unless you understand the risk.
+
+MSG
+      exit 13
+    fi
+    die "pip upgrade in venv failed (rc=$rc)."
   fi
-}
 
-# create venv if missing; ALWAYS use venv python for pip
-create_venv_and_install() {
-  mkdir -p "$(dirname "$VENV_DIR")"
-  if [ ! -d "$VENV_DIR" ]; then
-    log "venv: creating virtualenv at $VENV_DIR"
-    python3 -m venv "$VENV_DIR"
-  else
-    log "venv: using existing virtualenv at $VENV_DIR"
-  fi
-
-  # choose python executable inside venv
-  if [ -x "${VENV_DIR}/bin/python3" ]; then
-    VENV_PYTHON="${VENV_DIR}/bin/python3"
-  elif [ -x "${VENV_DIR}/bin/python" ]; then
-    VENV_PYTHON="${VENV_DIR}/bin/python"
-  else
-    die "venv python not found at ${VENV_DIR}/bin/python{,3}"
-  fi
-  export PULUMI_PYTHON_CMD="${VENV_PYTHON}"
-
-  log "venv: ensuring pip exists for ${VENV_PYTHON}"
-  ensure_pip_for_python "${VENV_PYTHON}"
-
-  log "venv: installing packages using ${VENV_PYTHON} (requirements: ${REQ_FILE})"
   if [ -f "$REQ_FILE" ]; then
-    "${VENV_PYTHON}" -m pip install -r "$REQ_FILE"
+    log "venv: installing packages from ${REQ_FILE} into venv"
+    set +e
+    "$VENV_PY" -m pip install -r "$REQ_FILE"
+    rc=$?
+    set -e
+    if [ $rc -ne 0 ]; then
+      die "pip install -r ${REQ_FILE} failed (rc=$rc)."
+    fi
   else
-    "${VENV_PYTHON}" -m pip install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
-    # install essential packages
-    "${VENV_PYTHON}" -m pip install pulumi pulumi-aws boto3 awscli >/dev/null 2>&1 || true
+    log "venv: installing default packages into venv"
+    "$VENV_PY" -m pip install pulumi pulumi-aws pulumi-tls boto3 awscli >/dev/null 2>&1 || true
   fi
-  log "venv: ready (python: ${VENV_PYTHON})"
+
+  # activate venv for remainder of script
+  # shellcheck disable=SC1090
+  source "${VENV_DIR}/bin/activate"
+  export PULUMI_PYTHON_CMD="${VENV_PY}"
+  log "venv: ready ($VENV_DIR) with python $("$VENV_PY" --version 2>/dev/null || true)"
 }
 
 activate_venv_if_exists() {
-  if [ -f "${VENV_DIR}/bin/activate" ]; then
+  enforce_venv() { :
+    mkdir -p "$(dirname "$VENV_DIR")" || true
+  }
+  enforce_venv
+  if [ -d "$VENV_DIR" ]; then
     # shellcheck disable=SC1090
     source "${VENV_DIR}/bin/activate"
-    if [ -x "${VENV_DIR}/bin/python3" ]; then
-      export PULUMI_PYTHON_CMD="${VENV_DIR}/bin/python3"
-    elif [ -x "${VENV_DIR}/bin/python" ]; then
-      export PULUMI_PYTHON_CMD="${VENV_DIR}/bin/python"
-    fi
+    export PULUMI_PYTHON_CMD="${VENV_DIR}/bin/python"
     log "venv: activated and PULUMI_PYTHON_CMD=${PULUMI_PYTHON_CMD}"
-  else
-    log "venv: not present; continuing without activation"
   fi
 }
 
@@ -496,15 +637,13 @@ find_pulumi_entrypoint() {
 
 ensure_valid_entrypoint_exists() {
   if ep="$(find_pulumi_entrypoint)"; then
-    # compile check using venv Python if available
-    local pycmd="${PULUMI_PYTHON_CMD:-python3}"
-    if ! "$pycmd" -m py_compile "$ep" >/dev/null 2>&1; then
-      die "Pulumi entrypoint '$ep' exists but contains syntax errors. Fix it and re-run."
+    if ! "$PYTHON_BIN" -m py_compile "$ep" >/dev/null 2>&1; then
+      die "Pulumi entrypoint '$ep' exists but contains syntax errors. Fix and re-run."
     fi
     log "pulumi: entrypoint found and valid: $ep"
     return 0
   fi
-  die "__main__.py or other Python Pulumi entrypoint missing in ${PROJECT_DIR}; this script will not create or modify __main__.py. Add a valid Pulumi program and re-run."
+  die "__main__.py or other Python Pulumi entrypoint missing in ${PROJECT_DIR}; add one and re-run."
 }
 
 get_pulumi_project_name() {
@@ -519,10 +658,8 @@ verify_stack_selected() {
 
 pulumi_select_or_init_stack() {
   local stack="$1"
-  # ensure pulumi CLI installed
-  ensure_pulumi_cli
-  export PULUMI_PYTHON_CMD="${PULUMI_PYTHON_CMD:-${VENV_DIR}/bin/python3}"
   for attempt in 1 6; do
+    export PULUMI_PYTHON_CMD="${VENV_DIR}/bin/python"
     if pulumi stack select "$stack" >/dev/null 2>&1; then
       log "pulumi: selected existing stack '$stack'"
       return 0
@@ -540,7 +677,8 @@ pulumi_select_or_init_stack() {
     for attempt in 1 4; do
       log "pulumi: trying stack init '$c' (attempt $attempt)"
       set +e
-      pulumi stack init "$c" >/dev/null 2>&1 || true
+      export PULUMI_PYTHON_CMD="${VENV_DIR}/bin/python"
+      pulumi stack init "$c" >/dev/null 2>&1
       rc=$?
       set -e
       if [ $rc -eq 0 ]; then
@@ -554,11 +692,11 @@ pulumi_select_or_init_stack() {
     done
   done
 
-  # fallback to pulumi new
   log "pulumi: fallback -> attempting non-interactive 'pulumi new python --yes --force'"
   ensure_pulumi_cli
   set +e
-  pulumi new python --yes --force >/dev/null 2>&1 || true
+  export PULUMI_PYTHON_CMD="${VENV_DIR}/bin/python"
+  pulumi new python --yes --force >/dev/null 2>&1
   rc=$?
   set -e
   if [ $rc -ne 0 ]; then
@@ -577,7 +715,7 @@ pulumi_preview_and_capture() {
   local logdir="${PROJECT_DIR}/.pulumi-logs"; mkdir -p "$logdir"
   local logf="${logdir}/pulumi-preview-$(date -u +%s).log"
   : >"$logf"
-  export PULUMI_PYTHON_CMD="${PULUMI_PYTHON_CMD:-${VENV_DIR}/bin/python3}"
+  export PULUMI_PYTHON_CMD="${VENV_DIR}/bin/python"
   if pulumi preview --diff --non-interactive >"$logf" 2>&1; then
     log "pulumi: preview succeeded (log: $logf)"; return 0
   else
@@ -591,7 +729,7 @@ pulumi_up_and_capture() {
   local logdir="${PROJECT_DIR}/.pulumi-logs"; mkdir -p "$logdir"
   local logf="${logdir}/pulumi-up-$(date -u +%s).log"
   : >"$logf"
-  export PULUMI_PYTHON_CMD="${PULUMI_PYTHON_CMD:-${VENV_DIR}/bin/python3}"
+  export PULUMI_PYTHON_CMD="${VENV_DIR}/bin/python"
   if pulumi up --yes >"$logf" 2>&1; then
     log "pulumi: up succeeded (log: $logf)"; return 0
   else
@@ -605,7 +743,7 @@ write_stack_outputs() {
   local out_json="${PROJECT_DIR}/pulumi-outputs.json"
   local out_sh="${PROJECT_DIR}/pulumi-exports.sh"
   mkdir -p "${PROJECT_DIR}/.pulumi-logs" || true
-  export PULUMI_PYTHON_CMD="${PULUMI_PYTHON_CMD:-${VENV_DIR}/bin/python3}"
+  export PULUMI_PYTHON_CMD="${VENV_DIR}/bin/python"
   set +e
   pulumi stack output --json >"${out_json}.tmp" 2>/dev/null
   rc=$?
@@ -616,8 +754,8 @@ write_stack_outputs() {
   fi
   mv "${out_json}.tmp" "$out_json" || true
 
-  if [ -s "$out_json" ] && command -v python3 >/dev/null 2>&1; then
-    python3 - "$out_json" "$out_sh" <<'PY'
+  if [ -s "$out_json" ] && command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    "$PYTHON_BIN" - "$out_json" "$out_sh" <<'PY'
 import json,sys,os
 json_fn = sys.argv[1]
 out_fn = sys.argv[2]
@@ -647,83 +785,24 @@ PY
   log "pulumi: outputs written to $out_json and $out_sh"
 }
 
-# New helper: set Pulumi config keys from environment variables
-set_pulumi_config_from_envs() {
-  declare -A cfgmap=(
-    ["AWS_REGION"]="aws:region"
-    ["VPC_ID"]="vpcId"
-    ["PUBLIC_SUBNET_IDS"]="publicSubnetIds"
-    ["PRIVATE_SUBNET_IDS"]="privateSubnetIds"
-    ["ALB_SECURITY_GROUP_ID"]="albSecurityGroupId"
-    ["HEAD_SECURITY_GROUP_ID"]="headSecurityGroupId"
-    ["WORKER_SECURITY_GROUP_ID"]="workerSecurityGroupId"
-    ["HEAD_AMI"]="headAmi"
-    ["HEAD_INSTANCE_TYPE"]="headInstanceType"
-    ["RAY_HEAD_INSTANCE_PROFILE"]="rayHeadInstanceProfile"
-    ["RAY_CPU_AMI"]="rayCpuAmi"
-    ["RAY_CPU_INSTANCE"]="rayCpuInstance"
-    ["RAY_CPU_INSTANCE_PROFILE"]="rayCpuInstanceProfile"
-    ["KEY_NAME"]="keyName"
-    ["REDIS_SSM_PARAM"]="redisSsmParam"
-    ["AUTOSCALER_BUCKET_NAME"]="autoscalerBucket"
-    ["MODELS_S3_BUCKET"]="modelsBucket"
-    ["DOMAIN"]="domain"
-    ["HOSTED_ZONE_ID"]="hostedZoneId"
-    ["PRIVATE_HOSTED_ZONE_ID"]="privateHostedZoneId"
-    ["PRIVATE_HOSTED_ZONE_NAME"]="privateHostedZoneName"
-    ["ENABLE_COGNITO"]="enableCognito"
-    ["ENABLE_WAF"]="enableWaf"
-    ["ENABLE_ELASTICACHE"]="enableElastiCache"
-    ["ENABLE_PROMETHEUS"]="enablePrometheus"
-    ["ENABLE_VPC_ENDPOINTS"]="createVpcEndpoints"
-    ["MULTI_AZ_DEPLOYMENT"]="multiAz"
-    ["NO_NAT"]="noNat"
-    ["ENABLE_RATE_LIMITER"]="enableRateLimiter"
-    ["ENABLE_GPU"]="enableGpu"
-    ["MODE"]="mode"
-    ["ENABLE_CROSS_ENCODER"]="enableCrossEncoder"
-    ["PULUMI_STATE_BUCKET"]="pulumiStateBucket"
-  )
-
-  for envvar in "${!cfgmap[@]}"; do
-    val="${!envvar-}"
-    pulumi_key="${cfgmap[$envvar]}"
-    if [ -n "$val" ]; then
-      log "pulumi config: setting ${pulumi_key} = (from env ${envvar})"
-      pulumi config set "${pulumi_key}" "$val" >/dev/null 2>&1 || log "pulumi config set ${pulumi_key} returned non-zero (continuing)"
-    fi
-  done
-}
-
 pulumi_login_and_run() {
   ensure_pulumi_cli
   export AWS_DYNAMODB_LOCK_TABLE="$DDB_TABLE"
   [ -n "$PULUMI_CONFIG_PASSPHRASE" ] && export PULUMI_CONFIG_PASSPHRASE
-  export PULUMI_PYTHON_CMD="${PULUMI_PYTHON_CMD:-${VENV_DIR}/bin/python3}"
+  export PULUMI_PYTHON_CMD="${VENV_DIR}/bin/python"
   log "pulumi: login s3://${S3_BUCKET}/${S3_PREFIX} (PULUMI_PYTHON_CMD=${PULUMI_PYTHON_CMD})"
-  # login may fail if not configured; allow script to continue and let pulumi commands report errors later
-  set +e
-  pulumi login "s3://${S3_BUCKET}/${S3_PREFIX}" >/dev/null 2>&1
-  rc=$?
-  set -e
-  if [ $rc -ne 0 ]; then
-    log "pulumi: login returned non-zero (continuing); ensure S3 backend is reachable and bucket exists"
-  fi
-
+  pulumi login "s3://${S3_BUCKET}/${S3_PREFIX}" >/dev/null 2>&1 || log "pulumi: login returned non-zero (continuing)"
   if [ ! -d "$PROJECT_DIR" ]; then die "project dir $PROJECT_DIR not found" 13; fi
   pushd "$PROJECT_DIR" >/dev/null || exit 1
   ensure_valid_entrypoint_exists
   activate_venv_if_exists
   pulumi_select_or_init_stack "$STACK"
-
   pulumi config set aws:region "$AWS_REGION" >/dev/null 2>&1 || true
-  set_pulumi_config_from_envs
 
-  export ENABLE_FILE_A="${ENABLE_FILE_A:-false}"
-  export ENABLE_FILE_B="${ENABLE_FILE_B:-false}"
-  export ENABLE_FILE_C="${ENABLE_FILE_C:-false}"
-  export ENABLE_FILE_D="${ENABLE_FILE_D:-false}"
-  export ENABLE_FILE_E="${ENABLE_FILE_E:-false}"
+  for e in $(env | awk -F= '/^PULUMI_CONFIG_/{print $1}'); do
+    val="$(printenv "$e")"; key="${e#PULUMI_CONFIG_}"; key_lc="$(echo "$key" | tr '[:upper:]' '[:lower:]')"
+    pulumi config set "$key_lc" "$val" >/dev/null 2>&1 || true
+  done
 
   local up_rc=0
 
@@ -759,7 +838,7 @@ pulumi_destroy_stack_if_exists_noninteractive() {
   if [ ! -d "$PROJECT_DIR" ]; then log "pulumi: project dir ${PROJECT_DIR} not found; skipping destroy"; return; fi
   pushd "$PROJECT_DIR" >/dev/null || return
   activate_venv_if_exists
-  export PULUMI_PYTHON_CMD="${PULUMI_PYTHON_CMD:-${VENV_DIR}/bin/python3}"
+  export PULUMI_PYTHON_CMD="${VENV_DIR}/bin/python"
   if pulumi stack select "$STACK" >/dev/null 2>&1; then
     pulumi destroy --yes >/dev/null 2>&1 || true
     pulumi stack rm --yes >/dev/null 2>&1 || true
@@ -793,40 +872,16 @@ cleanup_local_outputs() {
 
 log "Using project dir: ${PROJECT_DIR}"
 log "Using S3 bucket: ${S3_BUCKET}"
+log "Using python interpreter: ${PYTHON_BIN}"
 
 if [ "$MODE" = "create" ]; then
   log "=== CREATE MODE ==="
-
-  flags_count=0
-  [ "$FLAG_A" = true ] && flags_count=$((flags_count+1))
-  [ "$FLAG_B" = true ] && flags_count=$((flags_count+1))
-  [ "$FLAG_C" = true ] && flags_count=$((flags_count+1))
-  [ "$FLAG_D" = true ] && flags_count=$((flags_count+1))
-  [ "$FLAG_E" = true ] && flags_count=$((flags_count+1))
-
-  if [ "$flags_count" -eq 0 ]; then
-    export ENABLE_FILE_A=true
-    export ENABLE_FILE_B=true
-    export ENABLE_FILE_C=true
-    export ENABLE_FILE_D=true
-    export ENABLE_FILE_E=false
-    log "No module flags passed; defaulting to enable A,B,C,D"
-  else
-    export ENABLE_FILE_A=${FLAG_A}
-    export ENABLE_FILE_B=${FLAG_B}
-    export ENABLE_FILE_C=${FLAG_C}
-    export ENABLE_FILE_D=${FLAG_D}
-    export ENABLE_FILE_E=${FLAG_E}
-    log "Module flags set: A=${ENABLE_FILE_A} B=${ENABLE_FILE_B} C=${ENABLE_FILE_C} D=${ENABLE_FILE_D} E=${ENABLE_FILE_E}"
-  fi
-
   create_bucket_if_missing "$S3_BUCKET"
   create_dynamodb_if_missing "$DDB_TABLE"
   POLICY_ARN="$(ensure_policy "$S3_BUCKET" "$DDB_TABLE" "$POLICY_NAME" || true)"
   create_iam_user_if_requested "$PULUMI_IAM_USER" "$POLICY_ARN" "$PULUMI_CREDS_FILE"
   log "waiting briefly for IAM propagation..."
   sleep 3
-
   create_venv_and_install
 
   if [ ! -f "${PROJECT_DIR}/Pulumi.yaml" ]; then
@@ -853,6 +908,7 @@ REQ
 
   pulumi_login_and_run
 
+  log "ensure: $out_json and $out_setup present"
   log "CREATE complete"
   exit 0
 fi
