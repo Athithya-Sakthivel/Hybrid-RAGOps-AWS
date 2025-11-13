@@ -10,7 +10,6 @@ import pulumi_aws as aws
 STACK = pulumi.get_stack()
 cfg = pulumi.Config()
 
-# try to reuse a_prereqs_networking outputs in-process
 try:
     import a_prereqs_networking as netmod
     pulumi.log.info("Using a_prereqs_networking outputs in workers module")

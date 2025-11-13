@@ -137,11 +137,12 @@ if command -v aws >/dev/null 2>&1; then
 fi
 PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4 || echo "")
 if [ -n "$REDIS_PASSWORD" ]; then
-  ray start --head --port={RAY_REDIS_PORT} --node-ip-address="$PRIVATE_IP" --redis-password="$REDIS_PASSWORD" --autoscaling-config=/etc/ray/autoscaler.yaml --include-dashboard False --metrics-export-port=8080 || true
+  ray start --head --port={RAY_REDIS_PORT} --node-ip-address="$PRIVATE_IP" --redis-password="$REDIS_PASSWORD" --autoscaling-config=/etc/ray/autoscaler.yaml --include-dashboard False --metrics-export-port=8080 --resources='{"head":1}' || true
 else
-  ray start --head --port={RAY_REDIS_PORT} --node-ip-address="$PRIVATE_IP" --autoscaling-config=/etc/ray/autoscaler.yaml --include-dashboard False --metrics-export-port=8080 || true
+  ray start --head --port={RAY_REDIS_PORT} --node-ip-address="$PRIVATE_IP" --autoscaling-config=/etc/ray/autoscaler.yaml --include-dashboard False --metrics-export-port=8080 --resources='{"head":1}' || true
 fi
 """
+
 
 user_data = user_data_template.format(AUTOSCALER=autoscaler_yaml.replace("'", "'\\''"), REGION=aws.get_region().name, REDIS_SSM_PARAM=REDIS_SSM_PARAM, RAY_REDIS_PORT=RAY_REDIS_PORT)
 
