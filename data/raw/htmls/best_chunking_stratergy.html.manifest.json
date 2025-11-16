@@ -1,0 +1,9 @@
+{
+  "file_hash": "de06e0edf3c40315541a0de83eaaf9ec19ce429da3744748a510b7f3f5a33532",
+  "mime_type": "text/html",
+  "parser_version": "2.42.1",
+  "pipeline_run_id": "ee23958c-f9a3-4521-8507-9b9d07f066eb",
+  "s3_key": "data/raw/htmls/best_chunking_stratergy.html",
+  "timestamp": "2025-11-16T04:03:18.225092Z",
+  "indexed_chunks": 10
+}

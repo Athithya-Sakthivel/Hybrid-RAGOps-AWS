@@ -1,16 +1,3 @@
-#!/usr/bin/env python3
-"""
-Final local runner that enforces a standard import path.
-
-Behavior changes:
-- Prepends repo root and workdir to sys.path so both:
-    import indexing_pipeline.parse_chunk
-  and
-    import parse_chunk
-  work reliably.
-- Keeps AWS sanitization, auto-venv, preconvert controls, skip-s3, and robust in-process execution.
-"""
-
 from __future__ import annotations
 import argparse
 import logging
@@ -37,7 +24,6 @@ COLORS = {
     "ERROR": "\x1b[31;20m",
     "CRITICAL": "\x1b[41;30;20m",
 }
-
 
 class ColorFormatter(logging.Formatter):
     def format(self, record):

@@ -1,0 +1,9 @@
+{
+  "file_hash": "936a23b5c81d8942b8de551b737dc3ee9bd8905bd92019f91dd6885a9d33a142",
+  "mime_type": "application/pdf",
+  "parser_version": "2.42.1",
+  "pipeline_run_id": "ee23958c-f9a3-4521-8507-9b9d07f066eb",
+  "s3_key": "data/raw/pdfs/lgm_paper.pdf",
+  "timestamp": "2025-11-16T04:03:22.866841Z",
+  "indexed_chunks": 54
+}

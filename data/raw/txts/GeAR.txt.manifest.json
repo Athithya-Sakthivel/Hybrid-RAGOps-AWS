@@ -1,0 +1,9 @@
+{
+  "file_hash": "f55d505c3278dc3bebd4553f38907ee1c847f14bfb7a02e20be38cda874ec1f1",
+  "mime_type": "text/plain",
+  "parser_version": "2.42.1",
+  "pipeline_run_id": "ee23958c-f9a3-4521-8507-9b9d07f066eb",
+  "s3_key": "data/raw/txts/GeAR.txt",
+  "timestamp": "2025-11-16T04:03:25.871531Z",
+  "indexed_chunks": 7
+}

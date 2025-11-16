@@ -1,0 +1,9 @@
+{
+  "file_hash": "eb48c0d40ffcdcc4932698d591f4ea1e269a394d4d280a40241cb6c37863329b",
+  "mime_type": "application/pdf",
+  "parser_version": "2.42.1",
+  "pipeline_run_id": "ee23958c-f9a3-4521-8507-9b9d07f066eb",
+  "s3_key": "data/raw/pdfs/graph_rag_paper.pdf",
+  "timestamp": "2025-11-16T04:03:20.631378Z",
+  "indexed_chunks": 55
+}
