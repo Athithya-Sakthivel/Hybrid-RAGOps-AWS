@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 from __future__ import annotations
 import os
 import time
@@ -5,64 +6,87 @@ import json
 import uuid
 import hashlib
 import logging
-import subprocess
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple, Set
+from typing import List, Dict, Any, Optional, Tuple
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+# -------------------- Logging / noisy-lib suppression --------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("ingest")
+log.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
+if LOG_LEVEL != "DEBUG":
+    logging.getLogger("ray").setLevel(logging.INFO)
+    logging.getLogger("transformers").setLevel(logging.ERROR)
+    logging.getLogger("tokenizers").setLevel(logging.WARNING)
+    logging.getLogger("onnxruntime").setLevel(logging.WARNING)
+    logging.getLogger("qdrant_client").setLevel(logging.WARNING)
+    logging.getLogger("neo4j").setLevel(logging.WARNING)
+    logging.getLogger("botocore").setLevel(logging.WARNING)
+
+# Transformers HF logging
+try:
+    from transformers.utils import logging as hf_logging
+    hf_logging.set_verbosity_error()
+    try:
+        hf_logging.disable_progress_bar()
+    except Exception:
+        pass
+except Exception:
+    pass
+
+# ONNX runtime severity
+try:
+    import onnxruntime as ort
+    if hasattr(ort, "set_default_logger_severity"):
+        ort.set_default_logger_severity(3)
+except Exception:
+    pass
+
+os.environ.setdefault("RAY_LOG_LEVEL", LOG_LEVEL)
+os.environ.setdefault("RAY_DEDUP_LOGS", os.getenv("RAY_DEDUP_LOGS", "1"))
+
+# -------------------- Ray and config --------------------
 import ray
 from ray import serve
 
-# Config
 RAY_ADDRESS = os.getenv("RAY_ADDRESS", "auto")
 RAY_NAMESPACE = os.getenv("RAY_NAMESPACE", "ragops")
 SERVE_APP_NAME = os.getenv("SERVE_APP_NAME", "default")
-
 DATA_IN_LOCAL = os.getenv("DATA_IN_LOCAL", "false").lower() in ("1", "true", "yes")
 LOCAL_DIR_PATH = os.getenv("LOCAL_DIR_PATH", "./data")
 S3_BUCKET = os.getenv("S3_BUCKET", "").strip()
 S3_RAW_PREFIX = os.getenv("S3_RAW_PREFIX", "data/raw/").rstrip("/") + "/"
 S3_CHUNKED_PREFIX = os.getenv("S3_CHUNKED_PREFIX", "data/chunked/").rstrip("/") + "/"
-
-EMBED_DEPLOYMENT = os.getenv("EMBED_DEPLOYMENT", "embed_onxx")
+EMBED_DEPLOYMENT = os.getenv("EMBED_DEPLOYMENT", "embed_onnx_cpu")
 INDEXING_EMBEDDER_MAX_TOKENS = int(os.getenv("INDEXING_EMBEDDER_MAX_TOKENS", "512"))
+
+# set VECTOR_DIM default to 768 (match common ONNX embed models). If your embedder outputs different dim, set VECTOR_DIM env explicitly.
+VECTOR_DIM = int(os.getenv("VECTOR_DIM", "768"))
 
 QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", None)
 QDRANT_COLLECTION = os.getenv("COLLECTION", "my_collection")
 QDRANT_ON_DISK_PAYLOAD = os.getenv("QDRANT_ON_DISK_PAYLOAD", "true").lower() in ("1", "true", "yes")
+FORCE_RECREATE_QDRANT_COLLECTION = os.getenv("FORCE_RECREATE_QDRANT_COLLECTION", "false").lower() in ("1", "true", "yes")
 
-# --- Added safe defaults for common Qdrant HNSW tuning (collection-level) ---
-# These are optional tuning knobs. They are used at collection creation time.
 QDRANT_HNSW_M = int(os.getenv("QDRANT_HNSW_M", "16"))
 QDRANT_HNSW_EF_CONSTRUCTION = int(os.getenv("QDRANT_HNSW_EF_CONSTRUCTION", "200"))
 QDRANT_HNSW_EF_SEARCH = int(os.getenv("QDRANT_HNSW_EF_SEARCH", "50"))
 QDRANT_HNSW_FULL_SCAN_THRESHOLD = int(os.getenv("QDRANT_HNSW_FULL_SCAN_THRESHOLD", "10000"))
-# --------------------------------------------------------------------------------
 
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
-
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "64"))
 EMBED_BATCH = int(os.getenv("EMBED_BATCH", "32"))
 EMBED_TIMEOUT = int(os.getenv("EMBED_TIMEOUT", "60"))
-
 FORCE_REHASH = os.getenv("FORCE_REHASH", "0") in ("1", "true", "True")
-VECTOR_DIM = int(os.getenv("VECTOR_DIM", "768"))
-
-# lease TTL (seconds)
 LEASE_TTL_SECONDS = int(os.getenv("LEASE_TTL_SECONDS", "300"))
-
-# MODE: "vector_only" | "hybrid"
-# - vector_only: Qdrant stores only point id + minimal payload (chunk_id), Neo4j contains full text + metadata
-# - hybrid: Qdrant payload contains snippet/metadata and Neo4j still stores full text (no truncation)
 MODE = os.getenv("MODE", "hybrid").lower()
 
-# helpers
+# -------------------- helpers --------------------
 def deterministic_point_id(chunk_id: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_OID, str(chunk_id)))
 
@@ -106,7 +130,6 @@ def read_manifest_s3(bucket: str, key: str, client=None) -> Optional[Dict[str, A
         return None
 
 def write_manifest_s3_atomic(bucket: str, key: str, manifest: Dict[str, Any], client=None):
-    # keep original behavior: atomic tmp upload then copy
     client = client or _s3_client_for_bucket(bucket)
     final_key = key + ".manifest.json"
     tmp_key = final_key + f".tmp.{int(time.time())}-{uuid.uuid4().hex[:8]}"
@@ -178,65 +201,77 @@ def read_json_objects_from_text(text: str) -> List[Dict[str, Any]]:
             pass
     return out
 
-# Actors
+# -------------------- Ray actors --------------------
 @ray.remote(num_cpus=0)
 class QdrantWriter:
     def __init__(self, url: str, api_key: Optional[str], collection: str, vector_dim: int, on_disk_payload: bool = True):
         self.collection = collection
-        self.vector_dim = vector_dim
+        self.vector_dim = int(vector_dim)
         self.on_disk_payload = on_disk_payload
         self.client = None
         try:
             from qdrant_client import QdrantClient
             prefer_grpc = not (url.startswith("http://") or url.startswith("https://"))
             self.client = QdrantClient(url=url, api_key=api_key, prefer_grpc=prefer_grpc)
+            # Ensure collection exists and has correct vector size
             try:
                 cols = [c.name for c in self.client.get_collections().collections]
-                if collection not in cols:
-                    # try to create collection with HNSW config when available
-                    try:
-                        from qdrant_client.http.models import VectorParams, Distance, HnswConfig
-                        hnsw_cfg = HnswConfig(
-                            m=int(os.getenv("QDRANT_HNSW_M", str(QDRANT_HNSW_M))),
-                            ef_construct=int(os.getenv("QDRANT_HNSW_EF_CONSTRUCTION", str(QDRANT_HNSW_EF_CONSTRUCTION))),
-                            ef_search=int(os.getenv("QDRANT_HNSW_EF_SEARCH", str(QDRANT_HNSW_EF_SEARCH))),
-                            full_scan_threshold=int(os.getenv("QDRANT_HNSW_FULL_SCAN_THRESHOLD", str(QDRANT_HNSW_FULL_SCAN_THRESHOLD))),
-                        )
-                        self.client.create_collection(
-                            collection_name=collection,
-                            vectors_config=VectorParams(size=vector_dim, distance=Distance.COSINE),
-                            hnsw_config=hnsw_cfg,
-                            on_disk_payload=on_disk_payload,
-                        )
-                    except Exception:
-                        # fallback: try without explicit HNSW object (older/newer client compat)
+            except Exception:
+                cols = []
+            if collection in cols:
+                # inspect existing collection vector size if available
+                try:
+                    info = self.client.get_collection(collection_name=collection)
+                    existing_dim = None
+                    cfg = getattr(info, "config", None) or {}
+                    params = getattr(cfg, "params", None)
+                    if params and getattr(params, "vectors", None):
+                        vparams = params.vectors
+                        existing_dim = getattr(vparams, "size", None)
+                    # for http client fallback dict style
+                    if existing_dim is None:
                         try:
-                            from qdrant_client.http.models import VectorParams, Distance
-                            # pass hnsw settings as dict if supported by client
-                            hnsw_dict = {
-                                "m": int(os.getenv("QDRANT_HNSW_M", str(QDRANT_HNSW_M))),
-                                "ef_construct": int(os.getenv("QDRANT_HNSW_EF_CONSTRUCTION", str(QDRANT_HNSW_EF_CONSTRUCTION))),
-                                "ef_search": int(os.getenv("QDRANT_HNSW_EF_SEARCH", str(QDRANT_HNSW_EF_SEARCH))),
-                                "full_scan_threshold": int(os.getenv("QDRANT_HNSW_FULL_SCAN_THRESHOLD", str(QDRANT_HNSW_FULL_SCAN_THRESHOLD))),
-                            }
-                            # many qdrant client versions accept hnsw_config as dict
-                            self.client.create_collection(
-                                collection_name=collection,
-                                vectors_config=VectorParams(size=vector_dim, distance=Distance.COSINE),
-                                hnsw_config=hnsw_dict,
-                                on_disk_payload=on_disk_payload,
-                            )
-                        except Exception as e:
-                            # final fallback: create without hnsw config
+                            existing_dim = info.get("config", {}).get("params", {}).get("vectors", {}).get("size")
+                        except Exception:
+                            existing_dim = None
+                    if existing_dim is not None and int(existing_dim) != int(self.vector_dim):
+                        msg = f"Qdrant collection '{collection}' vector dim mismatch: existing={existing_dim} expected={self.vector_dim}"
+                        if os.getenv("FORCE_RECREATE_QDRANT_COLLECTION", "false").lower() in ("1", "true", "yes"):
+                            log.warning("%s - deleting and recreating collection (FORCE_RECREATE_QDRANT_COLLECTION enabled)", msg)
                             try:
-                                from qdrant_client.http.models import VectorParams, Distance
-                                self.client.create_collection(collection_name=collection, vectors_config=VectorParams(size=vector_dim, distance=Distance.COSINE), on_disk_payload=on_disk_payload)
-                            except Exception as e2:
-                                log.debug("QdrantWriter: collection create fallback failed: %s / %s", e, e2)
-                                raise
-                    log.info("QdrantWriter: created collection %s", collection)
-            except Exception as e:
-                log.debug("QdrantWriter: collection ensure skipped/failed: %s", e)
+                                self.client.delete_collection(collection_name=collection)
+                            except Exception:
+                                log.exception("Failed to delete existing collection; proceeding to create anyway")
+                            # fall through to create below
+                            cols = [c.name for c in self.client.get_collections().collections]
+                        else:
+                            log.error("%s. Set env FORCE_RECREATE_QDRANT_COLLECTION=true to recreate.", msg)
+                except Exception:
+                    log.debug("Qdrant collection inspection failed (continuing)")
+
+            if collection not in cols:
+                try:
+                    from qdrant_client.http.models import VectorParams, Distance, HnswConfig
+                    hnsw_cfg = HnswConfig(
+                        m=int(os.getenv("QDRANT_HNSW_M", str(QDRANT_HNSW_M))),
+                        ef_construct=int(os.getenv("QDRANT_HNSW_EF_CONSTRUCTION", str(QDRANT_HNSW_EF_CONSTRUCTION))),
+                        ef_search=int(os.getenv("QDRANT_HNSW_EF_SEARCH", str(QDRANT_HNSW_EF_SEARCH))),
+                        full_scan_threshold=int(os.getenv("QDRANT_HNSW_FULL_SCAN_THRESHOLD", str(QDRANT_HNSW_FULL_SCAN_THRESHOLD))),
+                    )
+                    self.client.create_collection(
+                        collection_name=collection,
+                        vectors_config=VectorParams(size=self.vector_dim, distance=Distance.COSINE),
+                        hnsw_config=hnsw_cfg,
+                        on_disk_payload=on_disk_payload,
+                    )
+                except Exception:
+                    try:
+                        from qdrant_client.http.models import VectorParams, Distance
+                        self.client.create_collection(collection_name=collection, vectors_config=VectorParams(size=self.vector_dim, distance=Distance.COSINE), on_disk_payload=on_disk_payload)
+                    except Exception as e:
+                        log.exception("QdrantWriter: collection create failed: %s", e)
+                        raise
+                log.info("QdrantWriter: created collection %s (dim=%d)", collection, self.vector_dim)
         except Exception as e:
             log.warning("QdrantWriter init failed: %s", e)
             self.client = None
@@ -268,6 +303,8 @@ class QdrantWriter:
                 vec = [float(x) for x in p["vector"]]
             except Exception as e:
                 return {"ok": False, "error": f"invalid_vector:{e}"}
+            if len(vec) != self.vector_dim:
+                return {"ok": False, "error": f"vector_dim_mismatch_expected_{self.vector_dim}_got_{len(vec)}"}
             structs.append(PointStruct(id=p["id"], vector=vec, payload=p.get("payload", {})))
         attempts = 0
         while attempts < 2:
@@ -281,28 +318,15 @@ class QdrantWriter:
                 log.warning("QdrantWriter upsert attempt %d failed: %s", attempts, msg)
                 if ("doesn't exist" in msg) or ("Not found: Collection" in msg) or ("404" in msg) or ("NotFound" in msg):
                     try:
-                        try:
-                            from qdrant_client.http.models import VectorParams, Distance, HnswConfig
-                            hnsw_cfg = HnswConfig(
-                                m=int(os.getenv("QDRANT_HNSW_M", str(QDRANT_HNSW_M))),
-                                ef_construct=int(os.getenv("QDRANT_HNSW_EF_CONSTRUCTION", str(QDRANT_HNSW_EF_CONSTRUCTION))),
-                                ef_search=int(os.getenv("QDRANT_HNSW_EF_SEARCH", str(QDRANT_HNSW_EF_SEARCH))),
-                                full_scan_threshold=int(os.getenv("QDRANT_HNSW_FULL_SCAN_THRESHOLD", str(QDRANT_HNSW_FULL_SCAN_THRESHOLD))),
-                            )
-                            self.client.create_collection(collection_name=self.collection, vectors_config=VectorParams(size=self.vector_dim, distance=Distance.COSINE), hnsw_config=hnsw_cfg, on_disk_payload=self.on_disk_payload)
-                        except Exception:
-                            # fallback to dict style or minimal create
-                            try:
-                                from qdrant_client.http.models import VectorParams, Distance
-                                hnsw_dict = {
-                                    "m": int(os.getenv("QDRANT_HNSW_M", str(QDRANT_HNSW_M))),
-                                    "ef_construct": int(os.getenv("QDRANT_HNSW_EF_CONSTRUCTION", str(QDRANT_HNSW_EF_CONSTRUCTION))),
-                                    "ef_search": int(os.getenv("QDRANT_HNSW_EF_SEARCH", str(QDRANT_HNSW_EF_SEARCH))),
-                                    "full_scan_threshold": int(os.getenv("QDRANT_HNSW_FULL_SCAN_THRESHOLD", str(QDRANT_HNSW_FULL_SCAN_THRESHOLD))),
-                                }
-                                self.client.create_collection(collection_name=self.collection, vectors_config=VectorParams(size=self.vector_dim, distance=Distance.COSINE), hnsw_config=hnsw_dict, on_disk_payload=self.on_disk_payload)
-                            except Exception as e2:
-                                self.client.create_collection(collection_name=self.collection, vectors_config=VectorParams(size=self.vector_dim, distance=Distance.COSINE), on_disk_payload=self.on_disk_payload)
+                        # attempt create
+                        from qdrant_client.http.models import VectorParams, Distance, HnswConfig
+                        hnsw_cfg = HnswConfig(
+                            m=int(os.getenv("QDRANT_HNSW_M", str(QDRANT_HNSW_M))),
+                            ef_construct=int(os.getenv("QDRANT_HNSW_EF_CONSTRUCTION", str(QDRANT_HNSW_EF_CONSTRUCTION))),
+                            ef_search=int(os.getenv("QDRANT_HNSW_EF_SEARCH", str(QDRANT_HNSW_EF_SEARCH))),
+                            full_scan_threshold=int(os.getenv("QDRANT_HNSW_FULL_SCAN_THRESHOLD", str(QDRANT_HNSW_FULL_SCAN_THRESHOLD))),
+                        )
+                        self.client.create_collection(collection_name=self.collection, vectors_config=VectorParams(size=self.vector_dim, distance=Distance.COSINE), hnsw_config=hnsw_cfg, on_disk_payload=self.on_disk_payload)
                         log.info("QdrantWriter: created collection on-the-fly: %s", self.collection)
                         continue
                     except Exception as e2:
@@ -340,8 +364,21 @@ class Neo4jWriter:
           ON CREATE SET d.file_name = c.file_name, d.created_at = datetime()
           ON MATCH SET d.updated_at = datetime()
         MERGE (ch:Chunk {chunk_id: c.chunk_id})
-          ON CREATE SET ch.text = c.text, ch.token_count = c.token_count, ch.file_type = c.file_type, ch.source_url = c.source_url, ch.timestamp = c.timestamp, ch.file_name = c.file_name, ch.qdrant_id = c.qdrant_point_id
-          ON MATCH SET ch.updated_at = datetime(), ch.qdrant_id = c.qdrant_point_id
+          ON CREATE SET ch.text = c.text,
+                        ch.token_count = c.token_count,
+                        ch.file_type = c.file_type,
+                        ch.source_url = c.source_url,
+                        ch.timestamp = c.timestamp,
+                        ch.file_name = c.file_name,
+                        ch.page_number = c.page_number,
+                        ch.row_range = c.row_range,
+                        ch.token_range = c.token_range,
+                        ch.audio_range = c.audio_range,
+                        ch.headings = c.headings,
+                        ch.headings_path = c.headings_path,
+                        ch.content_hash = c.content_hash,
+                        ch.qdrant_id = c.qdrant_point_id
+          ON MATCH SET ch.updated_at = datetime(), ch.qdrant_id = c.qdrant_point_id, ch.text = c.text
         MERGE (d)-[:HAS_CHUNK]->(ch)
         """
         written = 0
@@ -387,12 +424,7 @@ class Neo4jWriter:
             self._log.warning("neo4j get_chunks_info failed: %s", e)
         return out
 
-    # Lease methods for single-writer per file_hash
     def try_acquire_file_lock(self, file_hash: str, owner: str, ttl_seconds: int) -> Dict[str, Any]:
-        """
-        Returns {"ok": True, "acquired": True/False} on success,
-        or {"ok": False, "error": "..."} on Neo4j error.
-        """
         if not self.driver:
             return {"ok": False, "error": "neo4j_driver_unavailable"}
         try:
@@ -416,9 +448,6 @@ class Neo4jWriter:
             return {"ok": False, "error": str(e)}
 
     def release_file_lock(self, file_hash: str, owner: str) -> Dict[str, Any]:
-        """
-        Returns {"ok": True, "released": True/False} or {"ok": False, "error": "..."}
-        """
         if not self.driver:
             return {"ok": False, "error": "neo4j_driver_unavailable"}
         try:
@@ -436,7 +465,7 @@ class Neo4jWriter:
             self._log.warning("release_file_lock failed: %s", e)
             return {"ok": False, "error": str(e)}
 
-# Ray helpers
+# -------------------- Ray helpers & ingest worker --------------------
 def _ensure_ray_connected():
     if not ray.is_initialized():
         ray.init(address=(RAY_ADDRESS if RAY_ADDRESS and RAY_ADDRESS != "auto" else None), namespace=RAY_NAMESPACE, ignore_reinit_error=True)
@@ -492,15 +521,12 @@ def call_serve(handle, payload, timeout: float = EMBED_TIMEOUT):
             resp = handle(payload)
     except Exception as e:
         raise RuntimeError(f"serve invocation failed: {e}") from e
-
     if isinstance(resp, (dict, list, str, int, float, bool)) or resp is None:
         return resp
-
     try:
         return ray.get(resp, timeout=timeout)
     except Exception:
         pass
-
     if hasattr(resp, "object_refs"):
         obj_refs = getattr(resp, "object_refs")
         try:
@@ -510,7 +536,6 @@ def call_serve(handle, payload, timeout: float = EMBED_TIMEOUT):
                 return ray.get(obj_refs, timeout=timeout)
         except Exception:
             pass
-
     if hasattr(resp, "result") and callable(getattr(resp, "result")):
         try:
             return resp.result(timeout=timeout)
@@ -527,13 +552,11 @@ def call_serve(handle, payload, timeout: float = EMBED_TIMEOUT):
                 return resp.get()
             except Exception:
                 pass
-
     try:
         return ray.get(resp, timeout=timeout)
     except Exception as e:
         raise RuntimeError(f"call_serve failed resolving response: {e}") from e
 
-# actor ensure helper
 def ensure_actor(actor_cls, name: str, required_methods: List[str], *args):
     try:
         return actor_cls.options(name=name, lifetime="detached").remote(*args)
@@ -563,7 +586,6 @@ def ensure_actor(actor_cls, name: str, required_methods: List[str], *args):
                 pass
             return actor_cls.options(name=name, lifetime="detached").remote(*args)
 
-# worker
 @ray.remote
 def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: Dict[str, Any]) -> int:
     import boto3
@@ -575,17 +597,13 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
     force_rehash = cfg.get("force_rehash")
     embed_timeout = cfg.get("embed_timeout")
     boto_client = _s3_client_for_bucket(s3_bucket) if s3_bucket else None
-
-    # unique owner id for lease
     owner = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
     acquired_lease = False
-
     try:
         embed_handle = get_strict_handle(EMBED_DEPLOYMENT, timeout=10.0)
     except Exception:
         embed_handle = None
         log.warning("worker: embed handle unresolved")
-
     manifest = {}
     try:
         if mode == "s3" and boto_client:
@@ -594,10 +612,8 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
             manifest = read_manifest_local(raw_key) or {}
     except Exception:
         manifest = {}
-
     if force_rehash:
         manifest["indexed_chunks"] = 0
-
     file_hash = manifest.get("file_hash", "")
     if not file_hash or force_rehash:
         try:
@@ -610,8 +626,6 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
         except Exception as e:
             log.exception("hash compute failed for %s: %s", raw_key, e)
             return 0
-
-    # Try to acquire lease for this file_hash to avoid concurrent workers doing duplicate embedding
     if neo4j_actor:
         try:
             lease_res = ray.get(neo4j_actor.try_acquire_file_lock.remote(file_hash, owner, LEASE_TTL_SECONDS))
@@ -621,12 +635,10 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
                     return 0
                 acquired_lease = True
             else:
-                # if neo4j returned error, proceed without lease for compatibility
                 log.warning("Lease service reported error; proceeding without lease for %s: %s", raw_key, lease_res)
         except Exception as e:
             log.warning("Lease RPC failed; proceeding without lease for %s: %s", raw_key, e)
 
-    # ensure release in finally if we acquired
     try:
         chunks_meta: List[Dict[str, Any]] = []
         try:
@@ -663,7 +675,6 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
         except Exception as e:
             log.exception("failed reading chunk files for %s: %s", raw_key, e)
             return 0
-
         if not chunks_meta:
             return 0
 
@@ -682,30 +693,32 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
                 "file_type": p.get("file_type", ""),
                 "source_url": p.get("source_url", ""),
                 "timestamp": p.get("timestamp", ""),
+                "page_number": p.get("page_number"),
+                "row_range": p.get("row_range"),
+                "token_range": p.get("token_range"),
+                "audio_range": p.get("audio_range"),
+                "headings": p.get("headings"),
+                "headings_path": p.get("headings_path"),
                 "content_hash": p.get("content_hash") or hashlib.sha256(text.encode("utf-8")).hexdigest()
             })
-
         if not parsed_chunks:
             return 0
 
         point_ids = [deterministic_point_id(c["chunk_id"]) for c in parsed_chunks]
         chunk_ids = [c["chunk_id"] for c in parsed_chunks]
 
-        # Query Qdrant
+        # Query Qdrant and Neo4j for existence
         try:
             exist_map_q = ray.get(qdrant_actor.check_points_exist.remote(point_ids))
         except Exception as e:
             log.warning("qdrant existence check failed: %s", e)
             exist_map_q = {pid: False for pid in point_ids}
-
-        # Query Neo4j
         try:
             neo_info = ray.get(neo4j_actor.get_chunks_info.remote(chunk_ids))
         except Exception as e:
             log.warning("neo4j existence check failed: %s", e)
             neo_info = {cid: {"exists": False, "qdrant_id": None} for cid in chunk_ids}
 
-        # Decide embedding candidates
         to_embed_idxs: List[int] = []
         for i, c in enumerate(parsed_chunks):
             pid = point_ids[i]
@@ -723,16 +736,22 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
         if not to_embed_idxs:
             neo_payload = []
             for c, pid in zip(parsed_chunks, point_ids):
-                # store full text in Neo4j (no truncation)
                 neo_payload.append({
                     "chunk_id": c["chunk_id"],
                     "document_id": c["document_id"],
-                    "text": (c["text"] or ""),
+                    "text": c.get("text", ""),
                     "token_count": c["token_count"],
                     "file_name": c["file_name"],
                     "file_type": c["file_type"],
                     "source_url": c["source_url"],
                     "timestamp": c["timestamp"],
+                    "page_number": c.get("page_number"),
+                    "row_range": c.get("row_range"),
+                    "token_range": c.get("token_range"),
+                    "audio_range": c.get("audio_range"),
+                    "headings": c.get("headings"),
+                    "headings_path": c.get("headings_path"),
+                    "content_hash": c.get("content_hash"),
                     "qdrant_point_id": pid
                 })
             try:
@@ -741,15 +760,12 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
                     log.warning("neo4j write returned error: %s", r)
             except Exception:
                 log.exception("neo4j write failed for %s", raw_key)
-
-            # compute indexed_chunks count only (do not store indexed_chunk_ids or last_indexed_at)
             indexed_count = 0
             for i, c in enumerate(parsed_chunks):
                 pid = point_ids[i]
                 if exist_map_q.get(pid, False) or neo_info.get(c["chunk_id"], {}).get("exists", False):
                     indexed_count += 1
             manifest["indexed_chunks"] = indexed_count
-
             try:
                 if mode == "s3" and boto_client:
                     write_manifest_s3_atomic(s3_bucket, raw_key, manifest, client=boto_client)
@@ -765,46 +781,59 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
         if embed_handle is None:
             log.error("embed handle not available; skipping embedding for %s", raw_key)
             return 0
-
         try:
             for i in range(0, len(embed_texts), embed_batch):
                 batch_texts = embed_texts[i:i + embed_batch]
                 payload = {"texts": batch_texts, "max_length": max_tokens}
                 resp = call_serve(embed_handle, payload, timeout=embed_timeout)
                 if isinstance(resp, dict):
-                    vecs = resp.get("vectors") or resp.get("embeddings") or resp.get("data")
+                    vecs = resp.get("vectors") or resp.get("embeddings") or resp.get("data") or resp.get("outputs")
                 else:
                     vecs = resp
                 if vecs is None:
                     raise RuntimeError("no vectors returned")
+                # some embed deployments return {"vectors": [...], "max_length_used": ...}
                 if isinstance(vecs, dict) and "embeddings" in vecs:
                     vecs = vecs["embeddings"]
+                if isinstance(vecs, dict) and "vectors" in vecs:
+                    vecs = vecs["vectors"]
                 if not isinstance(vecs, list):
                     raise RuntimeError("vectors not list")
+                # validate vector dim and convert to float
                 for j, vec in enumerate(vecs):
+                    if not isinstance(vec, (list, tuple)):
+                        raise RuntimeError("vector not list/tuple")
+                    if len(vec) != VECTOR_DIM:
+                        # clear message for debugging; fail early to avoid bad upserts
+                        raise RuntimeError(f"embed returned vector dim {len(vec)} != expected VECTOR_DIM {VECTOR_DIM}")
                     idx = to_embed_idxs[i + j]
                     c = parsed_chunks[idx]
                     pid = point_ids[idx]
-
-                    # Decide qdrant payload per MODE
                     if MODE == "vector_only":
-                        q_payload = {"chunk_id": c["chunk_id"]}
-                    else:
-                        # hybrid: keep a compact snippet + basic metadata in qdrant payload
-                        q_payload = {
-                            "document_id": c["document_id"],
+                        payload = {
                             "chunk_id": c["chunk_id"],
-                            "snippet": (c["text"] or "")[:512],
+                            "document_id": c["document_id"],
+                            "text": c.get("text", ""),
                             "token_count": c["token_count"],
                             "file_name": c["file_name"],
                             "file_type": c["file_type"],
                             "source_url": c["source_url"],
                             "timestamp": c["timestamp"],
-                            "content_hash": c["content_hash"],
+                            "content_hash": c.get("content_hash"),
+                            "page_number": c.get("page_number"),
+                            "row_range": c.get("row_range"),
+                            "token_range": c.get("token_range"),
+                            "audio_range": c.get("audio_range"),
+                            "headings": c.get("headings"),
+                            "headings_path": c.get("headings_path"),
                             "source_file_hash": file_hash,
                         }
-
-                    new_points.append({"id": pid, "vector": [float(x) for x in vec], "payload": q_payload})
+                    else:
+                        payload = {
+                            "chunk_id": c["chunk_id"],
+                            "document_id": c["document_id"]
+                        }
+                    new_points.append({"id": pid, "vector": [float(x) for x in vec], "payload": payload})
         except Exception as e:
             log.exception("embedding failed for %s: %s", raw_key, e)
             return 0
@@ -854,16 +883,22 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
         for c, pid in zip(parsed_chunks, point_ids):
             ninfo = neo_info_final.get(c["chunk_id"], {"exists": False, "qdrant_id": None})
             if not ninfo.get("exists") or not ninfo.get("qdrant_id"):
-                # store full text in Neo4j (no truncation)
                 neo_payload.append({
                     "chunk_id": c["chunk_id"],
                     "document_id": c["document_id"],
-                    "text": (c["text"] or ""),
+                    "text": c.get("text", ""),
                     "token_count": c["token_count"],
                     "file_name": c["file_name"],
                     "file_type": c["file_type"],
                     "source_url": c["source_url"],
                     "timestamp": c["timestamp"],
+                    "page_number": c.get("page_number"),
+                    "row_range": c.get("row_range"),
+                    "token_range": c.get("token_range"),
+                    "audio_range": c.get("audio_range"),
+                    "headings": c.get("headings"),
+                    "headings_path": c.get("headings_path"),
+                    "content_hash": c.get("content_hash"),
                     "qdrant_point_id": pid
                 })
         try:
@@ -885,15 +920,12 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
         except Exception as e:
             log.warning("neo4j final existence check failed: %s", e)
             neo_info_final = {cid: {"exists": False, "qdrant_id": None} for cid in chunk_ids}
-
         existing_count = 0
         for i, c in enumerate(parsed_chunks):
             pid = point_ids[i]
             if exist_map_final.get(pid, False) or neo_info_final.get(c["chunk_id"], {}).get("exists", False):
                 existing_count += 1
-
         manifest["indexed_chunks"] = existing_count
-
         try:
             if mode == "s3" and boto_client:
                 write_manifest_s3_atomic(s3_bucket, raw_key, manifest, client=boto_client)
@@ -901,11 +933,8 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
                 write_manifest_local_atomic(raw_key, manifest)
         except Exception:
             log.exception("failed writing manifest for %s", raw_key)
-
         return indexed_new
-
     finally:
-        # release lease if we acquired it
         if acquired_lease and neo4j_actor:
             try:
                 rel = ray.get(neo4j_actor.release_file_lock.remote(file_hash, owner))
@@ -914,22 +943,17 @@ def ingest_file_worker(raw_key: str, mode: str, qdrant_actor, neo4j_actor, cfg: 
             except Exception as e:
                 log.warning("lease release RPC failed for %s: %s", raw_key, e)
 
-# main
+# -------------------- main --------------------
 def main():
     _ensure_ray_connected()
-    log.info("Connected to Ray (namespace=%s)", RAY_NAMESPACE)
-
+    log.info("Connected to Ray (namespace=%s) MODE=%s", RAY_NAMESPACE, MODE)
     try:
         _ = get_strict_handle(EMBED_DEPLOYMENT, timeout=10.0)
     except Exception:
         log.warning("embed handle unresolved on driver; workers will resolve")
-
-    # create / ensure actors and that they expose required methods. If an existing detached actor lacks required methods
-    # we kill it and recreate so workers can call get_chunks_info.
     qdrant_actor = ensure_actor(QdrantWriter, "qdrant_writer", ["check_points_exist", "upsert_points"], QDRANT_URL, QDRANT_API_KEY, QDRANT_COLLECTION, VECTOR_DIM, QDRANT_ON_DISK_PAYLOAD)
     neo4j_actor = ensure_actor(Neo4jWriter, "neo4j_writer", ["bulk_write_chunks", "get_chunks_info", "try_acquire_file_lock", "release_file_lock"], NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
 
-    # discover inputs
     inputs: List[Tuple[str, str]] = []
     if not DATA_IN_LOCAL and S3_BUCKET:
         import boto3
@@ -950,7 +974,6 @@ def main():
                     if f.endswith(".manifest.json"):
                         continue
                     inputs.append(("local", os.path.join(root, f)))
-
     if not inputs:
         log.warning("No raw inputs discovered")
         print("Total indexed chunks: 0")
@@ -981,7 +1004,6 @@ def main():
                 total_indexed += int(n or 0)
             except Exception as e:
                 log.exception("ingest task failed: %s", e)
-
     print(f"Total indexed chunks: {total_indexed}")
 
 if __name__ == "__main__":

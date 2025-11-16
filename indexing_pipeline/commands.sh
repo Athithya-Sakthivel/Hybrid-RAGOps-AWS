@@ -1,4 +1,75 @@
 
+echo "SHOW CONSTRAINTS;" | cypher-shell -a "$NEO4J_URI" -u "$NEO4J_USER" -p "$NEO4J_PASSWORD"
+
+# Delete all nodes & relationships (this will remove everything)
+echo "MATCH (n) DETACH DELETE n;" | cypher-shell -a "$NEO4J_URI" -u "$NEO4J_USER" -p "$NEO4J_PASSWORD"
+
+# If you want to drop constraints you discovered above, run (replace <constraint_name>):
+# echo "DROP CONSTRAINT <constraint_name> IF EXISTS;" | cypher-shell -a "$NEO4J_URI" -u "$NEO4J_USER" -p "$NEO4J_PASSWORD"
+
+###############################################################################
+# 2) Neo4j - Python (useful inside a venv; installs neo4j-driver)
+###############################################################################
+# pip install neo4j
+python3 - <<'PY'
+from neo4j import GraphDatabase
+import os
+uri = os.environ.get("NEO4J_URI")
+user = os.environ.get("NEO4J_USER")
+pwd  = os.environ.get("NEO4J_PASSWORD")
+drv = GraphDatabase.driver(uri, auth=(user, pwd))
+with drv.session() as s:
+    print("Deleting all nodes/relationships...")
+    s.run("MATCH (n) DETACH DELETE n")
+    # list constraints for manual review
+    try:
+        res = s.run("SHOW CONSTRAINTS")
+        print("CONSTRAINTS:")
+        for r in res:
+            print(r)
+    except Exception as e:
+        print("SHOW CONSTRAINTS failed:", e)
+drv.close()
+PY
+
+###############################################################################
+# 3) Qdrant - HTTP (curl + jq)
+# - List collections
+# - Delete a specific collection
+# - Delete all collections (loop) -- useful for "wipe everything"
+###############################################################################
+
+# List collections
+curl -sS -H "Api-Key: $QDRANT_API_KEY" "$QDRANT_URL/api/collections" | jq .
+
+# Delete a single collection (replace my_collection with your name)
+curl -sS -X DELETE -H "Api-Key: $QDRANT_API_KEY" "$QDRANT_URL/api/collections/my_collection" | jq .
+
+# Delete ALL collections (loop). Requires jq. This will remove all collections.
+for coll in $(curl -sS -H "Api-Key: $QDRANT_API_KEY" "$QDRANT_URL/api/collections" | jq -r '.collections[].name'); do
+  echo "Deleting collection: $coll"
+  curl -sS -X DELETE -H "Api-Key: $QDRANT_API_KEY" "$QDRANT_URL/api/collections/$coll" | jq .
+done
+
+###############################################################################
+# 4) Qdrant - Python (preferred when you have qdrant-client installed)
+###############################################################################
+# pip install qdrant-client
+python3 - <<'PY'
+import os
+from qdrant_client import QdrantClient
+qurl = os.environ.get("QDRANT_URL")
+qkey = os.environ.get("QDRANT_API_KEY") or None
+client = QdrantClient(url=qurl, api_key=qkey)
+info = client.get_collections()
+print("Collections:", [c.name for c in info.collections])
+for c in info.collections:
+    name = c.name
+    print("Deleting collection:", name)
+    client.delete_collection(collection_name=name)
+print("Done.")
+PY
+
 curl -X GET "$QDRANT_URL/collections" -H "api-key: $QDRANT_API_KEY" \
 | jq -r '.result.collections[].name' \
 | xargs -I{} curl -X DELETE "$QDRANT_URL/collections/{}" -H "api-key: $QDRANT_API_KEY"

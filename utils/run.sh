@@ -3,6 +3,7 @@ ray stop --force || true
 sudo rm -rf /tmp/ray/ || true
 ray start --head --port=6379 --resources='{"head":1}' --disable-usage-stats
 python3 -m infra.rayserve_deployments
+python3 indexing_pipeline/ingest.py
 
 
 curl -sS http://127.0.0.1:8003/healthz | jq .

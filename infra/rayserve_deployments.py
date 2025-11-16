@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 from __future__ import annotations
 import os
 import json
@@ -5,7 +6,48 @@ import logging
 import asyncio
 import traceback
 from typing import Any, Dict, Optional
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+# -------------------- Logging / noisy-lib suppression --------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+root = logging.getLogger()
+root.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+
+if LOG_LEVEL != "DEBUG":
+    logging.getLogger("ray").setLevel(logging.INFO)
+    logging.getLogger("ray.serve").setLevel(logging.INFO)
+    logging.getLogger("transformers").setLevel(logging.ERROR)
+    logging.getLogger("tokenizers").setLevel(logging.WARNING)
+    logging.getLogger("onnxruntime").setLevel(logging.WARNING)
+    logging.getLogger("botocore").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("qdrant_client").setLevel(logging.WARNING)
+    logging.getLogger("neo4j").setLevel(logging.WARNING)
+
+# Transformers logging API
+try:
+    from transformers.utils import logging as hf_logging
+    hf_logging.set_verbosity_error()
+    try:
+        hf_logging.disable_progress_bar()
+    except Exception:
+        pass
+except Exception:
+    pass
+
+# ONNX Runtime global severity (3 = WARNING, shows warnings+ only)
+try:
+    import onnxruntime as ort
+    if hasattr(ort, "set_default_logger_severity"):
+        ort.set_default_logger_severity(3)
+except Exception:
+    pass
+
+os.environ.setdefault("RAY_LOG_LEVEL", LOG_LEVEL)
+os.environ.setdefault("RAY_DEDUP_LOGS", os.getenv("RAY_DEDUP_LOGS", "1"))
+
+# -------------------- Deployment config --------------------
 RAY_ADDRESS = os.getenv("RAY_ADDRESS", None)
 RAY_NAMESPACE = os.getenv("RAY_NAMESPACE", None)
 SERVE_HTTP_HOST = os.getenv("SERVE_HTTP_HOST", "127.0.0.1")
@@ -43,23 +85,37 @@ INFERENCE_EMBEDDER_MAX_TOKENS = int(os.getenv("INFERENCE_EMBEDDER_MAX_TOKENS", "
 CROSS_ENCODER_MAX_TOKENS = int(os.getenv("CROSS_ENCODER_MAX_TOKENS", "600"))
 MAX_CHUNKS_TO_LLM = int(os.getenv("MAX_CHUNKS_TO_LLM", "8"))
 MODE = os.getenv("MODE", "hybrid").lower()
-logging.basicConfig(level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
 log = logging.getLogger("rayserve_deployments_final")
+
+# -------------------- imports --------------------
 import ray
 from ray import serve
 from ray.serve import HTTPOptions
 from starlette.responses import StreamingResponse, JSONResponse, PlainTextResponse, Response
+
 try:
     from infra import query as querylib
 except Exception:
     log.exception("Failed to import infra.query. Ensure infra/query.py exists and is importable.")
     raise
+
+# -------------------- helpers --------------------
 def _ensure_file(path: str):
     if not os.path.exists(path):
         raise FileNotFoundError(path)
-@serve.deployment(name=EMBED_DEPLOYMENT, num_replicas=EMBED_REPLICAS,ray_actor_options={"num_cpus": EMBED_CPUS, "num_gpus": EMBED_GPUS})
+
+# -------------------- ONNX Embed deployment --------------------
+@serve.deployment(name=EMBED_DEPLOYMENT, num_replicas=EMBED_REPLICAS, ray_actor_options={"num_cpus": EMBED_CPUS, "num_gpus": EMBED_GPUS})
 class ONNXEmbed:
     def __init__(self, onnx_path: str = ONNX_EMBED_PATH, tokenizer_path: str = ONNX_EMBED_TOKENIZER):
+        # reduce ORT verbosity again for safety in this process
+        try:
+            import onnxruntime as ort
+            if hasattr(ort, "set_default_logger_severity"):
+                ort.set_default_logger_severity(3)
+        except Exception:
+            pass
         from transformers import PreTrainedTokenizerFast
         import onnxruntime as ort
         import numpy as np
@@ -85,6 +141,7 @@ class ONNXEmbed:
         self.sess = self.ort.InferenceSession(onnx_path, sess_options=so, providers=providers)
         self.input_names = [inp.name for inp in self.sess.get_inputs()]
         log.info("[%s] initialized", EMBED_DEPLOYMENT)
+
     async def __call__(self, request_or_payload):
         if isinstance(request_or_payload, (dict, list)):
             body = request_or_payload
@@ -135,9 +192,18 @@ class ONNXEmbed:
         norms = self.np.maximum(norms, 1e-12)
         vecs = (vecs / norms).astype(float)
         return {"vectors": [v.tolist() for v in vecs], "max_length_used": int(max_length)}
-@serve.deployment(name=RERANK_DEPLOYMENT, num_replicas=RERANK_REPLICAS,ray_actor_options={"num_cpus": RERANK_CPUS, "num_gpus": RERANK_GPUS})
+
+# -------------------- ONNX Rerank deployment --------------------
+@serve.deployment(name=RERANK_DEPLOYMENT, num_replicas=RERANK_REPLICAS, ray_actor_options={"num_cpus": RERANK_CPUS, "num_gpus": RERANK_GPUS})
 class ONNXRerank:
     def __init__(self, onnx_path: str = ONNX_RERANK_PATH, tokenizer_path: str = ONNX_RERANK_TOKENIZER):
+        # reduce ORT verbosity here too
+        try:
+            import onnxruntime as ort
+            if hasattr(ort, "set_default_logger_severity"):
+                ort.set_default_logger_severity(3)
+        except Exception:
+            pass
         from transformers import PreTrainedTokenizerFast
         import onnxruntime as ort
         import numpy as np
@@ -163,6 +229,7 @@ class ONNXRerank:
         import numpy as np
         self.np = np
         log.info("[%s] initialized", RERANK_DEPLOYMENT)
+
     async def __call__(self, request_or_payload):
         if isinstance(request_or_payload, (dict, list)):
             body = request_or_payload
@@ -213,24 +280,53 @@ class ONNXRerank:
             except Exception as e:
                 raise RuntimeError("unable to parse reranker outputs: " + str(e))
         return {"scores": [float(s) for s in self.np.asarray(scores).astype(float)], "max_length_used": int(eff_max)}
-@serve.deployment(name=LLM_DEPLOYMENT, num_replicas=LLM_REPLICAS,ray_actor_options={"num_cpus": LLM_CPUS, "num_gpus": LLM_GPUS})
+
+# -------------------- LLM deployment (llama-cpp-python wrapper) --------------------
+@serve.deployment(name=LLM_DEPLOYMENT, num_replicas=LLM_REPLICAS, ray_actor_options={"num_cpus": LLM_CPUS, "num_gpus": LLM_GPUS})
 class LlamaServe:
     def __init__(self, model_path: str = LLM_MODEL_PATH):
         try:
+            # llama-cpp-python import
             from llama_cpp import Llama
         except Exception as e:
             log.exception("llama-cpp-python import failed: %s", e)
             raise RuntimeError("llama-cpp-python required for LLM deployment") from e
+
         _ensure_file(model_path)
         try:
             n_ctx = int(os.getenv("LLM_N_CTX", "2048"))
             n_threads = max(1, int(os.getenv("LLM_N_THREADS", str(max(1, int(LLM_CPUS))))))
             llm_kwargs = {"n_ctx": n_ctx, "n_threads": n_threads}
-            self.llm = Llama(model_path=model_path, **llm_kwargs)
-        except TypeError:
-            self.llm = Llama(model_path=model_path)
+            # enforce verbose=False to suppress wrapper/native metadata prints
+            llm_kwargs.setdefault("verbose", False)
+
+            # optionally suppress native stderr for any remaining prints
+            import contextlib
+            @contextlib.contextmanager
+            def _suppress_stderr():
+                try:
+                    devnull = os.open(os.devnull, os.O_RDWR)
+                    old_stderr = os.dup(2)
+                    os.dup2(devnull, 2)
+                    os.close(devnull)
+                    yield
+                finally:
+                    try:
+                        os.dup2(old_stderr, 2)
+                        os.close(old_stderr)
+                    except Exception:
+                        pass
+
+            # load model while suppressing native stderr (quiet startup)
+            with _suppress_stderr():
+                self.llm = Llama(model_path=model_path, **llm_kwargs)
+        except Exception:
+            # fallback to raising (we require LLM)
+            log.exception("LLM load failed")
+            raise
         self._lock = asyncio.Lock()
         log.info("[%s] LLM loaded %s", LLM_DEPLOYMENT, model_path)
+
     async def generate(self, prompt: str, params: Optional[Dict[str, Any]] = None) -> Any:
         params = params or {}
         async with self._lock:
@@ -245,6 +341,7 @@ class LlamaServe:
                 except Exception as e:
                     raise
             return await loop.run_in_executor(None, run)
+
     async def stream(self, prompt: str, params: Optional[Dict[str, Any]] = None):
         params = params or {}
         async with self._lock:
@@ -293,6 +390,7 @@ class LlamaServe:
                         yield str(p)
                     except Exception:
                         yield ""
+
     async def __call__(self, request_or_payload):
         if isinstance(request_or_payload, (dict, list)):
             body = request_or_payload
@@ -311,7 +409,9 @@ class LlamaServe:
         except Exception:
             pass
         return res
-@serve.deployment(name="gateway", num_replicas=GATEWAY_REPLICAS,ray_actor_options={"num_cpus": GATEWAY_CPUS, "resources": {"head": GATEWAY_HEAD_RESOURCE}, "num_gpus": 0.0})
+
+# -------------------- Gateway deployment --------------------
+@serve.deployment(name="gateway", num_replicas=GATEWAY_REPLICAS, ray_actor_options={"num_cpus": GATEWAY_CPUS, "resources": {"head": GATEWAY_HEAD_RESOURCE}, "num_gpus": 0.0})
 class Gateway:
     def __init__(self, embed_handle: Optional[Any] = None, rerank_handle: Optional[Any] = None, llm_handle: Optional[Any] = None):
         self.embed_handle = embed_handle
@@ -363,6 +463,7 @@ class Gateway:
         except Exception:
             log.exception("Gateway initialization error")
             raise
+
     def _health(self) -> Dict[str, Any]:
         ok = {"status": "ok", "note": "ok"}
         ok["embed_handle"] = bool(self.embed_handle)
@@ -371,6 +472,7 @@ class Gateway:
         ok["qdrant"] = bool(self.qdrant_client)
         ok["neo4j"] = bool(self.neo4j_driver)
         return ok
+
     async def _build_prompt_and_records(self, query_text: str, max_chunks: Optional[int] = None):
         try:
             res = querylib.retrieve_pipeline(self.embed_handle, self.rerank_handle, self.qdrant_client, self.neo4j_driver, query_text, max_chunks=max_chunks or MAX_CHUNKS_TO_LLM)
@@ -379,6 +481,7 @@ class Gateway:
             log.exception("retrieve_pipeline failed")
             prompt = json.dumps({"QUERY": query_text, "CONTEXT_CHUNKS": [], "YOUR_ROLE": "You are a helpful knowledge assistant who answers user queries with provenance using only the provided context chunks below."}, ensure_ascii=False)
             return {"prompt": prompt, "provenance": [], "records": [], "llm": None, "elapsed": 0.0}
+
     async def __call__(self, request):
         try:
             path = request.scope.get("path", "/")
@@ -451,28 +554,30 @@ class Gateway:
         except Exception:
             log.exception("Gateway handle error for request path=%s", request.scope.get("path"))
             return JSONResponse(content={"error":"gateway error", "trace": traceback.format_exc()}, status_code=500)
+
 def main():
     ray.init(address=RAY_ADDRESS if RAY_ADDRESS else None, namespace=RAY_NAMESPACE, ignore_reinit_error=True)
     http_opts = HTTPOptions(host=SERVE_HTTP_HOST, port=SERVE_HTTP_PORT)
     serve.start(detached=False, http_options=http_opts)
-    embed_app = ONNXEmbed.options(name=EMBED_DEPLOYMENT, num_replicas=EMBED_REPLICAS,ray_actor_options={"num_cpus": EMBED_CPUS, "num_gpus": EMBED_GPUS}).bind(ONNX_EMBED_PATH, ONNX_EMBED_TOKENIZER)
+    embed_app = ONNXEmbed.options(name=EMBED_DEPLOYMENT, num_replicas=EMBED_REPLICAS, ray_actor_options={"num_cpus": EMBED_CPUS, "num_gpus": EMBED_GPUS}).bind(ONNX_EMBED_PATH, ONNX_EMBED_TOKENIZER)
     rerank_app = None
     if ENABLE_CROSS_ENCODER:
-        rerank_app = ONNXRerank.options(name=RERANK_DEPLOYMENT, num_replicas=RERANK_REPLICAS,ray_actor_options={"num_cpus": RERANK_CPUS, "num_gpus": RERANK_GPUS}).bind(ONNX_RERANK_PATH, ONNX_RERANK_TOKENIZER)
+        rerank_app = ONNXRerank.options(name=RERANK_DEPLOYMENT, num_replicas=RERANK_REPLICAS, ray_actor_options={"num_cpus": RERANK_CPUS, "num_gpus": RERANK_GPUS}).bind(ONNX_RERANK_PATH, ONNX_RERANK_TOKENIZER)
     else:
         log.info("Cross encoder disabled; skipping rerank deployment")
     if REQUIRE_LLM_ON_DEPLOY:
         _ensure_file(LLM_MODEL_PATH)
-    llm_app = LlamaServe.options(name=LLM_DEPLOYMENT, num_replicas=LLM_REPLICAS,ray_actor_options={"num_cpus": LLM_CPUS, "num_gpus": LLM_GPUS}).bind(LLM_MODEL_PATH)
+    llm_app = LlamaServe.options(name=LLM_DEPLOYMENT, num_replicas=LLM_REPLICAS, ray_actor_options={"num_cpus": LLM_CPUS, "num_gpus": LLM_GPUS}).bind(LLM_MODEL_PATH)
     if rerank_app is not None:
-        gateway_app = Gateway.options(name=os.getenv("GATEWAY_DEPLOYMENT_NAME", "gateway"),num_replicas=GATEWAY_REPLICAS,ray_actor_options={"num_cpus": GATEWAY_CPUS, "resources": {"head": GATEWAY_HEAD_RESOURCE}, "num_gpus": 0.0}).bind(embed_app, rerank_app, llm_app)
+        gateway_app = Gateway.options(name=os.getenv("GATEWAY_DEPLOYMENT_NAME", "gateway"), num_replicas=GATEWAY_REPLICAS, ray_actor_options={"num_cpus": GATEWAY_CPUS, "resources": {"head": GATEWAY_HEAD_RESOURCE}, "num_gpus": 0.0}).bind(embed_app, rerank_app, llm_app)
     else:
-        gateway_app = Gateway.options(name=os.getenv("GATEWAY_DEPLOYMENT_NAME", "gateway"),num_replicas=GATEWAY_REPLICAS,ray_actor_options={"num_cpus": GATEWAY_CPUS, "resources": {"head": GATEWAY_HEAD_RESOURCE}, "num_gpus": 0.0}).bind(embed_app, None, llm_app)
+        gateway_app = Gateway.options(name=os.getenv("GATEWAY_DEPLOYMENT_NAME", "gateway"), num_replicas=GATEWAY_REPLICAS, ray_actor_options={"num_cpus": GATEWAY_CPUS, "resources": {"head": GATEWAY_HEAD_RESOURCE}, "num_gpus": 0.0}).bind(embed_app, None, llm_app)
     try:
         log.info("Starting Gateway application (serve.run)... HTTP at http://%s:%s", SERVE_HTTP_HOST, SERVE_HTTP_PORT)
         serve.run(gateway_app)
     except Exception:
         log.exception("serve.run failed for Gateway; rethrowing")
         raise
+
 if __name__ == "__main__":
     main()

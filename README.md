@@ -178,21 +178,16 @@ export JSONL_TARGET_TOKENS_PER_CHUNK=600    # (Including header)Increase if very
 export PPTX_SLIDES_PER_CHUNK=4                        # Number of slides per chunk. Increase or decrease based on text 
 export PPTX_OCR_ENGINE=rapidocr                       # 'tesseract' (faster), 'rapidocr' (high accuracy , slightly slower)
 export PYTHONUNBUFFERED=1                             # To force Python to display logs/output immediately instead of buffering
+export S3_BUCKET="e2e-rag-system-42"
 
 
-
-export INDEXING_EMBEDDER_MAX_TOKENS="512" # max tokens passed to embedder during indexing; reduce for memory/latency constraints
-export QDRANT_URL="http://127.0.0.1:6333" # Qdrant endpoint; production cloud URL or local container address goes here
-export QDRANT_API_KEY=""           # Qdrant API key if using cloud; leave empty for unauthenticated local instances
+export INDEXING_EMBEDDER_MAX_TOKENS="612" # max tokens passed to embedder during indexing; reduce for memory/latency constraints
 export COLLECTION="my_collection"  # Qdrant collection name; change per dataset / tenant to isolate vectors
 export QDRANT_ON_DISK_PAYLOAD="true" # store payload on disk (reduce RAM); true to minimize RAM usage for large payloads, false for fastest payload reads
 export QDRANT_HNSW_M="16"          # HNSW graph M parameter (index complexity); increase for higher recall at cost of memory/index build time
 export QDRANT_HNSW_EF_CONSTRUCTION="200" # ef_construction (build-time index quality); raise for better index quality (slower build)
 export QDRANT_HNSW_EF_SEARCH="50"  # ef_search (query-time window); increase to improve recall at runtime (higher latency/CPU)
 export QDRANT_HNSW_FULL_SCAN_THRESHOLD="10000" # threshold to force scan instead of HNSW; tune if you have many small vectors or lots of updates
-export NEO4J_URI="bolt://localhost:7687" # Neo4j bolt URI; set to your Neo4j host (use bolt+s for secure connections)
-export NEO4J_USER="neo4j"          # Neo4j username; change for production creds
-export NEO4J_PASSWORD=""           # Neo4j password; must be provided in secure env (avoid committing)
 export BATCH_SIZE="64"             # upsert / processing batch size; increase to improve throughput but watch memory usage
 export EMBED_BATCH="32"            # number of texts per embed call; tune based on embedder memory and latency tradeoffs
 export EMBED_TIMEOUT="60"          # seconds to wait for embed call; increase for slower embed backends
@@ -209,13 +204,8 @@ export NEO4J_WRITE_BASE_BACKOFF="0.8" # base backoff (s) for Neo4j retries; expo
 
 
 export MODE="hybrid"                      # "hybrid" (qdrant+neo4j flow) or "vector_only" (Qdrant vectors only); pick for latency vs richness
-export QDRANT_URL="http://127.0.0.1:6333" # Qdrant endpoint for vector search; set cloud URL when using managed Qdrant
-export QDRANT_API_KEY=""                  # Qdrant API key if required by cloud; leave empty for local
 export PREFER_GRPC="true"                 # if true prefer gRPC connection to Qdrant (faster), set false for HTTP-only endpoints
 export COLLECTION="my_collection"         # Qdrant collection name to query; must match ingest collection
-export NEO4J_URI="bolt://localhost:7687"  # Neo4j URI used for BM25 and graph expansion; required in hybrid mode
-export NEO4J_USER="neo4j"                 # Neo4j user; change for production
-export NEO4J_PASSWORD=""                  # Neo4j password; always provide securely
 export VECTOR_DIM="768"                   # expected vector dim; used to sanity-check embed length
 
 
